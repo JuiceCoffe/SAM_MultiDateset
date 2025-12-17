@@ -59,7 +59,6 @@ class MaskFormerSemanticDatasetMapper:
         self.img_format = image_format
         self.ignore_label = ignore_label
         self.size_divisibility = size_divisibility
-
         logger = logging.getLogger(__name__)
         mode = "training" if is_train else "inference"
         logger.info(f"[{self.__class__.__name__}] Augmentations used in {mode}: {augmentations}")

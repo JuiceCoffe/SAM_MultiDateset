@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License. 
 """
 from . import data  # register all new datasets
-from . import modeling
+# from . import modeling
 
 # config
-from .config import add_maskformer2_config, add_fcclip_config
+# from .config import add_maskformer2_config, add_fcclip_config
 
 # dataset loading
 from .data.dataset_mappers.coco_instance_new_baseline_dataset_mapper import COCOInstanceNewBaselineDatasetMapper
@@ -34,9 +34,9 @@ from .data.dataset_mappers.mask_former_semantic_dataset_mapper import (
 )
 
 # models
-from .fcclip import FCCLIP
-from .maft_plus import MAFT_Plus
-from .demo import MAFT_Plus_DEMO
+# from .fcclip import FCCLIP
+# from .maft_plus import MAFT_Plus
+# from .demo import MAFT_Plus_DEMO
 
 
 

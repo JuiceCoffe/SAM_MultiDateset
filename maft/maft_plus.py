@@ -351,6 +351,7 @@ class MAFT_Plus(nn.Module):
         # print("img_feat shape:", img_feat.shape)
 
         img_feats = F.normalize(img_feat, dim=1) # B C H W
+        print("img_feats shape:", img_feats.shape)
         text_feats = text_classifier# T C 带模板
         # print("text_feats shape:", text_feats.shape)
         logit_scale = torch.clamp(self.backbone.clip_model.logit_scale.exp(), max=100)
@@ -538,7 +539,8 @@ class MAFT_Plus(nn.Module):
                     if num_pixels < N0:
                         # 如果像素太少，不进行kmeans，直接把每个像素当作一个聚类中心
                         # 这种情况下，有效聚类数 = 像素数
-                        print(f"Warning: num_pixels ({num_pixels}) < N0 ({N0}). Using pixel coords as cluster centers.")
+                        
+                        # print(f"Warning: num_pixels ({num_pixels}) < N0 ({N0}). Using pixel coords as cluster centers.")
                         cluster_centers = coords
                         # 标签直接就是 0, 1, 2...
                         cluster_labels = torch.arange(num_pixels, device=device)

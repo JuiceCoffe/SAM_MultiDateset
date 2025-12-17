@@ -1,13 +1,3 @@
-"""
-This file may have been modified by Bytedance Ltd. and/or its affiliates (“Bytedance's Modifications”).
-All Bytedance's Modifications are Copyright (year) Bytedance Ltd. and/or its affiliates. 
-
-Reference: https://github.com/facebookresearch/Mask2Former/blob/main/train_net.py
-
-MAFT-Plus Training Script.
-
-This script is a simplified version of the training script in detectron2/tools.
-"""
 try:
     # ignore ShapelyDeprecationWarning from fvcore
     from shapely.errors import ShapelyDeprecationWarning
@@ -60,12 +50,14 @@ from maft import (
     MaskFormerInstanceDatasetMapper,
     MaskFormerPanopticDatasetMapper,
     MaskFormerSemanticDatasetMapper,
-    SemanticSegmentorWithTTA,
-    add_maskformer2_config,
-    add_fcclip_config,
+    # SemanticSegmentorWithTTA,
+    # add_maskformer2_config,
+    # add_fcclip_config,
 )
 
-from maft.config import add_pe_config
+from sam3.config import add_sam3_config
+from sam3.modeling_d2 import SAM3Wrapper # 导入这个类就会自动触发 REGISTER
+
 
 
 class Trainer(DefaultTrainer):
@@ -228,21 +220,21 @@ class Trainer(DefaultTrainer):
             optimizer = maybe_add_gradient_clipping(cfg, optimizer)
         return optimizer
 
-    @classmethod
-    def test_with_TTA(cls, cfg, model):
-        logger = logging.getLogger("detectron2.trainer")
-        # In the end of training, run an evaluation with TTA.
-        logger.info("Running inference with test-time augmentation ...")
-        model = SemanticSegmentorWithTTA(cfg, model)
-        evaluators = [
-            cls.build_evaluator(
-                cfg, name, output_folder=os.path.join(cfg.OUTPUT_DIR, "inference_TTA")
-            )
-            for name in cfg.DATASETS.TEST
-        ]
-        res = cls.test(cfg, model, evaluators)
-        res = OrderedDict({k + "_TTA": v for k, v in res.items()})
-        return res
+    # @classmethod
+    # def test_with_TTA(cls, cfg, model):
+    #     logger = logging.getLogger("detectron2.trainer")
+    #     # In the end of training, run an evaluation with TTA.
+    #     logger.info("Running inference with test-time augmentation ...")
+    #     model = SemanticSegmentorWithTTA(cfg, model)
+    #     evaluators = [
+    #         cls.build_evaluator(
+    #             cfg, name, output_folder=os.path.join(cfg.OUTPUT_DIR, "inference_TTA")
+    #         )
+    #         for name in cfg.DATASETS.TEST
+    #     ]
+    #     res = cls.test(cfg, model, evaluators)
+    #     res = OrderedDict({k + "_TTA": v for k, v in res.items()})
+    #     return res
 
 
 def setup(args):
@@ -250,20 +242,27 @@ def setup(args):
     Create configs and perform basic setups.
     """
     cfg = get_cfg()
-    # for poly lr schedule
     add_deeplab_config(cfg)
-    add_maskformer2_config(cfg)
-    add_fcclip_config(cfg)
-    add_pe_config(cfg)
+    add_sam3_config(cfg)
+
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.merge_from_list(['SEED', 123])
+
+    cfg.eval_only = args.eval_only
+    
     cfg.freeze()
     default_setup(cfg, args)
     # Setup logger for "maft-plus" module
-    setup_logger(output=cfg.OUTPUT_DIR, distributed_rank=comm.get_rank(), name="maft-plus")
+    setup_logger(output=cfg.OUTPUT_DIR, distributed_rank=comm.get_rank(), name="sam3")
     return cfg
 
+# def build_sam3_model(cfg):
+#     SAM3_ROOT = os.getcwd()
+#     bpe_path = os.path.join(SAM3_ROOT, "assets", "bpe_simple_vocab_16e6.txt.gz")
+#     model = build_sam3_image_model(bpe_path=bpe_path)
+#     model.to(torch.device(cfg.MODEL.DEVICE))
+#     return model
 
 def main(args):
     # torch.multiprocessing.set_start_method('spawn')
@@ -271,18 +270,14 @@ def main(args):
 
     if args.eval_only:
         model = Trainer.build_model(cfg)
-        # DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
-        #     cfg.MODEL.WEIGHTS, resume=args.resume
-        # )
-        try:
-            DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
-                cfg.MODEL.WEIGHTS, resume=args.resume
-            )
-        except:
-            print("="*20,"跳过模型权重加载","="*20)
+        DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
+            cfg.MODEL.WEIGHTS, resume=args.resume
+        )
+
+        # model = build_sam3_model(cfg)
         res = Trainer.test(cfg, model)
-        if cfg.TEST.AUG.ENABLED:
-            res.update(Trainer.test_with_TTA(cfg, model))
+        # if cfg.TEST.AUG.ENABLED:
+        #     res.update(Trainer.test_with_TTA(cfg, model))
         if comm.is_main_process():
             verify_results(cfg, res)
         return res
