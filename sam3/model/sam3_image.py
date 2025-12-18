@@ -205,6 +205,7 @@ class Sam3Image(torch.nn.Module):
             )
         if encode_text:
             # print("input shape:", txt_feats.shape, geo_feats.shape, visual_prompt_embed.shape)
+            # print("input mask shape:", txt_masks.shape, geo_masks.shape, visual_prompt_mask.shape)
             prompt = torch.cat([txt_feats, geo_feats, visual_prompt_embed], dim=0)
             prompt_mask = torch.cat([txt_masks, geo_masks, visual_prompt_mask], dim=1)
         else:

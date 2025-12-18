@@ -76,7 +76,7 @@ class SAM3Wrapper(nn.Module):
         else:
             inst_predictor = None
 
-        self.detector = _create_sam3_model(
+        self.sam3_model = _create_sam3_model(
             backbone,
             transformer,
             input_geometry_encoder,
@@ -86,7 +86,7 @@ class SAM3Wrapper(nn.Module):
             cfg.eval_only,
         )
         if cfg.eval_only:
-            self.detector.eval()
+            self.sam3_model.eval()
         print("SAM3创建成功!")
         # -------------------------------------------------------
         # 3. 训练配置
@@ -164,7 +164,7 @@ class SAM3Wrapper(nn.Module):
                 # this is needed to avoid oom, which may happen when num of class is large
                 bs = 128
                 for idx in range(0, len(self.train_class_names), bs):
-                    text_classifier.append(self.detector.backbone.forward_text(self.train_class_names[idx:idx+bs], device=self.device).detach())
+                    text_classifier.append(self.sam3_model.backbone.forward_text(self.train_class_names[idx:idx+bs], device=self.device).detach())
                 text_classifier = torch.cat(text_classifier, dim=0)
 
                 # average across templates and normalization.
@@ -184,7 +184,7 @@ class SAM3Wrapper(nn.Module):
                 bs = 128
                 print("Generating text classifier for", dataname, "with", len(self.test_class_names), "classes.")
                 for idx in range(0, len(self.test_class_names), bs):
-                    state_text = self.detector.backbone.forward_text(self.test_class_names[idx:idx+bs], device=self.device)
+                    state_text = self.sam3_model.backbone.forward_text(self.test_class_names[idx:idx+bs], device=self.device)
 
                     batch_text_feat = state_text["language_features"].detach()
                     mask = state_text["language_mask"] # B, L
@@ -232,7 +232,7 @@ class SAM3Wrapper(nn.Module):
         meta = batched_inputs[0]["meta"]
         
         # 图形特征
-        backbone_out_vision = self.detector.backbone.forward_image(images.tensor)
+        backbone_out_vision = self.sam3_model.backbone.forward_image(images.tensor)
         img_feat = backbone_out_vision["vision_features"] # B, C, H', W'
         backbone_fpn = backbone_out_vision["backbone_fpn"]
     
@@ -243,7 +243,7 @@ class SAM3Wrapper(nn.Module):
         text_classifier, num_templates = self.get_text_classifier(meta['dataname'])
 
         # others
-        geometric_prompt = self.detector._get_dummy_prompt()
+        geometric_prompt = self.sam3_model._get_dummy_prompt()
         
         if self.predict_mode == "Cycle": 
 
@@ -258,11 +258,9 @@ class SAM3Wrapper(nn.Module):
 
             names_masks = []
             for i in range(len(self.language_features)):
-
-                # if i not in gt_names_idx:
-                #     names_masks.append(torch.zeros((1, img_h, img_w), device=self.device))
-                #     continue
-
+                if i not in gt_names_idx:
+                    names_masks.append(torch.zeros((1, img_h, img_w), device=self.device))
+                    continue
                 backbone_out={
                     "img_batch_all_stages": img_feat,
                     "vision_pos_enc": backbone_out_vision["vision_pos_enc"],
@@ -270,7 +268,7 @@ class SAM3Wrapper(nn.Module):
                     "language_features": self.language_features[i,:,:].unsqueeze(1),
                     "language_mask": self.language_mask[i,:],
                 }
-                outputs = self.detector.forward_grounding(
+                outputs = self.sam3_model.forward_grounding(
                     backbone_out = backbone_out,
                     find_input=self.find_stage,
                     geometric_prompt= geometric_prompt,
