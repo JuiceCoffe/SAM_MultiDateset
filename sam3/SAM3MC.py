@@ -8,9 +8,9 @@ from torch.nn import functional as F
 from detectron2.config import configurable
 from detectron2.data import MetadataCatalog
 from detectron2.modeling import META_ARCH_REGISTRY, build_backbone, build_sem_seg_head
-from detectron2.modeling.backbone import Backbone
+from detectron2.modeling.backbone import backbone
 from detectron2.modeling.postprocessing import sem_seg_postprocess
-from detectron2.structures import Boxes, ImageList, Instances, BitMasks
+from detectron2.structures import boxes, ImageList, Instances, BitMasks
 from detectron2.utils.memory import retry_if_cuda_oom
 
 import matplotlib.pyplot as plt
@@ -33,8 +33,8 @@ from sam3.model_builder import (
 )
 from sam3.model.data_misc import FindStage, interpolate
 
-from maft.utils.text_templetes import VILD_PROMPT
-# VILD_PROMPT = ["{}"]
+# from maft.utils.text_templetes import VILD_PROMPT
+VILD_PROMPT = ["{}"]
 
 
 @META_ARCH_REGISTRY.register()
@@ -185,10 +185,10 @@ class SAM3MC(nn.Module):
                     state_text = self.detector.backbone.forward_text(self.test_class_names[idx:idx+bs], device=self.device)
 
                     batch_text_feat = state_text["language_features"].detach()
-                    mask = state_text["language_mask"] # B, L
-                    batch_text_feat = batch_text_feat.permute(1,0,2) # -> B, L, D 
+                    mask = state_text["language_mask"] # bs, L
+                    batch_text_feat = batch_text_feat.permute(1,0,2) # -> bs, L, D 
                     text_classifier.append(batch_text_feat)
-                    language_mask.append(mask) # B, L
+                    language_mask.append(mask) # bs, L
                 text_classifier = torch.cat(text_classifier, dim=0)
                 language_mask = torch.cat(language_mask, dim=0) # (num_names * VILD_PROMPT,  L)
                 # average across templates and normalization.
@@ -220,7 +220,7 @@ class SAM3MC(nn.Module):
         # print("shape of images.tensor:", images.tensor.shape)
         img_h, img_w = images.tensor.shape[-2:]
 
-        batch_size = images.tensor.shape[0]
+        bs = images.tensor.shape[0]
         
 
         file_names = [x["file_name"] for x in batched_inputs]
@@ -230,7 +230,7 @@ class SAM3MC(nn.Module):
         
         # 图形特征
         backbone_out_vision = self.detector.backbone.forward_image(images.tensor)
-        img_feat = backbone_out_vision["vision_features"] # B, C, H', W'
+        img_feat = backbone_out_vision["vision_features"] # bs, C, H', W'
         backbone_fpn = backbone_out_vision["backbone_fpn"]
     
 
@@ -243,7 +243,7 @@ class SAM3MC(nn.Module):
         geometric_prompt = self.detector._get_dummy_prompt()
         
         batch_gt_names_idx = []
-        for i in range(batch_size):
+        for i in range(bs):
             gt_classes = get_gt_labels_from_sem_seg(batched_inputs[i]["sem_seg"].to(self.device))
             gt_names_idx = []
             cur_idx = 0
@@ -258,13 +258,14 @@ class SAM3MC(nn.Module):
         language_features_input = []
 
         USE_GT_NAMES_ONLY = True
+        # USE_GT_NAMES_ONLY = False
         
         if USE_GT_NAMES_ONLY:
-            language_features_input = [self.language_features[batch_gt_names_idx[i],:,:] for i in range(batch_size)]
-            language_features_input = torch.cat(language_features_input, dim=0) # (B, num_names * L, dim)
-            language_mask_input = [self.language_mask[batch_gt_names_idx[i],:] for i in range(batch_size)]
-            language_mask_input = torch.cat(language_mask_input, dim=0) # (B, num_names * L)
-            if batch_size == 1:
+            language_features_input = [self.language_features[batch_gt_names_idx[i],:,:] for i in range(bs)]
+            language_features_input = torch.cat(language_features_input, dim=0) # (bs, num_names * L, dim)
+            language_mask_input = [self.language_mask[batch_gt_names_idx[i],:] for i in range(bs)]
+            language_mask_input = torch.cat(language_mask_input, dim=0) # (bs, num_names * L)
+            if bs == 1:
                 language_features_input = language_features_input.unsqueeze(0)
                 language_mask_input = language_mask_input.unsqueeze(0)
 
@@ -273,8 +274,8 @@ class SAM3MC(nn.Module):
             language_mask_input = self.language_mask
 
         # print("shape of input:",language_features_input.shape, language_mask_input.shape)
-        language_features_input = language_features_input.reshape(batch_size, -1, language_features_input.shape[-1]) # (B, num_names * L, dim)
-        language_mask_input = language_mask_input.reshape(batch_size, -1) # (B, num_names * L)
+        language_features_input = language_features_input.reshape(bs, -1, language_features_input.shape[-1]) # (bs, num_names * L, dim)
+        language_mask_input = language_mask_input.reshape(bs, -1) # (bs, num_names * L)
         # print("shape of input after reshape:",language_features_input.shape, language_mask_input.shape)
         
 
@@ -282,8 +283,8 @@ class SAM3MC(nn.Module):
             "img_batch_all_stages": img_feat,
             "vision_pos_enc": backbone_out_vision["vision_pos_enc"],
             "backbone_fpn": backbone_fpn,
-            "language_features": language_features_input.permute(1, 0, 2), # (num_names * L, B, dim)
-            "language_mask": language_mask_input, # B, (num_names * L)
+            "language_features": language_features_input.permute(1, 0, 2), # (num_names * L, bs, dim)
+            "language_mask": language_mask_input, # bs, (num_names * L)
         }
         # outputs = self.detector.forward_grounding(
         #     backbone_out = backbone_out,
@@ -345,6 +346,7 @@ class SAM3MC(nn.Module):
         #========================================
         outputs = out
         # print("outputs keys:", outputs.keys())
+        # outputs keys: dict_keys(['encoder_hidden_states', 'prev_encoder_out', 'presence_feats', 'queries', 'presence_logit_dec', 'pred_logits', 'pred_boxes', 'pred_boxes_xyxy', 'pred_masks', 'semantic_seg', 'presence_logit', 'pixel_embed', 'instance_embeds', 'obj_queries']
 
         out_bbox = outputs["pred_boxes"]
 
@@ -357,12 +359,7 @@ class SAM3MC(nn.Module):
             align_corners=False,
         ).sigmoid()
 
-        presence_score = torch.ones(batch_size,1, device=self.device)  # 由于多类别情况下 presence_logit_dec 不适用，暂时全部设为 1 [B, 1]
         # presence_score = outputs["presence_logit_dec"].sigmoid().unsqueeze(1) # 在多类别情况下认为失效
-
-        out_logits = outputs["pred_logits"] 
-        out_probs = out_logits.sigmoid() # B, N, 1
-        # out_probs = (out_probs * presence_score).squeeze(-1) # 实例的概率
 
 
 
@@ -379,35 +376,48 @@ class SAM3MC(nn.Module):
         # out_masks shape: torch.Size([1, 200, 1008, 1008]) out_probs shape: torch.Size([1, 200]) out_semseg shape: torch.Size([1, 1, 1008, 1008]) presence_score shape: torch.Size([1, 1, 1])
         
 
-        B, N, H, W = out_masks.shape
+        bs, N, H, W = out_masks.shape
         C = text_classifier.shape[0] # num_names
 
+        # out_logits = outputs["pred_logits"] 
+        # out_probs = out_logits.sigmoid() # bs, N, 1
 
-        queries_masks = torch.mul(out_masks,out_probs.unsqueeze(-1)) # 每个实例的mask乘以对应的概率得分 [B, N, H, W]
-        # 现在还需要对query分类
-        queries = outputs["obj_queries"]
-        projected_text_classifier = self.detector.segmentation_head.instance_seg_head(text_classifier.unsqueeze(-1).unsqueeze(-1)).squeeze(-1).squeeze(-1) # pixel_emd在与query乘之前过了这个
-        projected_queries = self.detector.segmentation_head.mask_predictor.mask_embed(queries) # B, N, D
+        # queries_masks = torch.mul(out_masks,out_probs.unsqueeze(-1)) # 每个实例的mask乘以对应的概率得分 [bs, N, H, W]
 
-        queries_names_probs = torch.einsum("bnd,cd->bnc", queries, text_classifier).sigmoid() # B, N, num_names
-        queries_names_probs = torch.einsum("bnd,cd->bnc", projected_queries, text_classifier).sigmoid() # B, N, num_names
-        queries_names_probs = torch.einsum("bnd,cd->bnc", queries, projected_text_classifier).sigmoid() # B, N, num_names
-        queries_names_probs = torch.einsum("bnd,cd->bnc", projected_queries, projected_text_classifier).sigmoid() # B, N, num_names
+        queries_masks = out_masks # out_probs失效，直接用原始mask_logits
 
-        queries_seg_result = torch.zeros((B, C, H, W), dtype=out_masks.dtype, device=out_masks.device)
+        queries = outputs["obj_queries"] 
 
-        for n in range(queries.shape[1]):
-            query_instance_result = (queries_names_probs[:, n, :].unsqueeze(-1).unsqueeze(-1) * queries_masks[:, n, :, :].unsqueeze(1)) # [B, num_names, 1, 1] * [B, 1, H, W] -> [B, num_names, H, W]
+        text_classifier_mask = torch.zeros((C, bs), dtype=torch.bool, device=text_classifier.device)
+        scores = self.detector.dot_prod_scoring( # 这里把num names当作batch维度实现并行
+            hs=queries.unsqueeze(0)/queries.norm(dim=-1, keepdim=True).unsqueeze(0), # 1, bs, N, D, 
+            prompt=text_classifier.unsqueeze(0), # 1, C, D
+            prompt_mask=text_classifier_mask.expand(-1, bs), # C, bs 
+        )
+
+        # print("scores shape:", scores.shape) 
+        queries_names_logits = scores.permute(0, 2, 1, 3) # bs, N, C, 1
+ 
+        queries_names_probs = queries_names_logits.sigmoid()
+        queries_names_probs = queries_names_probs.squeeze(-1) # bs, N, C
+
+
+        queries_seg_result = torch.zeros((bs, C, H, W), dtype=out_masks.dtype, device=out_masks.device)
+
+        for n in range(queries_names_probs.shape[1]):
+            query_instance_result = (queries_names_probs[:, n, :].unsqueeze(-1).unsqueeze(-1) * queries_masks[:, n, :, :].unsqueeze(1)) # [bs, num_names, 1, 1] * [bs, 1, H, W] -> [bs, num_names, H, W]
             queries_seg_result = torch.max(queries_seg_result, query_instance_result)
 
 
         # semantic_masks = torch.mul(out_semseg , presence_score.unsqueeze(-1)) 也用不了了
 
         # 用pixel_embed点积分类器代替semantic head
-        pixel_embed = outputs["pixel_embed"].permute(0,2,3,1) # B, H, W, D
+        pixel_embed = outputs["pixel_embed"]
+        pixel_embed = self.detector.segmentation_head.instance_seg_head(pixel_embed)
+        pixel_embed = pixel_embed.permute(0,2,3,1) # bs, H, W, D
         # print("pixel_embed shape:", pixel_embed.shape)
-        sem_seg_logits = torch.einsum("bhwd,cd->bhwc", pixel_embed, text_classifier) # B, H, W, num_names
-        sem_seg_logits = sem_seg_logits.permute(0,3,1,2) # B, num_names, H, W
+        sem_seg_logits = torch.einsum("bhwd,cd->bhwc", pixel_embed, text_classifier) # bs, H, W, num_names
+        sem_seg_logits = sem_seg_logits.permute(0,3,1,2) # bs, num_names, H, W
         sem_seg_probs = sem_seg_logits.sigmoid()
         # print("sem_seg_probs shape:", sem_seg_probs.shape)
 
@@ -420,14 +430,14 @@ class SAM3MC(nn.Module):
             align_corners=False,
         )
 
-        # seg_logits = torch.max(queries_seg_result, sem_seg_logits) # [B, num_names, H, W]
+        # seg_logits = torch.max(queries_seg_result, sem_seg_logits) # [bs, num_names, H, W]
 
         # 目前先不合并
         seg_logits = queries_seg_result
         # seg_logits = sem_seg_logits
 
         if USE_GT_NAMES_ONLY:
-            for b in range(batch_size):
+            for b in range(bs):
                 gtcls_mask = torch.ones_like(seg_logits[b], dtype=torch.bool)
                 gtcls_mask[batch_gt_names_idx[b],:,:] = False
                 seg_logits[b][gtcls_mask] = 0.0
@@ -440,7 +450,7 @@ class SAM3MC(nn.Module):
         final_seg_logits = torch.stack(final_seg_logits, dim=1)
 
         pred_result = final_seg_logits[0].argmax(0)
-        visualize_segmentation(pred_result, self.vis_class_names+['void'],batched_inputs[0]["image"],f"./show_queries/{file_names[0]}_")
+        # visualize_segmentation(pred_result, self.vis_class_names+['void'],batched_inputs[0]["image"],f"./show_queries/{file_names[0]}_")
         # visualize_segmentation(pred_result, self.vis_class_names+['void'],batched_inputs[0]["image"],f"./show_seg/{file_names[0]}_")
 
         # =======================================================
@@ -448,7 +458,7 @@ class SAM3MC(nn.Module):
 
 
         results = []
-        for i in range(batch_size):
+        for i in range(bs):
             orig_size = (batched_inputs[i]["height"], batched_inputs[i]["width"]) # 没经过 resize 到 1008 的大小
             res = sem_seg_postprocess(
                 final_seg_logits[i], 
