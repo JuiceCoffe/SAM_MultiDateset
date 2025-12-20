@@ -158,24 +158,6 @@ class SAM3VLBackbone(nn.Module):
                 text_to_encode, input_boxes, device=device
             )
 
-        # # ================== 【新增调试代码】 ==================
-        # if self.training is False: # 建议只在推理/测试时打印，防止训练刷屏
-        #     print(f"\n[Debug] Current Captions: {captions}")
-        #     print(f"[Debug] Mask Shape: {text_attention_mask.shape}")
-            
-        #     # 取第一句话的 mask 看看
-        #     sample_mask = text_attention_mask[0].cpu().tolist()
-        #     print(f"[Debug] Mask Values (First sample):\n{sample_mask}")
-            
-        #     # 统计有效长度
-        #     valid_len = sum(sample_mask)
-        #     total_len = len(sample_mask)
-        #     print(f"[Debug] Valid Tokens: {valid_len}, Padding: {total_len - valid_len}")
-            
-        #     # 如果你能访问 tokenizer (假设在 self.tokenizer)，还可以打印对应的 token
-        #     # tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0])
-        #     # print(list(zip(tokens, sample_mask)))
-        # # ====================================================
 
         if additional_text is not None:
             output["additional_text_features"] = text_memory[:, -len(additional_text) :]

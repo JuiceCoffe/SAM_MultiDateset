@@ -108,7 +108,6 @@ class HungarianMatcher(nn.Module):
 
             out_prob = outputs["pred_logits"][b].softmax(-1)  # [num_queries, num_classes]
             tgt_ids = targets[b]["labels"]
-
             # Compute the classification cost. Contrary to the loss, we don't use the NLL,
             # but approximate it in 1 - proba[target class].
             # The 1 is a constant that doesn't change the matching, it can be ommitted.
@@ -143,7 +142,6 @@ class HungarianMatcher(nn.Module):
 
                 # Compute the dice loss betwen masks
                 cost_dice = batch_dice_loss_jit(out_mask, tgt_mask)
-            
             # Final cost matrix
             C = (
                 self.cost_mask * cost_mask

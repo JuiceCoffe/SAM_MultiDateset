@@ -36,7 +36,43 @@ from sam3.model.data_misc import FindStage, interpolate
 # from maft.utils.text_templetes import VILD_PROMPT
 VILD_PROMPT = ["{}"]
 
-# from maft.modeling.criterion import SetCriterion
+from maft.modeling.matcher import HungarianMatcher
+from maft.modeling.criterion import SetCriterion
+from maft.modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
+
+class PixelProjector(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim=None):
+        """
+        Args:
+            input_dim: pixel_embed 的通道数 (通常是 SAM 解码器的输出维度，如 256)
+            output_dim: text_classifier 的通道数 (即文本编码器的维度，如 CLIP 的 512/768/1024)
+            hidden_dim: MLP 隐藏层维度，默认等于 input_dim
+        """
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = input_dim
+            
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+        
+        # 初始化参数：Xavier 初始化有助于训练稳定
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0.0)
+
+    def forward(self, x):
+        return self.net(x)
 
 
 @META_ARCH_REGISTRY.register()
@@ -88,45 +124,102 @@ class SAM3MC(nn.Module):
         if cfg.eval_only:
             self.detector.eval()
         print("SAM3创建成功!")
+
+
         # -------------------------------------------------------
-        # 3. 训练配置
+        # 新增模块
+        # -------------------------------------------------------
+        self.mask_pooling = MaskPooling()
+        
+        self.no_object_embed = nn.Embedding(1, 256)
+        # 初始化常数，通常对背景类做一点特殊的初始化有助于收敛
+        nn.init.normal_(self.no_object_embed.weight, mean=0, std=0.02)
+        
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(100))
+
+        self.sem_seg_projector = PixelProjector(
+            input_dim= 256,
+            output_dim= 256,
+        )
+
+        # -------------------------------------------------------
+        # 训练配置
         # -------------------------------------------------------
         # 你需要检查 sam3_loss 的初始化参数
-        self.loss_func = None
+
         self.train_dataname = None
         self.test_dataname = None
         self.test_metadata = {i: MetadataCatalog.get(i) for i in cfg.DATASETS.TEST}
         self.train_metadata = MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
         _, self.train_num_templates, self.train_class_names = self.prepare_class_names_from_metadata(self.train_metadata, self.train_metadata)
 
+        # -------------------------------------------------------
+        # criterion损失函数
+        # -------------------------------------------------------
+        no_object_weight = cfg.SOLVER.NO_OBJECT_WEIGHT
+
+        # loss weights
+        class_weight = cfg.SOLVER.CLASS_WEIGHT
+        dice_weight = cfg.SOLVER.DICE_WEIGHT
+        mask_weight = cfg.SOLVER.MASK_WEIGHT
+
+        weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
+
+        # building criterion
+        matcher = HungarianMatcher(
+            cost_class=class_weight,
+            cost_mask=mask_weight,
+            cost_dice=dice_weight,
+            num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
+        )
+        
+        losses = ["labels", "masks"]
+
+        self.criterion = SetCriterion(
+            171, 
+            matcher=matcher,
+            weight_dict=weight_dict,
+            eos_coef=no_object_weight,
+            losses=losses,
+            num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
+            oversample_ratio=cfg.SOLVER.OVERSAMPLE_RATIO,
+            importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
+        )
+
         # --------------------------------------------------
         # sam3的其他配置
         # --------------------------------------------------
-        self.find_stage = FindStage(
-            img_ids=torch.tensor([0], device = self.device, dtype=torch.long),
-            text_ids=torch.tensor([0], device = self.device, dtype=torch.long),
-            input_boxes=None,
-            input_boxes_mask=None,
-            input_boxes_label=None,
-            input_points=None,
-            input_points_mask=None,
-        )
+
         self._freeze()
 
     def _freeze(self, ):
         for name, param in self.named_parameters():
             if 'backbone' in name:
                 param.requires_grad = False
-            if 'dot_prod_scoring' in name:
-                param.requires_grad = False
-            if 'geometry_encoder' in name:
-                param.requires_grad = False
+            else:
+                param.requires_grad = True
         
         print('='*10,'Parameters to be trained', '='*10)
         for name, param in self.named_parameters():
             if param.requires_grad == True:
                 print(name)
         # exit()
+
+    def prepare_targets(self, targets, images):
+        h_pad, w_pad = images.tensor.shape[-2:]
+        new_targets = []
+        for targets_per_image in targets:
+            # pad gt
+            gt_masks = targets_per_image.gt_masks
+            padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+            padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+            new_targets.append(
+                {
+                    "labels": targets_per_image.gt_classes,
+                    "masks": padded_masks,
+                }
+            )
+        return new_targets
 
     def prepare_class_names_from_metadata(self, metadata, train_metadata):
         def split_labels(x):
@@ -249,6 +342,7 @@ class SAM3MC(nn.Module):
         return self.pixel_mean.device
 
     def forward(self, batched_inputs):
+
         images = [x["image"].to(self.device) for x in batched_inputs]
         # print("shape of first image:", images[0].shape)
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
@@ -257,6 +351,16 @@ class SAM3MC(nn.Module):
         img_h, img_w = images.tensor.shape[-2:]
 
         bs = images.tensor.shape[0]
+        
+        self.find_stage = FindStage(
+            img_ids=torch.arange(bs, device=self.device, dtype=torch.long),
+            text_ids=torch.arange(bs, device=self.device, dtype=torch.long),
+            input_boxes=None,
+            input_boxes_mask=None,
+            input_boxes_label=None,
+            input_points=None,
+            input_points_mask=None,
+        )
 
         with torch.no_grad():
 
@@ -271,15 +375,16 @@ class SAM3MC(nn.Module):
             backbone_fpn = backbone_out_vision["backbone_fpn"]
             for k in range(len(backbone_fpn)):
                 backbone_fpn[k] = backbone_fpn[k].detach()
-        
+
 
             # 语言特征
             # text_classifier:[num_names, dim] 
             # language_features:[num_names, num_templates, L, dim] language_mask:[num_names, num_templates, L]
             text_classifier, num_templates = self.get_text_classifier(meta['dataname'])
+            text_classifier = torch.cat([text_classifier, self.no_object_embed.weight], dim=0) # 增加一个背景类
 
             # others
-            geometric_prompt = self.detector._get_dummy_prompt()
+            geometric_prompt = self.detector._get_dummy_prompt(bs)
         
         batch_gt_names_idx = []
         for i in range(bs):
@@ -296,8 +401,8 @@ class SAM3MC(nn.Module):
         
         language_features_input = []
 
-        USE_GT_NAMES_ONLY = True
-        # USE_GT_NAMES_ONLY = False
+        # USE_GT_NAMES_ONLY = True
+        USE_GT_NAMES_ONLY = False
         
         if USE_GT_NAMES_ONLY:
             language_features_input = [self.language_features[batch_gt_names_idx[i],:,:] for i in range(bs)]
@@ -309,8 +414,8 @@ class SAM3MC(nn.Module):
                 language_mask_input = language_mask_input.unsqueeze(0)
 
         else:
-            language_features_input = self.language_features
-            language_mask_input = self.language_mask
+            language_features_input = self.language_features.expand(bs, -1, -1, -1) # (bs, num_names, L, dim)
+            language_mask_input = self.language_mask.expand(bs, -1, -1) # (bs, num_names, L)
 
         # print("shape of input:",language_features_input.shape, language_mask_input.shape)
         language_features_input = language_features_input.reshape(bs, -1, language_features_input.shape[-1]) # (bs, num_names * L, dim)
@@ -325,12 +430,6 @@ class SAM3MC(nn.Module):
             "language_features": language_features_input.permute(1, 0, 2), # (num_names * L, bs, dim)
             "language_mask": language_mask_input, # bs, (num_names * L)
         }
-        # outputs = self.detector.forward_grounding(
-        #     backbone_out = backbone_out,
-        #     find_input=self.find_stage,
-        #     geometric_prompt= geometric_prompt,
-        #     find_target=None,
-        # )
 
         #=================================
         find_input = self.find_stage
@@ -386,10 +485,7 @@ class SAM3MC(nn.Module):
         # print("outputs keys:", outputs.keys())
         # outputs keys: dict_keys(['encoder_hidden_states', 'prev_encoder_out', 'presence_feats', 'queries', 'presence_logit_dec', 'pred_logits', 'pred_boxes', 'pred_boxes_xyxy', 'pred_masks', 'semantic_seg', 'presence_logit', 'pixel_embed', 'instance_embeds', 'obj_queries']
 
-        out_bbox = outputs["pred_boxes"]
-
-
-        out_masks = outputs["pred_masks"]
+        out_masks = outputs["pred_masks"].clone()
 
         out_masks = out_masks.sigmoid()
 
@@ -422,71 +518,109 @@ class SAM3MC(nn.Module):
 
         text_classifier_mask = torch.zeros((C, bs), dtype=torch.bool, device=text_classifier.device)
 
-        scores = self.detector.dot_prod_scoring( # 这里把num names当作batch维度实现并行，算出每个query对所有类别的分数
-            hs=queries.unsqueeze(0)/queries.norm(dim=-1, keepdim=True).unsqueeze(0), # 1, bs, N, D, 
-            prompt=text_classifier.unsqueeze(0), # 1, C, D
-            prompt_mask=text_classifier_mask.expand(-1, bs), # C, bs 
-        ) # [bs, C, N, 1]
+        # scores = self.detector.dot_prod_scoring( # 这里把num names当作batch维度实现并行，算出每个query对所有类别的分数
+        #     hs=queries.unsqueeze(0)/queries.norm(dim=-1, keepdim=True).unsqueeze(0), # 1, bs, N, D, 
+        #     prompt=text_classifier.unsqueeze(0), # 1, C, D
+        #     prompt_mask=text_classifier_mask.expand(-1, bs), # C, bs 
+        # ) # [bs, C, N, 1]
 
-        queries_names_logits = scores
-        queries_names_probs = queries_names_logits.sigmoid()
-        queries_names_probs = queries_names_probs.squeeze(-1) # bs, C, N
+        # 用 maskpooling 代替点积score
+        fusion_feat = encoder_out["encoder_hidden_states"] # H'*W', bs, D
+        fusion_feat = fusion_feat.permute(1,0,2) # bs, H'*W', D
+        fusion_feat = fusion_feat.reshape(bs, img_feat.shape[-2], img_feat.shape[-1], fusion_feat.shape[-1])
+        # print("fusion_feat shape:", fusion_feat.shape) # bs, H'*W', D
 
-        # 训练时会启用DAC导致 N_prob > N_mask
-        N_mask = out_masks.shape[1] # 200
-        N_prob = queries_names_probs.shape[2] # 400 (因为 DAC)
+        mask_for_pooling = F.interpolate(
+            queries_masks,
+            size = fusion_feat.shape[1:3],
+            mode='bilinear',
+            align_corners=False
+        )
 
-        if N_prob > N_mask:
-            # 丢弃后 200 个 (o2m)，它们只是为了辅助训练，
-            # 真正的预测结果都在前 200 个 (o2o) 里。
-            queries_names_probs = queries_names_probs[:, :, :N_mask]
-        print("queries_names_probs shape:", queries_names_probs.shape)
+        pooled_fusion_feature = self.mask_pooling(
+                                    fusion_feat.permute(0,3,1,2), # bs, D, H', W'
+                                    mask_for_pooling
+                                )
+        out_vocab_cls_results = get_classification_logits(
+                                    pooled_fusion_feature, 
+                                    text_classifier, 
+                                    self.logit_scale.exp(), 
+                                    num_templates
+                                )
+        # print("out_vocab_cls_results shape:", out_vocab_cls_results.shape) # bs, C, numclasses + 1,已经处理为class而非name了
+
+        if self.training:
+            # mask classification target
+            if "instances" in batched_inputs[0]:
+                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                targets = self.prepare_targets(gt_instances, images)
+            else:
+                targets = None
+            
+            criterion_pred = {
+                'pred_logits': out_vocab_cls_results, 
+                'pred_masks': outputs["pred_masks"],
+                # 'aux_outputs': []
+            }
+
+            losses = self.criterion(criterion_pred, targets)
+
+            for k in list(losses.keys()):
+                if k in self.criterion.weight_dict:
+                    losses[k] *= self.criterion.weight_dict[k]
+                else:
+                    # remove this loss if not specified in `weight_dict`
+                    losses.pop(k)
+
+            # 只在训练时使用语义分割头
+            pixel_embed = outputs["pixel_embed"]
+            pixel_embed = self.detector.segmentation_head.instance_seg_head(pixel_embed)
+            pixel_embed = pixel_embed.permute(0,2,3,1) # bs, H, W, D
+            # =======================================================
+            # [新增] 3. 投影对齐
+            # input: [bs, H, W, pixel_dim] -> output: [bs, H, W, text_dim]
+            pixel_embed_projected = self.sem_seg_projector(pixel_embed)
+            
+            # 4. 归一化 (Normalization)
+            # 计算余弦相似度前，必须对特征和文本都做 L2 归一化，否则 Loss 难以收敛
+            pixel_embed_norm = F.normalize(pixel_embed_projected, p=2, dim=-1)
+            text_classifier_norm = F.normalize(text_classifier, p=2, dim=-1)
+            
+            # 5. 计算 Logits (点积)
+            # bhwd (pixel), cd (text) -> bhwc (logits)
+            # 使用 logit_scale 进行缩放 (类似 CLIP)
+            logit_scale = self.logit_scale.exp()
+            sem_seg_logits = torch.einsum("bhwd,cd->bhwc", pixel_embed_norm, text_classifier_norm) * logit_scale
+            # =======================================================
+            # print("pixel_embed shape:", pixel_embed.shape)
+            sem_seg_logits = sem_seg_logits.permute(0,3,1,2) # bs, num_names, H, W
+            final_sem_seg_logits = []
+            cur_idx = 0
+            for num_t in num_templates: 
+                final_sem_seg_logits.append(sem_seg_logits[:, cur_idx: cur_idx + num_t,:,:].max(1).values)
+                cur_idx += num_t
+            final_sem_seg_logits = torch.stack(final_sem_seg_logits, dim=1)
+
+            sem_seg_loss = self.semantic_segmentation_loss(final_sem_seg_logits, batched_inputs, images.tensor.shape)
+            losses.update(sem_seg_loss=sem_seg_loss)
+            return losses
+            
+        else:
+            out_vocab_cls_results = out_vocab_cls_results.sigmoid() 
+            queries_seg_result = torch.einsum("bnc,bnhw->bchw", out_vocab_cls_results, queries_masks) # [bs, num_classes+1, H, W]
 
 
-        # queries_seg_result = torch.zeros((bs, C, H, W), dtype=out_masks.dtype, device=out_masks.device)
-        # for n in range(queries_names_probs.shape[2]):
-        #     query_instance_result = torch.mul(
-        #         queries_masks[:, n, :, :].unsqueeze(1), # bs, 1, H, W
-        #         queries_names_probs[:, :, n].unsqueeze(-1).unsqueeze(-1) # bs, C, 1, 1
-        #     )
-        #     # print("query_instance_result shape:", query_instance_result.shape) [bs, C, H, W]
-        #     queries_seg_result = torch.max(queries_seg_result, query_instance_result)
-        
-        # 使用 einsum 极速聚合，显存占用极低，代替上面循环
-        queries_seg_result = torch.einsum("bnhw, bcn -> bchw", queries_masks, queries_names_probs)
-
-
-        # semantic_masks = torch.mul(out_semseg , presence_score.unsqueeze(-1)) 也用不了了
-
-        # 用pixel_embed点积分类器代替semantic head
-        pixel_embed = outputs["pixel_embed"]
-        pixel_embed = self.detector.segmentation_head.instance_seg_head(pixel_embed)
-        pixel_embed = pixel_embed.permute(0,2,3,1) # bs, H, W, D
-        # print("pixel_embed shape:", pixel_embed.shape)
-        sem_seg_logits = torch.einsum("bhwd,cd->bhwc", pixel_embed, text_classifier) # bs, H, W, num_names
-        sem_seg_logits = sem_seg_logits.permute(0,3,1,2) # bs, num_names, H, W
-        sem_seg_probs = sem_seg_logits.sigmoid()
-        # print("sem_seg_probs shape:", sem_seg_probs.shape)
-
-        # seg_logits = torch.max(queries_seg_result, sem_seg_logits) # [bs, num_names, H, W]
-
-        
-        # seg_logits = queries_seg_result # 目前先不用semantic head的结果
-        # seg_logits = sem_seg_probs
-        seg_logits = torch.max(queries_seg_result, sem_seg_probs) # [bs, num_names, H, W]
+        seg_logits = queries_seg_result 
 
         if USE_GT_NAMES_ONLY:
-            for b in range(bs):
-                gtcls_mask = torch.ones_like(seg_logits[b], dtype=torch.bool)
-                gtcls_mask[batch_gt_names_idx[b],:,:] = False
-                seg_logits[b][gtcls_mask] = 0.0
+            pass
+            # for b in range(bs):
+            #     gtcls_mask = torch.ones_like(seg_logits[b], dtype=torch.bool)
+            #     gtcls_mask[batch_gt_names_idx[b],:,:] = False
+            #     seg_logits[b][gtcls_mask] = 0.0
         
-        final_seg_logits = []
-        cur_idx = 0
-        for num_t in num_templates: 
-            final_seg_logits.append(seg_logits[:, cur_idx: cur_idx + num_t,:,:].max(1).values)
-            cur_idx += num_t
-        final_seg_logits = torch.stack(final_seg_logits, dim=1)
+        final_seg_logits = seg_logits
+        # print("final_seg_logits shape:", final_seg_logits.shape) # bs,num_classes+1, H, W
 
         pred_result = final_seg_logits[0].argmax(0)
         # visualize_segmentation(pred_result, self.vis_class_names+['void'],batched_inputs[0]["image"],f"./show_queries/{file_names[0]}_")
@@ -508,6 +642,59 @@ class SAM3MC(nn.Module):
             results.append({"sem_seg": res})
         # print("跑通！")
         return results
+
+    def semantic_segmentation_loss(self, pred_logits, batched_inputs, images_tensor_shape):
+        """
+        Args:
+            pred_logits (Tensor): 形状为 [B, NumClasses, H_feat, W_feat] 的预测结果 (通常是 Stride 4).
+            batched_inputs (list[dict]): 包含 'sem_seg' 的原始输入列表.
+            images_tensor_shape (tuple): images.tensor.shape, 即 [B, 3, H_pad, W_pad].
+                                        我们需要知道 Padded 后的总高宽来做正确的上采样.
+        """
+        # 1. 获取 Padded 的目标尺寸 (即 images.tensor 的 H, W)
+        # pred_logits 通常是下采样过的 (如 1/4)，我们需要先把它还原到 images.tensor 的尺度
+        _, _, pad_h, pad_w = images_tensor_shape
+        
+        # 2. 将整个 Batch 的预测上采样到 Padded 尺寸
+        # mode='bilinear' align_corners=False 是分割任务的标准做法
+        pred_logits_upsampled = F.interpolate(
+            pred_logits, 
+            size=(pad_h, pad_w), 
+            mode="bilinear", 
+            align_corners=False
+        )
+        
+        total_loss = 0.0
+        valid_samples = 0
+        
+        # 3. 逐张图片处理：裁剪出有效区域并计算 Loss
+        for i, input_per_image in enumerate(batched_inputs):
+            # 获取该样本的 GT (Semantic Map)
+            # 注意：sem_seg 可能在 CPU 上，需要移到 GPU
+            gt_sem_seg = input_per_image["sem_seg"].to(pred_logits.device)
+            
+            # 获取 GT 的真实尺寸 (未 Padding 的尺寸)
+            gt_h, gt_w = gt_sem_seg.shape
+            
+            # 从上采样后的预测中，裁剪出有效区域 (Top-Left corner)
+            # Detectron2 的 padding 默认是在右侧和下侧，所以切片 [:gt_h, :gt_w] 是安全的
+            valid_pred = pred_logits_upsampled[i, :, :gt_h, :gt_w]
+            
+            # 此时 valid_pred 的形状是 [NumClasses, gt_h, gt_w]
+            # gt_sem_seg 的形状是 [gt_h, gt_w]
+            # 增加一个 Batch 维度以使用 cross_entropy
+            valid_pred = valid_pred.unsqueeze(0) # [1, C, H, W]
+            gt_sem_seg = gt_sem_seg.unsqueeze(0) # [1, H, W]
+            
+            # 4. 计算 Loss
+            # ignore_index=255 是通用的忽略背景/无效区域的设定，请根据你的数据集调整
+            loss = F.cross_entropy(valid_pred, gt_sem_seg.long(), ignore_index=255)
+            
+            total_loss += loss
+            valid_samples += 1
+
+        # 平均 Loss
+        return total_loss / max(valid_samples, 1)    
 
 
     def semantic_inference(self, mask_cls, mask_pred):

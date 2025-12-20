@@ -13,9 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and 
 limitations under the License. 
 """
-from .backbone.clip import CLIP
+# from .backbone.clip import CLIP
 from .pixel_decoder.msdeformattn import MSDeformAttnPixelDecoder
 from .meta_arch.fcclip_head import FCCLIPHead
 
-from .backbone import PEEncoder
-from .backbone import dinov3txt
+# from .backbone import PEEncoder
+# from .backbone import dinov3txt
