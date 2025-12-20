@@ -36,6 +36,8 @@ from sam3.model.data_misc import FindStage, interpolate
 # from maft.utils.text_templetes import VILD_PROMPT
 VILD_PROMPT = ["{}"]
 
+# from maft.modeling.criterion import SetCriterion
+
 
 @META_ARCH_REGISTRY.register()
 class SAM3MC(nn.Module):
