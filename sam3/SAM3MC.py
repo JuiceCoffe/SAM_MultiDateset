@@ -153,6 +153,8 @@ class SAM3MC(nn.Module):
         self.train_metadata = MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
         _, self.train_num_templates, self.train_class_names = self.prepare_class_names_from_metadata(self.train_metadata, self.train_metadata)
 
+        self.use_aux = cfg.SOLVER.USE_AUX
+
         # -------------------------------------------------------
         # criterion损失函数
         # -------------------------------------------------------
@@ -163,7 +165,16 @@ class SAM3MC(nn.Module):
         dice_weight = cfg.SOLVER.DICE_WEIGHT
         mask_weight = cfg.SOLVER.MASK_WEIGHT
 
-        weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
+        weight_dict = {}
+        criterion_weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
+        weight_dict.update(criterion_weight_dict)
+
+        if self.use_aux:
+            for i in range (5):
+                for k in criterion_weight_dict.keys():
+                    weight_dict[f"{k}_{i}"] = criterion_weight_dict[k]
+        
+        
 
         # building criterion
         matcher = HungarianMatcher(
@@ -486,6 +497,7 @@ class SAM3MC(nn.Module):
                 prompt=prompt,
                 prompt_mask=prompt_mask,
                 hs=hs,
+                aux_masks=self.training,
             )
         
         # if self.detector.training or self.detector.num_interactive_steps_val > 0:
@@ -494,7 +506,7 @@ class SAM3MC(nn.Module):
         #========================================
         outputs = out
         # print("outputs keys:", outputs.keys())
-        # outputs keys: dict_keys(['encoder_hidden_states', 'prev_encoder_out', 'presence_feats', 'queries', 'presence_logit_dec', 'pred_logits', 'pred_boxes', 'pred_boxes_xyxy', 'pred_masks', 'semantic_seg', 'presence_logit', 'pixel_embed', 'instance_embeds', 'obj_queries']
+        # print('aux:',outputs['aux_outputs'][0].keys())
 
         out_masks = outputs["pred_masks"].clone()
 
@@ -525,34 +537,46 @@ class SAM3MC(nn.Module):
 
         queries_masks = out_masks # out_probs是通过与池化prompt投影卷积实现的，多类别下失效，直接用原始mask_logits
 
-        queries = outputs["obj_queries"] 
+        queries = outputs["obj_queries"] # 6, bs, N, D
 
         text_classifier_mask = torch.zeros((C_, bs), dtype=torch.bool, device=text_classifier.device)
 
-        # print("queries shape:", queries.shape) # bs, N, D
-        queries = queries[:,:N,:].clone() # 避免DAC造成的queries翻倍
-        queries = F.normalize(queries, dim=-1, p=2)
+        
+        self.use_aux = self.use_aux and self.training
+        aux_outputs = []
 
-        # hs=queries.unsqueeze(1)
-        # hs = hs.expand(-1, C_, -1, -1).contiguous().view(bs*(C_), N, -1).unsqueeze(0) # 1, bs*(C+1), N, D
-        # print("hs shape:", hs.shape)
-        # prompt= text_classifier.unsqueeze(0).expand( bs, -1, -1).contiguous().view(1, bs * C_, -1) # 1, bs*(C+1), D
-        # print("prompt shape", prompt.shape)
+        for i in range(6):
+            if self.use_aux or i == 5 :
+                tp_queries = queries[i,:,:N,:].clone() # 避免DAC造成的tp_queries翻倍
+                tp_queries = F.normalize(tp_queries, dim=-1, p=2)
 
-        out_vocab_names_results = self.detector.dot_prod_scoring( # 这里把num names当作batch维度实现并行，算出每个query对所有类别的分数
-            hs= queries.unsqueeze(1).expand(-1, C_, -1, -1).contiguous().view(bs*(C_), N, -1).unsqueeze(0), # 1, bs*(C+1), N, D
-            prompt = text_classifier.unsqueeze(0).expand( bs, -1, -1).contiguous().view(1, bs * C_, -1), # 1, bs*(C+1), D
-            prompt_mask=text_classifier_mask.expand(-1, bs).view(-1, 1), # (C+1) * bs 
-        ) 
+                # hs=tp_queries.unsqueeze(1)
+                # hs = hs.expand(-1, C_, -1, -1).contiguous().view(bs*(C_), N, -1).unsqueeze(0) # 1, bs*(C+1), N, D
+                # print("hs shape:", hs.shape)
+                # prompt= text_classifier.unsqueeze(0).expand( bs, -1, -1).contiguous().view(1, bs * C_, -1) # 1, bs*(C+1), D
+                # print("prompt shape", prompt.shape)
 
-        out_vocab_names_results = out_vocab_names_results.view(bs, C_, N).permute(0,2,1) # bs, N, C+1
-        out_vocab_cls_results= []
-        cur_idx = 0
-        for num_t in num_templates: 
-            out_vocab_cls_results.append(out_vocab_names_results[:,:, cur_idx: cur_idx + num_t].max(-1).values)
-            cur_idx += num_t
-        out_vocab_cls_results = torch.stack(out_vocab_cls_results, dim=-1) # bs, N, num_classes
-        out_vocab_cls_results = torch.cat([out_vocab_cls_results, out_vocab_names_results[:,:,-1:]], dim=-1) # bs, N, num_classes + 1 (添加背景类)
+                out_vocab_names_results = self.detector.dot_prod_scoring( # 这里把num names当作batch维度实现并行，算出每个query对所有类别的分数
+                    hs= tp_queries.unsqueeze(1).expand(-1, C_, -1, -1).contiguous().view(bs*(C_), N, -1).unsqueeze(0), # 1, bs*(C+1), N, D
+                    prompt = text_classifier.unsqueeze(0).expand( bs, -1, -1).contiguous().view(1, bs * C_, -1), # 1, bs*(C+1), D
+                    prompt_mask=text_classifier_mask.expand(-1, bs).view(-1, 1), # (C+1) * bs 
+                ) 
+
+                out_vocab_names_results = out_vocab_names_results.view(bs, C_, N).permute(0,2,1) # bs, N, C+1
+                out_vocab_cls_results= []
+                cur_idx = 0
+                for num_t in num_templates: 
+                    out_vocab_cls_results.append(out_vocab_names_results[:,:, cur_idx: cur_idx + num_t].max(-1).values)
+                    cur_idx += num_t
+                out_vocab_cls_results = torch.stack(out_vocab_cls_results, dim=-1) # bs, N, num_classes
+                out_vocab_cls_results = torch.cat([out_vocab_cls_results, out_vocab_names_results[:,:,-1:]], dim=-1) # bs, N, num_classes + 1 (添加背景类)
+                # print(f"aux out_vocab_cls_results[{i}] shape:", out_vocab_cls_results.shape)
+                if i<5:
+                    aux_outputs.append({'pred_logits': out_vocab_cls_results, 'pred_masks': outputs['aux_outputs'][i]["pred_masks"]})
+                else:
+                    out_vocab_cls_results_final = out_vocab_cls_results
+
+
 
         if self.training:
             # mask classification target
@@ -563,43 +587,20 @@ class SAM3MC(nn.Module):
                 targets = None
             
             criterion_pred = {
-                'pred_logits': out_vocab_cls_results,
+                'pred_logits': out_vocab_cls_results_final,
                 'pred_masks': outputs["pred_masks"],
-                # 'aux_outputs': []
+                'aux_outputs': aux_outputs if self.use_aux is True else None,
             }
 
             losses = self.criterion(criterion_pred, targets)
 
             for k in list(losses.keys()):
+                # print("loss:", k, losses[k].item())
                 if k in self.criterion.weight_dict:
                     losses[k] *= self.criterion.weight_dict[k]
                 else:
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
-
-            # 只在训练时使用语义分割头
-            # pixel_embed = outputs["pixel_embed"]
-            # pixel_embed = self.detector.segmentation_head.instance_seg_head(pixel_embed)
-            # pixel_embed = pixel_embed.permute(0,2,3,1) # bs, H, W, D
-
-            # pixel_embed_projected = self.sem_seg_projector(pixel_embed)
-            
-            # pixel_embed_norm = F.normalize(pixel_embed_projected, p=2, dim=-1)
-            # text_classifier_norm = F.normalize(text_classifier, p=2, dim=-1)
-
-            # logit_scale = self.logit_scale.exp()
-            # sem_seg_logits = torch.einsum("bhwd,cd->bhwc", pixel_embed_norm, text_classifier_norm) * logit_scale
-
-            # sem_seg_logits = sem_seg_logits.permute(0,3,1,2) # bs, num_names, H, W
-            # final_sem_seg_logits = []
-            # cur_idx = 0
-            # for num_t in num_templates: 
-            #     final_sem_seg_logits.append(sem_seg_logits[:, cur_idx: cur_idx + num_t,:,:].max(1).values)
-            #     cur_idx += num_t
-            # final_sem_seg_logits = torch.stack(final_sem_seg_logits, dim=1)
-
-            # sem_seg_loss = self.semantic_segmentation_loss(final_sem_seg_logits, batched_inputs, images.tensor.shape)
-            # losses.update(sem_seg_loss=sem_seg_loss)
 
             return losses
             

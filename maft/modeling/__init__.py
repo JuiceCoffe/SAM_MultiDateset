@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License. 
 """
 # from .backbone.clip import CLIP
-from .pixel_decoder.msdeformattn import MSDeformAttnPixelDecoder
-from .meta_arch.fcclip_head import FCCLIPHead
+# from .pixel_decoder.msdeformattn import MSDeformAttnPixelDecoder
+# from .meta_arch.fcclip_head import FCCLIPHead
 
 # from .backbone import PEEncoder
 # from .backbone import dinov3txt

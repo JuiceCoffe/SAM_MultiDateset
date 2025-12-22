@@ -324,5 +324,7 @@ class UniversalSegmentationHead(SegmentationHead):
             "presence_logit": presence_logit,
             "pixel_embed": pixel_embed, # 新增高分辨率特征图输出
             "instance_embeds": instance_embeds, # 新增实例嵌入输出(实际上是用于掩码预测的特征图)
-            "obj_queries": obj_queries[-1], # 新增对象查询输出
+            "fin_queries": obj_queries[-1,:,:,:], # 新增对象查询输出
+            'aux_queries': obj_queries[:-1,:,:,:] if self.aux_masks else None, # 新增辅助查询输出
+            'obj_queries': obj_queries, # 新增所有对象查询输出
         }

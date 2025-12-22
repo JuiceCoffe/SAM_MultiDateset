@@ -397,6 +397,7 @@ class Sam3Image(torch.nn.Module):
         prompt,
         prompt_mask,
         hs,
+        aux_masks = False # self.aux_loss and self.segmentation_head.aux_masks
     ):
         apply_dac = self.transformer.decoder.dac and self.training
         if self.segmentation_head is not None:
@@ -412,7 +413,7 @@ class Sam3Image(torch.nn.Module):
                 prompt=prompt,
                 prompt_mask=prompt_mask,
             )
-            aux_masks = False  # self.aux_loss and self.segmentation_head.aux_masks
+              # self.aux_loss and self.segmentation_head.aux_masks
             for k, v in seg_head_outputs.items():
                 if k in self.segmentation_head.instance_keys:
                     _update_out(out, k, v[:, :num_o2o], auxiliary=aux_masks)
