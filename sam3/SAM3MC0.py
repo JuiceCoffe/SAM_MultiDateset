@@ -33,8 +33,8 @@ from sam3.model_builder import (
 )
 from sam3.model.data_misc import FindStage, interpolate
 
-from maft.utils.text_templetes import VILD_PROMPT
-# VILD_PROMPT = ["{}"]
+# from maft.utils.text_templetes import VILD_PROMPT
+VILD_PROMPT = ["{}"]
 
 from maft.modeling.matcher import HungarianMatcher
 from maft.modeling.criterion import SetCriterion
@@ -196,8 +196,8 @@ class SAM3MC(nn.Module):
         for name, param in self.named_parameters():
             if 'backbone' in name:
                 param.requires_grad = False
-            # elif 'dot_prod_scoring' in name:
-            #     param.requires_grad = False
+            elif 'dot_prod_scoring' in name:
+                param.requires_grad = False
             elif 'geometry_encoder' in name:
                 param.requires_grad = False
             else:
@@ -516,7 +516,7 @@ class SAM3MC(nn.Module):
         
 
         bs, N, H, W = out_masks.shape
-        C_ = text_classifier.shape[0] # num_names + 1 
+        C = text_classifier.shape[0] # num_names
 
         # out_logits = outputs["pred_logits"] 
         # out_probs = out_logits.sigmoid() # bs, N, 1
@@ -527,32 +527,38 @@ class SAM3MC(nn.Module):
 
         queries = outputs["obj_queries"] 
 
-        text_classifier_mask = torch.zeros((C_, bs), dtype=torch.bool, device=text_classifier.device)
+        text_classifier_mask = torch.zeros((C, bs), dtype=torch.bool, device=text_classifier.device)
 
-        # print("queries shape:", queries.shape) # bs, N, D
-        queries = queries[:,:N,:].clone() # 避免DAC造成的queries翻倍
-        queries = F.normalize(queries, dim=-1, p=2)
+        # scores = self.detector.dot_prod_scoring( # 这里把num names当作batch维度实现并行，算出每个query对所有类别的分数
+        #     hs=queries.unsqueeze(0)/queries.norm(dim=-1, keepdim=True).unsqueeze(0), # 1, bs, N, D, 
+        #     prompt=text_classifier.unsqueeze(0), # 1, C, D
+        #     prompt_mask=text_classifier_mask.expand(-1, bs), # C, bs 
+        # ) # [bs, C, N, 1]
 
-        # hs=queries.unsqueeze(1)
-        # hs = hs.expand(-1, C_, -1, -1).contiguous().view(bs*(C_), N, -1).unsqueeze(0) # 1, bs*(C+1), N, D
-        # print("hs shape:", hs.shape)
-        # prompt= text_classifier.unsqueeze(0).expand( bs, -1, -1).contiguous().view(1, bs * C_, -1) # 1, bs*(C+1), D
-        # print("prompt shape", prompt.shape)
+        # 用 maskpooling 代替点积score
+        fusion_feat = encoder_out["encoder_hidden_states"] # H'*W', bs, D
+        fusion_feat = fusion_feat.permute(1,0,2) # bs, H'*W', D
+        fusion_feat = fusion_feat.reshape(bs, img_feat.shape[-2], img_feat.shape[-1], fusion_feat.shape[-1])
+        # print("fusion_feat shape:", fusion_feat.shape) # bs, H'*W', D
 
-        out_vocab_names_results = self.detector.dot_prod_scoring( # 这里把num names当作batch维度实现并行，算出每个query对所有类别的分数
-            hs= queries.unsqueeze(1).expand(-1, C_, -1, -1).contiguous().view(bs*(C_), N, -1).unsqueeze(0), # 1, bs*(C+1), N, D
-            prompt = text_classifier.unsqueeze(0).expand( bs, -1, -1).contiguous().view(1, bs * C_, -1), # 1, bs*(C+1), D
-            prompt_mask=text_classifier_mask.expand(-1, bs).view(-1, 1), # (C+1) * bs 
-        ) 
+        mask_for_pooling = F.interpolate(
+            queries_masks,
+            size = fusion_feat.shape[1:3],
+            mode='bilinear',
+            align_corners=False
+        )
 
-        out_vocab_names_results = out_vocab_names_results.view(bs, C_, N).permute(0,2,1) # bs, N, C+1
-        out_vocab_cls_results= []
-        cur_idx = 0
-        for num_t in num_templates: 
-            out_vocab_cls_results.append(out_vocab_names_results[:,:, cur_idx: cur_idx + num_t].max(-1).values)
-            cur_idx += num_t
-        out_vocab_cls_results = torch.stack(out_vocab_cls_results, dim=-1) # bs, N, num_classes
-        out_vocab_cls_results = torch.cat([out_vocab_cls_results, out_vocab_names_results[:,:,-1:]], dim=-1) # bs, N, num_classes + 1 (添加背景类)
+        pooled_fusion_feature = self.mask_pooling(
+                                    fusion_feat.permute(0,3,1,2), # bs, D, H', W'
+                                    mask_for_pooling
+                                )
+        out_vocab_cls_results = get_classification_logits(
+                                    pooled_fusion_feature, 
+                                    text_classifier, 
+                                    self.logit_scale.exp(), 
+                                    num_templates
+                                )
+        # print("out_vocab_cls_results shape:", out_vocab_cls_results.shape) # bs, C, numclasses + 1,已经处理为class而非name了
 
         if self.training:
             # mask classification target
@@ -563,7 +569,7 @@ class SAM3MC(nn.Module):
                 targets = None
             
             criterion_pred = {
-                'pred_logits': out_vocab_cls_results,
+                'pred_logits': out_vocab_cls_results, 
                 'pred_masks': outputs["pred_masks"],
                 # 'aux_outputs': []
             }
