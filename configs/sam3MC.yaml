@@ -43,5 +43,5 @@ INPUT:
     SIZE: (1008, 1008)
     # 如果遇到显存不够，可以把 SINGLE_CATEGORY_MAX_AREA 设为 1.0 忽略限制
 
-OUTPUT_DIR: ./out/semantic/sam3MC/bs16_3e-5_150k
+OUTPUT_DIR: ./out/semantic/sam3MC/bs8_3e-5_150k
   

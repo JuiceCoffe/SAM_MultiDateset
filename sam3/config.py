@@ -42,3 +42,5 @@ def add_sam3_config(cfg):
     cfg.SOLVER.TRAIN_NUM_POINTS = 12544
     cfg.SOLVER.OVERSAMPLE_RATIO = 3.0
     cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO = 0.75
+
+    cfg.SOLVER.USE_AUX = True
