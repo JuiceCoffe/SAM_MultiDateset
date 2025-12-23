@@ -551,13 +551,15 @@ class SAM3MC(nn.Module):
                 # prompt= text_classifier.unsqueeze(0).expand( bs, -1, -1).contiguous().view(1, bs * C_, -1) # 1, bs*(C+1), D
                 # print("prompt shape", prompt.shape)
 
-                out_vocab_names_results = self.detector.dot_prod_scoring( # 这里把num names当作batch维度实现并行，算出每个query对所有类别的分数
-                    hs= tp_queries.unsqueeze(1).expand(-1, C_, -1, -1).contiguous().view(bs*(C_), N, -1).unsqueeze(0), # 1, bs*(C+1), N, D
-                    prompt = text_classifier.unsqueeze(0).expand( bs, -1, -1).contiguous().view(1, bs * C_, -1), # 1, bs*(C+1), D
-                    prompt_mask=text_classifier_mask.expand(-1, bs).view(-1, 1), # (C+1) * bs 
-                ) 
+                # out_vocab_names_results = self.detector.dot_prod_scoring( # 这里把num names当作batch维度实现并行，算出每个query对所有类别的分数
+                #     hs= tp_queries.unsqueeze(1).expand(-1, C_, -1, -1).contiguous().view(bs*(C_), N, -1).unsqueeze(0), # 1, bs*(C+1), N, D
+                #     prompt = text_classifier.unsqueeze(0).expand( bs, -1, -1).contiguous().view(1, bs * C_, -1), # 1, bs*(C+1), D
+                #     prompt_mask=text_classifier_mask.expand(-1, bs).view(-1, 1), # (C+1) * bs 
+                # ) 
+                # out_vocab_names_results = out_vocab_names_results.view(bs, C_, N).permute(0,2,1) # bs, N, C+1
 
-                out_vocab_names_results = out_vocab_names_results.view(bs, C_, N).permute(0,2,1) # bs, N, C+1
+                out_vocab_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier) # bs, N, C+1
+                
                 out_vocab_cls_results= []
                 cur_idx = 0
                 for num_t in num_templates: 
