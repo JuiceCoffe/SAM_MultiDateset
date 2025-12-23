@@ -40,6 +40,8 @@ from maft.modeling.matcher import HungarianMatcher
 from maft.modeling.criterion import SetCriterion
 from maft.modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
 
+from .NearMatcher import match_every_pred_to_best_gt
+
 class PixelProjector(nn.Module):
     def __init__(self, input_dim, output_dim, hidden_dim=None):
         """
@@ -76,7 +78,7 @@ class PixelProjector(nn.Module):
 
 
 @META_ARCH_REGISTRY.register()
-class SAM3MC(nn.Module):
+class SAM3MC_ora(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.device_type = cfg.MODEL.DEVICE
@@ -197,6 +199,17 @@ class SAM3MC(nn.Module):
             importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
         )
 
+        # --------------------------------------------------
+        # Oracle
+        # --------------------------------------------------
+
+        self.OracleSelect_on = True
+        self.oracle_matcher = HungarianMatcher(
+            cost_class=0,
+            cost_mask=mask_weight,
+            cost_dice=dice_weight,
+            num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
+        )
         # --------------------------------------------------
         # sam3的其他配置
         # --------------------------------------------------
@@ -497,7 +510,7 @@ class SAM3MC(nn.Module):
                 prompt=prompt,
                 prompt_mask=prompt_mask,
                 hs=hs,
-                aux_masks=self.training,
+                aux_masks=True,
             )
         
         # if self.detector.training or self.detector.num_interactive_steps_val > 0:
@@ -512,20 +525,6 @@ class SAM3MC(nn.Module):
 
         out_masks = out_masks.sigmoid()
 
-        # presence_score = outputs["presence_logit_dec"].sigmoid().unsqueeze(1) # 在多类别情况下认为失效
-
-        # out_semseg = outputs["semantic_seg"] # 原语义分割头输出，舍去
-        # out_semseg = F.interpolate(
-        #     out_semseg,
-        #     size=(img_h, img_w),
-        #     mode="bilinear",
-        #     align_corners=False,
-        # ).sigmoid()
-
-
-        # print("out_masks shape:", out_masks.shape, "out_probs shape:", out_probs.shape, "out_semseg shape:", out_semseg.shape, "presence_score shape:", presence_score.shape)
-        # out_masks shape: torch.Size([1, 200, 1008, 1008]) out_probs shape: torch.Size([1, 200]) out_semseg shape: torch.Size([1, 1, 1008, 1008]) presence_score shape: torch.Size([1, 1, 1])
-        
 
         bs, N, H, W = out_masks.shape
         C_ = text_classifier.shape[0] # num_names + 1 
@@ -576,6 +575,65 @@ class SAM3MC(nn.Module):
                 else:
                     out_vocab_cls_results_final = out_vocab_cls_results
 
+        if self.OracleSelect_on:
+            # print('='*20,"Oracle select开始",'='*20) # ==================================
+            targets = []
+            input_per_image = batched_inputs[0]
+            height = input_per_image.get("height")
+            width = input_per_image.get("width")
+            sem_seg = input_per_image["sem_seg"].to(self.device)
+
+            image_masks, image_labels = self.sem_seg_2_gt_masks(sem_seg, height, width)
+
+            if image_labels.numel() == 0:
+                print('='*20,"image_labels.numel() == 0",'='*20)
+                # return self.forward(batched_inputs,no_gt_masks=True)
+                return "image_labels.numel() == 0"
+            
+            target_for_this_image = {
+                "labels": image_labels.long(), 
+                "masks": image_masks
+            }
+            targets.append(target_for_this_image)
+
+            mask_cls_results = out_vocab_cls_results_final
+            mask_pred_results = outputs["pred_masks"]
+
+            outputs_for_match = {"pred_logits": mask_cls_results, "pred_masks": mask_pred_results}
+            # print('='*20,"准备Oracle select匹配",'='*20)
+            # oracle_indices = self.oracle_matcher(outputs_for_match, targets)
+            oracle_indices = match_every_pred_to_best_gt(self.oracle_matcher, outputs_for_match, targets)
+            # print('='*20,"结束Oracle select匹配",'='*20)
+            new_mask_cls_results = []
+            new_mask_pred_results = []
+            new_out_vocab_cls_results = [] 
+
+            for i, (pred_idx, gt_idx) in enumerate(oracle_indices):
+                # 1. 提取预测相关的 Mask 和原始分类结果
+                selected_cls = mask_cls_results[i, pred_idx]
+                selected_pred = mask_pred_results[i, pred_idx]
+                
+                # 2. 关键修改：获取该图片匹配到的真实类别 ID
+                # targets[i]["labels"] 是该图所有 GT 的类别，使用 gt_idx 按匹配顺序重排
+                matched_gt_labels = targets[i]["labels"][gt_idx] 
+                
+                # 3. 将 matched_gt_labels 存入结果（它现在直接就是真实的类别数字）
+                # 注意：如果后续需要它跟 mask_cls_results 维度对齐，可能需要根据业务逻辑处理
+                selected_out_vocab_cls = matched_gt_labels
+
+                new_mask_cls_results.append(selected_cls)
+                new_mask_pred_results.append(selected_pred)
+                new_out_vocab_cls_results.append(selected_out_vocab_cls)
+
+            # 堆叠回 Tensor
+            mask_cls_results = torch.stack(new_mask_cls_results)
+            mask_pred_results = torch.stack(new_mask_pred_results)
+            queries_masks = mask_pred_results.sigmoid()
+            # 此时 out_vocab_cls_results 里的值就是真实的物体类别 ID
+            out_vocab_cls_results = torch.stack(new_out_vocab_cls_results)
+            out_vocab_cls_results = F.one_hot(out_vocab_cls_results, num_classes=len(num_templates)).float()
+
+            # print("out_vocab_cls_results:",out_vocab_cls_results.shape)
 
 
         if self.training:
@@ -621,7 +679,7 @@ class SAM3MC(nn.Module):
         final_seg_logits = seg_logits[:, :-1, :, :]
         # print("final_seg_logits shape:", final_seg_logits.shape) # bs,num_classes+1, H, W
 
-        # pred_result = final_seg_logits[0].argmax(0)
+        pred_result = final_seg_logits[0].argmax(0)
         # visualize_segmentation(pred_result, self.vis_class_names+['void'],batched_inputs[0]["image"],f"./show_queries/{file_names[0]}_")
         # visualize_segmentation(pred_result, self.vis_class_names+['void'],batched_inputs[0]["image"],f"./show_seg/{file_names[0]}_")
 
@@ -701,6 +759,26 @@ class SAM3MC(nn.Module):
         mask_pred = mask_pred.sigmoid()
         semseg = torch.einsum("qc,qhw->chw", mask_cls, mask_pred)
         return semseg
+
+    def sem_seg_2_gt_masks(self, sem_seg, height, width):
+        classes = torch.unique(sem_seg,sorted=False,return_inverse=False,return_counts=False)
+        gt_labels = classes[classes != 255]
+        masks = [sem_seg == class_id for class_id in gt_labels]
+
+        if len(masks) == 0:
+            gt_masks = torch.zeros((0, sem_seg.shape[-2],
+                                            sem_seg.shape[-1])).to(sem_seg)
+        else:
+            gt_masks = torch.stack(masks).squeeze(1)
+            
+        num_masks = gt_masks.shape[0]
+        total_masks = torch.zeros((num_masks, gt_masks.shape[1], gt_masks.shape[2]), dtype=gt_masks.dtype, device=gt_masks.device)
+        labels = torch.zeros((num_masks), device=gt_masks.device)
+        
+        total_masks[:num_masks] = gt_masks[:num_masks]
+        labels[:num_masks] = gt_labels[:num_masks]
+        
+        return total_masks.float(), labels
 
 def get_gt_labels_from_sem_seg(sem_seg):
     """

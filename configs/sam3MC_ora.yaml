@@ -1,7 +1,7 @@
 MODEL:
   PIXEL_MEAN : [127.5, 127.5, 127.5]
   PIXEL_STD : [127.5, 127.5, 127.5]
-  META_ARCHITECTURE: "SAM3MC"
+  META_ARCHITECTURE: "SAM3MC_ora"
   SAM3:
     BPE_PATH: "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
     ENABLE_SEGMENTATION: True
@@ -27,7 +27,7 @@ SOLVER:
   USE_AUX : True
 
 TEST:
-  EVAL_PERIOD: 16 # 7500
+  EVAL_PERIOD: 7500
 
 INPUT:
   DATASET_MAPPER_NAME: "mask_former_semantic" 
@@ -43,5 +43,5 @@ INPUT:
     SIZE: (1008, 1008)
     # 如果遇到显存不够，可以把 SINGLE_CATEGORY_MAX_AREA 设为 1.0 忽略限制
 
-OUTPUT_DIR: ./out/semantic/sam3MC/bs8_3e-5_150k
+OUTPUT_DIR: ./out/semantic/sam3MC/ora_bs8_3e-5_150k
   

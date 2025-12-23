@@ -497,7 +497,7 @@ class SAM3MC(nn.Module):
                 prompt=prompt,
                 prompt_mask=prompt_mask,
                 hs=hs,
-                aux_masks=self.training,
+                aux_masks=True,
             )
         
         # if self.detector.training or self.detector.num_interactive_steps_val > 0:
@@ -530,11 +530,6 @@ class SAM3MC(nn.Module):
         bs, N, H, W = out_masks.shape
         C_ = text_classifier.shape[0] # num_names + 1 
 
-        # out_logits = outputs["pred_logits"] 
-        # out_probs = out_logits.sigmoid() # bs, N, 1
-
-        # queries_masks = torch.mul(out_masks,out_probs.unsqueeze(-1)) # 每个实例的mask乘以对应的概率得分 [bs, N, H, W]
-
         queries_masks = out_masks # out_probs是通过与池化prompt投影卷积实现的，多类别下失效，直接用原始mask_logits
 
         queries = outputs["obj_queries"] # 6, bs, N, D
@@ -542,11 +537,11 @@ class SAM3MC(nn.Module):
         text_classifier_mask = torch.zeros((C_, bs), dtype=torch.bool, device=text_classifier.device)
 
         
-        self.use_aux = self.use_aux and self.training
+        use_aux = self.use_aux and self.training
         aux_outputs = []
 
         for i in range(6):
-            if self.use_aux or i == 5 :
+            if use_aux or i == 5 :
                 tp_queries = queries[i,:,:N,:].clone() # 避免DAC造成的tp_queries翻倍
                 tp_queries = F.normalize(tp_queries, dim=-1, p=2)
 
@@ -589,7 +584,7 @@ class SAM3MC(nn.Module):
             criterion_pred = {
                 'pred_logits': out_vocab_cls_results_final,
                 'pred_masks': outputs["pred_masks"],
-                'aux_outputs': aux_outputs if self.use_aux is True else None,
+                'aux_outputs': aux_outputs if use_aux is True else None,
             }
 
             losses = self.criterion(criterion_pred, targets)
