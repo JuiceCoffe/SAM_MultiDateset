@@ -634,7 +634,7 @@ class SAM3MC_DINO(nn.Module):
             # !!! 关键修改：硬阈值二值化 !!!
             # 如果不加这行，背景的 0.01 * 10000个像素 > 前景 0.9 * 100个像素
             # 导致所有 query 提取出来的都是“背景平均特征”，所以预测结果全图一样。
-            mask_threshold = 0.7
+            mask_threshold = 0.9
             binarized_mask = (mask_for_pool > mask_threshold).float()
 
             # 执行 Pooling

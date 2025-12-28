@@ -40,40 +40,6 @@ from .loss.matcher import HungarianMatcher
 from .loss.criterion import SetCriterion
 from maft.modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
 
-class PixelProjector(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim=None):
-        """
-        Args:
-            input_dim: pixel_embed 的通道数 (通常是 SAM 解码器的输出维度，如 256)
-            output_dim: text_classifier 的通道数 (即文本编码器的维度，如 CLIP 的 512/768/1024)
-            hidden_dim: MLP 隐藏层维度，默认等于 input_dim
-        """
-        super().__init__()
-        if hidden_dim is None:
-            hidden_dim = input_dim
-            
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
-        
-        # 初始化参数：Xavier 初始化有助于训练稳定
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.weight, 1.0)
-            nn.init.constant_(m.bias, 0.0)
-
-    def forward(self, x):
-        return self.net(x)
-
 
 @META_ARCH_REGISTRY.register()
 class SAM3MC(nn.Module):
@@ -140,11 +106,6 @@ class SAM3MC(nn.Module):
 
         # 在 __init__ 中
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07)) # 这是一个经验值
-
-        self.sem_seg_projector = PixelProjector(
-            input_dim= 256,
-            output_dim= 256,
-        )
 
         # -------------------------------------------------------
         # 训练配置
@@ -536,6 +497,7 @@ class SAM3MC(nn.Module):
 
         queries = outputs["obj_queries"] # 6, bs, N, D
         pixel_embed = outputs["pixel_embed"] # bs, D, H', W'
+        instance_embeds = outputs["instance_embeds"] 
 
         use_aux = self.use_aux and self.training
         aux_outputs = []
@@ -565,12 +527,13 @@ class SAM3MC(nn.Module):
                 query_cls_results = torch.stack(query_cls_results, dim=-1) # bs, N, num_classes
                 # print(f"aux query_cls_results[{i}] shape:", query_cls_results.shape)
 
-                # 用点积结果代替原有掩码生成逻辑
-                tp_masks_logits = torch.einsum("bnd,bdhw->bnhw", tp_queries, pixel_embed) # bs, N, D @ bs, D, H', W' -> bs, N, H', W'
-                if i<5:    
-                    outputs['aux_outputs'][i]["pred_masks"] = tp_masks_logits
-                else:
-                    outputs["pred_masks"] = tp_masks_logits
+                # # 用点积结果代替原有掩码生成逻辑 疑似效果极差
+                # tp_masks_logits = torch.einsum("bnd,bdhw->bnhw", tp_queries, instance_embeds) # bs, N, D @ bs, D, H', W' -> bs, N, H', W'
+                # if i<5:    
+                #     outputs['aux_outputs'][i]["pred_masks"] = tp_masks_logits
+                # else:
+                #     outputs["pred_masks"] = tp_masks_logits
+                    
 
                 if i<5:
                     aux_outputs.append({'pred_logits': query_cls_results, 'pred_masks': outputs['aux_outputs'][i]["pred_masks"]})
