@@ -54,11 +54,14 @@ from maft import (
     # add_fcclip_config,
 )
 
+from maft.data.dataset_mappers.coco_combine_new_baseline_dataset_mapper import COCOCombineNewBaselineDatasetMapper
+
 from sam3.config import add_sam3_config
 from sam3.modeling_d2 import SAM3Wrapper # 导入这个类就会自动触发 REGISTER
 from sam3.SAM3MC import SAM3MC
 from sam3.SAM3MC_ora import SAM3MC_ora
 from sam3.SAM3MC_DINO import SAM3MC_DINO
+from sam3.SAM3MC_o365 import SAM3MC_o365
 
 
 class Trainer(DefaultTrainer):
@@ -127,8 +130,12 @@ class Trainer(DefaultTrainer):
         elif cfg.INPUT.DATASET_MAPPER_NAME == "coco_semantic_lsj":
             mapper = COCOSemanticNewBaselineDatasetMapper(cfg, True)
             return build_detection_train_loader(cfg, mapper=mapper)
-        
+        elif cfg.INPUT.DATASET_MAPPER_NAME == "coco_combine_lsj":
+            mapper = COCOCombineNewBaselineDatasetMapper(cfg, True)
+            return build_detection_train_loader(cfg, mapper=mapper)        
         else:
+            print(f"mapper {cfg.INPUT.DATASET_MAPPER_NAME}不存在！")
+            exit()
             mapper = None
             return build_detection_train_loader(cfg, mapper=mapper)
 

@@ -132,26 +132,19 @@ class SetCriterion(nn.Module):
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
 
-    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
+    def __init__(self,  matcher, weight_dict,  losses,
                  num_points, oversample_ratio, importance_sample_ratio):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
             matcher: module able to compute a matching between targets and proposals
             weight_dict: dict containing as key the names of the losses and as values their relative weight.
-            eos_coef: relative classification weight applied to the no-object category
             losses: list of all the losses to be applied. See get_loss for list of available losses.
         """
         super().__init__()
-        self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
-        self.eos_coef = eos_coef
         self.losses = losses
-        # empty_weight = torch.ones(self.num_classes + 1)
-        # empty_weight[-1] = self.eos_coef
-        empty_weight = torch.ones(self.num_classes)
-        self.register_buffer("empty_weight", empty_weight)
 
         # pointwise mask loss parameters
         self.num_points = num_points
@@ -194,28 +187,6 @@ class SetCriterion(nn.Module):
 
             losses = {"loss_ce": loss_ce}
             return losses
-
-    # def loss_labels(self, outputs, targets, indices, num_masks):
-    #     """Classification loss (NLL)
-    #     targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
-    #     """
-    #     assert "pred_logits" in outputs
-    #     src_logits = outputs["pred_logits"].float()
-
-    #     idx = self._get_src_permutation_idx(indices)
-    #     target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-    #     target_classes = torch.full(
-    #         src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device
-    #     )
-    #     target_classes[idx] = target_classes_o
-
-    #     print("src_logits shape:", src_logits.transpose(1, 2).shape)
-    #     print("target_classes shape:", target_classes.shape)
-    #     print("empty_weight shape:", self.empty_weight.shape)
-
-    #     loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
-    #     losses = {"loss_ce": loss_ce}
-    #     return losses
     
     def loss_masks(self, outputs, targets, indices, num_masks):
         """Compute the losses related to the masks: the focal loss and the dice loss.
@@ -332,8 +303,6 @@ class SetCriterion(nn.Module):
             "matcher: {}".format(self.matcher.__repr__(_repr_indent=8)),
             "losses: {}".format(self.losses),
             "weight_dict: {}".format(self.weight_dict),
-            "num_classes: {}".format(self.num_classes),
-            "eos_coef: {}".format(self.eos_coef),
             "num_points: {}".format(self.num_points),
             "oversample_ratio: {}".format(self.oversample_ratio),
             "importance_sample_ratio: {}".format(self.importance_sample_ratio),

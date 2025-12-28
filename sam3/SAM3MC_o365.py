@@ -40,9 +40,11 @@ from .loss.matcher import HungarianMatcher
 from .loss.criterion import SetCriterion
 from maft.modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
 
+import random
+
 
 @META_ARCH_REGISTRY.register()
-class SAM3MC(nn.Module):
+class SAM3MC_o365(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.device_type = cfg.MODEL.DEVICE
@@ -123,7 +125,6 @@ class SAM3MC(nn.Module):
         # -------------------------------------------------------
         # criterion损失函数
         # -------------------------------------------------------
-        no_object_weight = cfg.SOLVER.NO_OBJECT_WEIGHT
 
         # loss weights
         class_weight = cfg.SOLVER.CLASS_WEIGHT
@@ -186,17 +187,67 @@ class SAM3MC(nn.Module):
     def prepare_targets(self, targets, images):
         h_pad, w_pad = images.tensor.shape[-2:]
         new_targets = []
+        masks_list = []
+        labels_list = []
+
+        num_masks = 32  # 每张图片最多选取 24 个掩码
+        min_mask_area = 0
+        
         for targets_per_image in targets:
-            # pad gt
+            # 获取原始掩码并进行 padding
             gt_masks = targets_per_image.gt_masks
-            padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
-            padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
-            new_targets.append(
-                {
-                    "labels": targets_per_image.gt_classes,
-                    "masks": padded_masks,
-                }
-            )
+            if isinstance(gt_masks, BitMasks):
+                gt_masks = gt_masks.tensor
+            valid_mask_indices = [i for i, mask in enumerate(gt_masks) if mask.sum() > min_mask_area]  # 筛选掉面积小于阈值的掩码
+
+            if len(valid_mask_indices) > 0:
+                valid_gt_masks = gt_masks[valid_mask_indices]
+                valid_gt_classes = targets_per_image.gt_classes[valid_mask_indices]
+                
+                padded_masks = torch.zeros((valid_gt_masks.shape[0], h_pad, w_pad), dtype=valid_gt_masks.dtype, device=valid_gt_masks.device)
+                padded_masks[:, : valid_gt_masks.shape[1], : valid_gt_masks.shape[2]] = valid_gt_masks
+                new_targets.append(
+                    {
+                        "labels": valid_gt_classes,
+                        "masks": padded_masks,
+                    }
+                )
+
+                # 初始化 total_masks 和 selected_labels
+                total_masks = torch.zeros((num_masks, h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+                selected_labels = torch.zeros((num_masks), device=gt_masks.device)
+
+                if valid_gt_masks.shape[0] != 0:
+                    # 随机选取有效的掩码
+                    selected_indices = random.choices(range(valid_gt_masks.shape[0]), k=num_masks)
+
+                    for idx, mask_idx in enumerate(selected_indices):
+                        total_masks[idx, :valid_gt_masks[mask_idx].shape[0], :valid_gt_masks[mask_idx].shape[1]] = valid_gt_masks[mask_idx]
+                        selected_labels[idx] = valid_gt_classes[mask_idx]
+                else:
+                    selected_labels.fill_(-1)  # 若没有有效掩码，则填充255表示无效
+            else:
+                total_masks = torch.zeros((num_masks, h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+                selected_labels = torch.zeros((num_masks), device=gt_masks.device)
+                selected_labels.fill_(-1)  # 若所有掩码全为0，则标记为无效
+                
+                padded_masks = torch.zeros((0, h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+                valid_gt_classes = torch.zeros((0), device=gt_masks.device)
+                new_targets.append(
+                    {
+                        "labels": valid_gt_classes,
+                        "masks": padded_masks,
+                    }
+                )
+
+            masks_list.append(total_masks)
+            labels_list.append(selected_labels)
+
+        masks = torch.stack(masks_list, dim=0)
+        labels = torch.stack(labels_list, dim=0)
+        labels = labels.long()
+
+        # return new_targets, masks, labels
         return new_targets
 
     def prepare_class_names_from_metadata(self, metadata, train_metadata):
@@ -351,7 +402,9 @@ class SAM3MC(nn.Module):
             file_names = [x["file_name"] for x in batched_inputs]
             file_names = [x.split('/')[-1].split('.')[0] for x in file_names]
 
-            meta = batched_inputs[0]["meta"]
+            # meta = batched_inputs[0]["meta"]
+            
+            dataname = batched_inputs[0]['dataname']
             
             # 图形特征
             backbone_out_vision = self.detector.backbone.forward_image(images.tensor)
@@ -364,14 +417,28 @@ class SAM3MC(nn.Module):
             # 语言特征
             # text_classifier:[num_names, dim] 
             # language_features:[num_names, num_templates, L, dim] language_mask:[num_names, num_templates, L]
-            text_classifier, num_templates = self.get_text_classifier(meta['dataname'])
+            
+            # text_classifier, num_templates = self.get_text_classifier(meta['dataname'])
+            text_classifier, num_templates = self.get_text_classifier(dataname)
 
             # others
             geometric_prompt = self.detector._get_dummy_prompt(bs)
         
         batch_gt_names_idx = []
         for i in range(bs):
-            gt_classes = get_gt_labels_from_sem_seg(batched_inputs[i]["sem_seg"].to(self.device))
+            # gt_classes = get_gt_labels_from_sem_seg(batched_inputs[i]["sem_seg"].to(self.device))
+
+            # === 修改开始：适配 Objects365 的 Instances 格式 ===
+            gt_classes = []
+            if "instances" in batched_inputs[i]:
+                # 从实例中提取去重后的类别 ID
+                if len(batched_inputs[i]["instances"]) > 0:
+                    gt_classes = batched_inputs[i]["instances"].gt_classes.unique().cpu().tolist()
+            elif "sem_seg" in batched_inputs[i]:
+                # 兼容旧的 COCO Stuff 逻辑
+                gt_classes = get_gt_labels_from_sem_seg(batched_inputs[i]["sem_seg"].to(self.device))
+            # === 修改结束 ===
+
             gt_names_idx = []
             cur_idx = 0
             for i,num_t in enumerate(num_templates): 

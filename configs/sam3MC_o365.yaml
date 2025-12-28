@@ -1,0 +1,64 @@
+MODEL:
+  PIXEL_MEAN : [127.5, 127.5, 127.5]
+  PIXEL_STD : [127.5, 127.5, 127.5]
+  META_ARCHITECTURE: "SAM3MC_o365"
+  SAM3:
+    BPE_PATH: "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
+    ENABLE_SEGMENTATION: True
+  WEIGHTS: "/data/hmp/huggingface/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
+  # WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
+  # WEIGHTS: /data/hmp/sam3.pt
+DATASETS:
+  TRAIN: ("objects365_v1_masktrain",) #"lvis_v1_train","openvocab_coco_2017_train_panoptic_with_sem_seg")
+  TEST: ('openvocab_ade20k_panoptic_val',) 
+SOLVER:
+  AMP:
+    ENABLED: True
+  IMS_PER_BATCH: 32
+  # IMS_PER_BATCH: 3
+  BASE_LR: 0.0001
+  LR_SCHEDULER_NAME: WarmupPolyLR
+  MAX_ITER: 75000 # 295000 # 55000 
+  CHECKPOINT_PERIOD: 7500
+
+  CLASS_WEIGHT: 2.0
+  MASK_WEIGHT: 5.0
+  DICE_WEIGHT: 5.0
+  USE_AUX : True
+
+TEST:
+  EVAL_PERIOD: 7500
+
+INPUT:
+  # DATASET_MAPPER_NAME: "mask_former_semantic" 
+  DATASET_MAPPER_NAME: "coco_combine_lsj"
+  IMAGE_SIZE: 1008
+  # 1. 禁用缩放抖动：将最小和最大缩放比例都设为 1.0
+  MIN_SCALE: 1.0
+  MAX_SCALE: 1.0
+  
+  # 2. 锁定尺寸：让最短边和最长边都限制在 1008
+  MIN_SIZE_TRAIN: (1008,)
+  MAX_SIZE_TRAIN: 1008
+  MIN_SIZE_TEST: 1008
+  MAX_SIZE_TEST: 1008
+  
+  # 3. 保持 Crop 开启：确保输出一定是 1008x1008 的正方形
+  CROP:
+    ENABLED: True
+    TYPE: "absolute"
+    SIZE: (1008, 1008)
+    SINGLE_CATEGORY_MAX_AREA: 1.0
+    
+  MASK_FORMAT: "bitmask"
+  FORMAT: "RGB"
+
+OUTPUT_DIR: ./out/objects365/bs32_1e-4_75k
+  
+DATALOADER:
+  # 必须开启！过滤掉没有标注的图片
+  FILTER_EMPTY_ANNOTATIONS: True
+  # 开启长宽比分组，减少 padding 浪费，节省显存
+  ASPECT_RATIO_GROUPING: True
+  # Objects365 图片解码较慢，建议增加 workers
+  NUM_WORKERS: 0

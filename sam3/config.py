@@ -27,6 +27,9 @@ def add_sam3_config(cfg):
     cfg.INPUT.COLOR_AUG_SSD = False    
     cfg.INPUT.SIZE_DIVISIBILITY = -1
 
+    cfg.INPUT.MIN_SCALE = 0.1
+    cfg.INPUT.MAX_SCALE = 2.0
+
 
     cfg.MODEL.PIXEL_MEAN = [127.5, 127.5, 127.5]
     cfg.MODEL.PIXEL_STD = [127.5, 127.5, 127.5]
