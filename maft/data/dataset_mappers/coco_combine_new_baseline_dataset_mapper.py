@@ -231,5 +231,11 @@ class COCOCombineNewBaselineDatasetMapper:
         #instances.gt_boxes = Boxes(boxes)
         dataset_dict["instances"] = instances
 
+        dataset_dict["meta"] = {
+            **{k: dataset_dict[k] for k in ["file_name", "height", "width", "image_id"] if k in dataset_dict},
+            "dataname": "objects365_v1_masktrain" if "obj365" in dataset_dict["file_name"] else ("lvis_v1_train" if "annotations" in dataset_dict else "openvocab_coco_2017_train_panoptic_with_sem_seg")
+        }
+
+        
         return dataset_dict
 

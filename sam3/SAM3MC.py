@@ -97,9 +97,7 @@ class SAM3MC(nn.Module):
         # -------------------------------------------------------
         self.mask_pooling = MaskPooling()
 
-        # 【新增】初始化 logit_bias
-        # 我们希望初始概率 p = 0.01
-        # Sigmoid(x) = 0.01  =>  x = log(0.01 / (1 - 0.01)) ≈ -4.595
+        # 初始概率 p = 0.01
         prior_prob = 0.01
         bias_value = -np.log((1 - prior_prob) / prior_prob)
         self.logit_bias = nn.Parameter(torch.ones([]) * bias_value)

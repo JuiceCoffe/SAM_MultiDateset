@@ -91,6 +91,15 @@ class Trainer(DefaultTrainer):
                     output_dir=output_folder,
                 )
             )
+        # semantic segmentation
+        if cfg.INPUT.DATASET_MAPPER_NAME == "coco_combine_lsj":
+            evaluator_list.append(
+                SemSegEvaluator(
+                    dataset_name,
+                    distributed=True,
+                    output_dir=output_folder,
+                )
+            )
         # panoptic segmentation
         elif cfg.INPUT.DATASET_MAPPER_NAME == "coco_panoptic_lsj":
             evaluator_list.append(COCOPanopticEvaluator(dataset_name, output_dir=output_folder))

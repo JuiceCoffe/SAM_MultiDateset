@@ -402,9 +402,9 @@ class SAM3MC_o365(nn.Module):
             file_names = [x["file_name"] for x in batched_inputs]
             file_names = [x.split('/')[-1].split('.')[0] for x in file_names]
 
-            # meta = batched_inputs[0]["meta"]
+            meta = batched_inputs[0]["meta"]
             
-            dataname = batched_inputs[0]['dataname']
+            dataname = meta['dataname']
             
             # 图形特征
             backbone_out_vision = self.detector.backbone.forward_image(images.tensor)
@@ -614,7 +614,7 @@ class SAM3MC_o365(nn.Module):
                 targets = self.prepare_targets(gt_instances, images)
             else:
                 targets = None
-            
+
             criterion_pred = {
                 'pred_logits': query_cls_results_final,
                 'pred_masks': outputs["pred_masks"],
