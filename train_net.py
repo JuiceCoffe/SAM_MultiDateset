@@ -91,8 +91,11 @@ class Trainer(DefaultTrainer):
                     output_dir=output_folder,
                 )
             )
-        # semantic segmentation
-        if cfg.INPUT.DATASET_MAPPER_NAME == "coco_combine_lsj":
+        # panoptic segmentation
+        elif cfg.INPUT.DATASET_MAPPER_NAME == "coco_panoptic_lsj":
+            evaluator_list.append(COCOPanopticEvaluator(dataset_name, output_dir=output_folder))
+        elif cfg.INPUT.DATASET_MAPPER_NAME == "coco_combine_lsj":
+            evaluator_list.append(COCOPanopticEvaluator(dataset_name, output_dir=output_folder))
             evaluator_list.append(
                 SemSegEvaluator(
                     dataset_name,
@@ -100,9 +103,6 @@ class Trainer(DefaultTrainer):
                     output_dir=output_folder,
                 )
             )
-        # panoptic segmentation
-        elif cfg.INPUT.DATASET_MAPPER_NAME == "coco_panoptic_lsj":
-            evaluator_list.append(COCOPanopticEvaluator(dataset_name, output_dir=output_folder))
         if len(evaluator_list) == 0:
             raise NotImplementedError(
                 "no Evaluator for the dataset {} with the type {}".format(
@@ -112,6 +112,7 @@ class Trainer(DefaultTrainer):
         elif len(evaluator_list) == 1:
             return evaluator_list[0]
         return DatasetEvaluators(evaluator_list)
+
 
     @classmethod
     def build_train_loader(cls, cfg):

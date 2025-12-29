@@ -610,59 +610,6 @@ class SAM3MC(nn.Module):
         # print("跑通！")
         return results
 
-    def semantic_segmentation_loss(self, pred_logits, batched_inputs, images_tensor_shape):
-        """
-        Args:
-            pred_logits (Tensor): 形状为 [B, NumClasses, H_feat, W_feat] 的预测结果 (通常是 Stride 4).
-            batched_inputs (list[dict]): 包含 'sem_seg' 的原始输入列表.
-            images_tensor_shape (tuple): images.tensor.shape, 即 [B, 3, H_pad, W_pad].
-                                        我们需要知道 Padded 后的总高宽来做正确的上采样.
-        """
-        # 1. 获取 Padded 的目标尺寸 (即 images.tensor 的 H, W)
-        # pred_logits 通常是下采样过的 (如 1/4)，我们需要先把它还原到 images.tensor 的尺度
-        _, _, pad_h, pad_w = images_tensor_shape
-        
-        # 2. 将整个 Batch 的预测上采样到 Padded 尺寸
-        # mode='bilinear' align_corners=False 是分割任务的标准做法
-        pred_logits_upsampled = F.interpolate(
-            pred_logits, 
-            size=(pad_h, pad_w), 
-            mode="bilinear", 
-            align_corners=False
-        )
-        
-        total_loss = 0.0
-        valid_samples = 0
-        
-        # 3. 逐张图片处理：裁剪出有效区域并计算 Loss
-        for i, input_per_image in enumerate(batched_inputs):
-            # 获取该样本的 GT (Semantic Map)
-            # 注意：sem_seg 可能在 CPU 上，需要移到 GPU
-            gt_sem_seg = input_per_image["sem_seg"].to(pred_logits.device)
-            
-            # 获取 GT 的真实尺寸 (未 Padding 的尺寸)
-            gt_h, gt_w = gt_sem_seg.shape
-            
-            # 从上采样后的预测中，裁剪出有效区域 (Top-Left corner)
-            # Detectron2 的 padding 默认是在右侧和下侧，所以切片 [:gt_h, :gt_w] 是安全的
-            valid_pred = pred_logits_upsampled[i, :, :gt_h, :gt_w]
-            
-            # 此时 valid_pred 的形状是 [NumClasses, gt_h, gt_w]
-            # gt_sem_seg 的形状是 [gt_h, gt_w]
-            # 增加一个 Batch 维度以使用 cross_entropy
-            valid_pred = valid_pred.unsqueeze(0) # [1, C, H, W]
-            gt_sem_seg = gt_sem_seg.unsqueeze(0) # [1, H, W]
-            
-            # 4. 计算 Loss
-            # ignore_index=255 是通用的忽略背景/无效区域的设定，请根据你的数据集调整
-            loss = F.cross_entropy(valid_pred, gt_sem_seg.long(), ignore_index=255)
-            
-            total_loss += loss
-            valid_samples += 1
-
-        # 平均 Loss
-        return total_loss / max(valid_samples, 1)    
-
 
     def semantic_inference(self, mask_cls, mask_pred):
         mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1]

@@ -10,7 +10,7 @@ from detectron2.data import MetadataCatalog
 from detectron2.modeling import META_ARCH_REGISTRY, build_backbone, build_sem_seg_head
 from detectron2.modeling.backbone import backbone
 from detectron2.modeling.postprocessing import sem_seg_postprocess
-from detectron2.structures import boxes, ImageList, Instances, BitMasks
+from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 from detectron2.utils.memory import retry_if_cuda_oom
 
 import matplotlib.pyplot as plt
@@ -161,9 +161,17 @@ class SAM3MC_o365(nn.Module):
             importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
         )
 
-        # --------------------------------------------------
-        # sam3的其他配置
-        # --------------------------------------------------
+        # -------------------------------------------------------
+        # 【新增】Inference 参数配置
+        # -------------------------------------------------------
+        self.semantic_on = cfg.TEST.SEMANTIC_ON if hasattr(cfg.TEST, "SEMANTIC_ON") else True
+        self.instance_on = cfg.TEST.INSTANCE_ON if hasattr(cfg.TEST, "INSTANCE_ON") else True
+        self.panoptic_on = cfg.TEST.PANOPTIC_ON if hasattr(cfg.TEST, "PANOPTIC_ON") else False
+        
+        # 阈值设置 (如果没有在 cfg 定义，给默认值)
+        self.object_mask_threshold = 0.0
+        self.overlap_threshold = 0.8
+        self.test_topk_per_image = 100
 
         self._freeze()
 
@@ -632,26 +640,9 @@ class SAM3MC_o365(nn.Module):
                     losses.pop(k)
 
             return losses
-            
-        else:
-            query_cls_results = query_cls_results.sigmoid() 
-            queries_seg_result = torch.einsum("bnc,bnhw->bchw", query_cls_results, queries_masks) # [bs, num_classes+1, H, W]
-
-
-        seg_logits = queries_seg_result 
-
-        if USE_GT_NAMES_ONLY:
-            pass
-            # for b in range(bs):
-            #     gtcls_mask = torch.ones_like(seg_logits[b], dtype=torch.bool)
-            #     gtcls_mask[batch_gt_names_idx[b],:,:] = False
-            #     seg_logits[b][gtcls_mask] = 0.0
         
-        # final_seg_logits = seg_logits[:, :-1, :, :]
-        final_seg_logits = seg_logits
-        # print("final_seg_logits shape:", final_seg_logits.shape) # bs,num_classes+1, H, W
+        else:
 
-        # if not self.training:
         #     pred_result = final_seg_logits[0].argmax(0)
         #     visualize_segmentation(
         #         pred_result=pred_result,
@@ -664,80 +655,178 @@ class SAM3MC_o365(nn.Module):
 
         # =======================================================
         
+            mask_cls_logits = query_cls_results_final # 保持 Logits 状态
+            mask_pred_logits = outputs["pred_masks"]  # 保持 Logits 状态
 
 
-        results = []
-        for i in range(bs):
-            orig_size = (batched_inputs[i]["height"], batched_inputs[i]["width"]) # 没经过 resize 到 1008 的大小
-            res = sem_seg_postprocess(
-                final_seg_logits[i], 
-                (img_h, img_w),
-                orig_size[0],
-                orig_size[1],
-            )
-            results.append({"sem_seg": res})
-        # print("跑通！")
-        return results
+            results = []
+            
+            for i in range(bs):
+                # 获取单张图数据
+                mask_cls_i = mask_cls_logits[i]       # [Q, C]
+                mask_pred_i = mask_pred_logits[i]     # [Q, H, W]
+                
+                # 获取原始图像尺寸
+                img_h_orig = batched_inputs[i]["height"]
+                img_w_orig = batched_inputs[i]["width"]
+                
+                # 上采样 Mask 到原始图像尺寸 (非常重要)
+                # 使用 bilinear 插值 logits
+                mask_pred_i = F.interpolate(
+                    mask_pred_i.unsqueeze(0), 
+                    size=(img_h_orig, img_w_orig), 
+                    mode="bilinear", 
+                    align_corners=False
+                ).squeeze(0)
+                
+                res = {}
+                dataname = batched_inputs[i]["meta"]["dataname"]
 
-    def semantic_segmentation_loss(self, pred_logits, batched_inputs, images_tensor_shape):
-        """
-        Args:
-            pred_logits (Tensor): 形状为 [B, NumClasses, H_feat, W_feat] 的预测结果 (通常是 Stride 4).
-            batched_inputs (list[dict]): 包含 'sem_seg' 的原始输入列表.
-            images_tensor_shape (tuple): images.tensor.shape, 即 [B, 3, H_pad, W_pad].
-                                        我们需要知道 Padded 后的总高宽来做正确的上采样.
-        """
-        # 1. 获取 Padded 的目标尺寸 (即 images.tensor 的 H, W)
-        # pred_logits 通常是下采样过的 (如 1/4)，我们需要先把它还原到 images.tensor 的尺度
-        _, _, pad_h, pad_w = images_tensor_shape
+                # --- A. 语义分割 (Semantic Segmentation) ---
+                if self.semantic_on:
+                    # 使用你原来的逻辑，但注意输入变成了 logits
+                    mask_cls_prob = mask_cls_i.sigmoid()
+                    mask_pred_prob = mask_pred_i.sigmoid()
+                    semseg = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_prob)
+                    res["sem_seg"] = semseg
+
+                # --- B. 全景分割 (Panoptic Segmentation) ---
+                if self.panoptic_on:
+                    panoptic_seg, segments_info = self.panoptic_inference(
+                        mask_cls_i, mask_pred_i, dataname
+                    )
+                    res["panoptic_seg"] = (panoptic_seg, segments_info)
+                
+                # --- C. 实例分割 (Instance Segmentation) ---
+                if self.instance_on:
+                    instances = self.instance_inference(
+                        mask_cls_i, mask_pred_i, dataname
+                    )
+                    res["instances"] = instances
+
+                results.append(res)
+
+            return results
+
+
+
+    def panoptic_inference(self, mask_cls, mask_pred, dataname):
+        # mask_cls: [Q, K] (Logits)
+        # mask_pred: [Q, H, W] (Logits or Probs, depends on input)
         
-        # 2. 将整个 Batch 的预测上采样到 Padded 尺寸
-        # mode='bilinear' align_corners=False 是分割任务的标准做法
-        pred_logits_upsampled = F.interpolate(
-            pred_logits, 
-            size=(pad_h, pad_w), 
-            mode="bilinear", 
-            align_corners=False
-        )
+        # 1. 计算分数 (Sigmoid 而不是 Softmax)
+        scores, labels = mask_cls.sigmoid().max(-1) # [Q]
+        mask_pred = mask_pred.sigmoid() # [Q, H, W]
+
+        # 2. 过滤掉低分 Query
+        keep = scores > self.object_mask_threshold
         
-        total_loss = 0.0
-        valid_samples = 0
+        cur_scores = scores[keep]
+        cur_classes = labels[keep]
+        cur_masks = mask_pred[keep]
         
-        # 3. 逐张图片处理：裁剪出有效区域并计算 Loss
-        for i, input_per_image in enumerate(batched_inputs):
-            # 获取该样本的 GT (Semantic Map)
-            # 注意：sem_seg 可能在 CPU 上，需要移到 GPU
-            gt_sem_seg = input_per_image["sem_seg"].to(pred_logits.device)
-            
-            # 获取 GT 的真实尺寸 (未 Padding 的尺寸)
-            gt_h, gt_w = gt_sem_seg.shape
-            
-            # 从上采样后的预测中，裁剪出有效区域 (Top-Left corner)
-            # Detectron2 的 padding 默认是在右侧和下侧，所以切片 [:gt_h, :gt_w] 是安全的
-            valid_pred = pred_logits_upsampled[i, :, :gt_h, :gt_w]
-            
-            # 此时 valid_pred 的形状是 [NumClasses, gt_h, gt_w]
-            # gt_sem_seg 的形状是 [gt_h, gt_w]
-            # 增加一个 Batch 维度以使用 cross_entropy
-            valid_pred = valid_pred.unsqueeze(0) # [1, C, H, W]
-            gt_sem_seg = gt_sem_seg.unsqueeze(0) # [1, H, W]
-            
-            # 4. 计算 Loss
-            # ignore_index=255 是通用的忽略背景/无效区域的设定，请根据你的数据集调整
-            loss = F.cross_entropy(valid_pred, gt_sem_seg.long(), ignore_index=255)
-            
-            total_loss += loss
-            valid_samples += 1
+        # 加权 Mask
+        cur_prob_masks = cur_scores.view(-1, 1, 1) * cur_masks
 
-        # 平均 Loss
-        return total_loss / max(valid_samples, 1)    
+        h, w = cur_masks.shape[-2:]
+        panoptic_seg = torch.zeros((h, w), dtype=torch.int32, device=cur_masks.device)
+        segments_info = []
 
+        current_segment_id = 0
 
-    def semantic_inference(self, mask_cls, mask_pred):
-        mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1]
-        mask_pred = mask_pred.sigmoid()
-        semseg = torch.einsum("qc,qhw->chw", mask_cls, mask_pred)
-        return semseg
+        if cur_masks.shape[0] == 0:
+            return panoptic_seg, segments_info
+
+        # 3. Argmax 生成全景图
+        cur_mask_ids = cur_prob_masks.argmax(0)
+        stuff_memory_list = {}
+        
+        # 获取 Metadata
+        meta = self.test_metadata[dataname] if dataname in self.test_metadata else MetadataCatalog.get(dataname)
+        thing_ids = set(meta.thing_dataset_id_to_contiguous_id.values())
+
+        for k in range(cur_classes.shape[0]):
+            pred_class = cur_classes[k].item()
+            isthing = pred_class in thing_ids
+            
+            # 检查 Mask 质量
+            mask_area = (cur_mask_ids == k).sum().item()
+            original_area = (cur_masks[k] >= 0.5).sum().item()
+            mask = (cur_mask_ids == k) & (cur_masks[k] >= 0.5)
+
+            if mask_area > 0 and original_area > 0 and mask.sum().item() > 0:
+                if mask_area / original_area < self.overlap_threshold:
+                    continue
+
+                # 合并 Stuff 区域
+                if not isthing:
+                    if int(pred_class) in stuff_memory_list.keys():
+                        panoptic_seg[mask] = stuff_memory_list[int(pred_class)]
+                        continue
+                    else:
+                        stuff_memory_list[int(pred_class)] = current_segment_id + 1
+
+                current_segment_id += 1
+                panoptic_seg[mask] = current_segment_id
+
+                segments_info.append(
+                    {
+                        "id": current_segment_id,
+                        "isthing": bool(isthing),
+                        "category_id": int(pred_class),
+                    }
+                )
+
+        return panoptic_seg, segments_info
+
+    def instance_inference(self, mask_cls, mask_pred, dataname):
+        # mask_cls: [Q, K] (Logits)
+        # mask_pred: [Q, H, W] (Logits)
+        
+        image_size = mask_pred.shape[-2:]
+        
+        # 1. 计算分数 (Sigmoid)
+        scores = mask_cls.sigmoid() # [Q, K]
+        num_classes = scores.shape[-1]
+        
+        # 2. 展开所有 Query-Class 对
+        num_queries = scores.shape[0]
+        labels = torch.arange(num_classes, device=self.device).unsqueeze(0).repeat(num_queries, 1).flatten(0, 1)
+        
+        scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.test_topk_per_image, sorted=False)
+        labels_per_image = labels[topk_indices]
+
+        # 找到对应的 mask index
+        topk_indices = topk_indices // num_classes
+        mask_pred = mask_pred[topk_indices]
+
+        # 4. 过滤 Thing Classes (如果是 Panoptic 模式)
+        if self.panoptic_on:
+            meta = self.test_metadata[dataname] if dataname in self.test_metadata else MetadataCatalog.get(dataname)
+            thing_ids = set(meta.thing_dataset_id_to_contiguous_id.values())
+            
+            keep = torch.zeros_like(scores_per_image).bool()
+            for i, lab in enumerate(labels_per_image):
+                keep[i] = lab.item() in thing_ids
+            
+            scores_per_image = scores_per_image[keep]
+            labels_per_image = labels_per_image[keep]
+            mask_pred = mask_pred[keep]
+
+        # 5. 生成 Instances 对象
+        result = Instances(image_size)
+        
+        # 使用 Sigmoid 后的 Mask
+        mask_pred_sigmoid = mask_pred.sigmoid()
+        result.pred_masks = (mask_pred_sigmoid > 0.5).float() # 二值化
+        result.pred_boxes = Boxes(torch.zeros(mask_pred.size(0), 4)) # SAM3 通常不直接出框，这里放空框或者用 mask2box 计算
+        
+        # 计算综合分数
+        mask_scores_per_image = (mask_pred_sigmoid.flatten(1) * result.pred_masks.flatten(1)).sum(1) / (result.pred_masks.flatten(1).sum(1) + 1e-6)
+        result.scores = scores_per_image * mask_scores_per_image
+        result.pred_classes = labels_per_image
+        
+        return result
 
 def get_gt_labels_from_sem_seg(sem_seg):
     """

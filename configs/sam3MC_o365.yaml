@@ -14,12 +14,12 @@ DATASETS:
 SOLVER:
   AMP:
     ENABLED: True
-  IMS_PER_BATCH: 32
+  IMS_PER_BATCH: 8
   # IMS_PER_BATCH: 3
   BASE_LR: 0.0001
   LR_SCHEDULER_NAME: WarmupPolyLR
-  MAX_ITER: 37500 # 295000 # 55000 
-  CHECKPOINT_PERIOD: 7500
+  MAX_ITER: 75000 # 295000 # 55000 
+  CHECKPOINT_PERIOD: 12500
 
   CLASS_WEIGHT: 2.0
   MASK_WEIGHT: 5.0
@@ -27,7 +27,11 @@ SOLVER:
   USE_AUX : True
 
 TEST:
-  EVAL_PERIOD: 7500
+  EVAL_PERIOD: 12500
+  INSTANCE_ON: True   # 测 AP (Objects365 的主要指标)
+  PANOPTIC_ON: True   # 测 PQ
+  SEMANTIC_ON: True   # 测 mIoU
+  DETECTIONS_PER_IMAGE: 100 # 实例分割每张图保留多少个结果
 
 INPUT:
   # DATASET_MAPPER_NAME: "mask_former_semantic" 
@@ -53,7 +57,7 @@ INPUT:
   MASK_FORMAT: "bitmask"
   FORMAT: "RGB"
 
-OUTPUT_DIR: ./out/objects365/bs32_1e-4_75k
+OUTPUT_DIR: ./out/objects365/bs8_1e-4_1ep
   
 DATALOADER:
   # 必须开启！过滤掉没有标注的图片
