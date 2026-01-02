@@ -1,7 +1,7 @@
-_BASE_: ./o365.yaml
+_BASE_: ./cocostuff.yaml
 
 MODEL:
-  WEIGHTS: /data/hmp/mysam/weights/obj4e5.pth
+  WEIGHTS: /data/hmp/mysam/weights/coco_model_0014999.pth
 DATASETS:
   # TRAIN: ("objects365_v1_masktrain",) 
   # TRAIN: ("coco_2017_train_panoptic",)
@@ -12,5 +12,4 @@ TEST:
   PANOPTIC_ON: True   # 测 PQ
   SEMANTIC_ON: True   # 测 mIoU
 
-OUTPUT_DIR: ./out/instance/test
-  
+OUTPUT_DIR: ./out/cocostuff/test
