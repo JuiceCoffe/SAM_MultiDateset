@@ -1,11 +1,11 @@
 *.png
-output/
-datasets/
+/output/
+/datasets/
 *.pyc
-maft/modeling/pixel_decoder/
-out/
-detectron2/
-weights/
+/maft/modeling/pixel_decoder/
+/out/
+/detectron2/
+/weights/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
