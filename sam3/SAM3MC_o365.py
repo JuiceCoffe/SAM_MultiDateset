@@ -38,6 +38,8 @@ from maft.utils.text_templetes import VILD_PROMPT
 
 from .loss.matcher import HungarianMatcher
 from .loss.criterion import SetCriterion
+from sam3.model.content_dependent_transfer import ContentDependentTransfer
+
 from maft.modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
 
 import random
@@ -109,6 +111,9 @@ class SAM3MC_o365(nn.Module):
         # 在 __init__ 中
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07)) # 这是一个经验值
 
+        self.use_cdt = True
+        if self.use_cdt:
+            self.cdt = ContentDependentTransfer(d_model = 256, nhead = 8, panoptic_on = True)
         # -------------------------------------------------------
         # 训练配置
         # -------------------------------------------------------
@@ -299,7 +304,7 @@ class SAM3MC_o365(nn.Module):
                 self.language_mask = torch.min(language_mask.view(language_features.shape[0],len(VILD_PROMPT),language_features.shape[1]), dim=1).values# [num_names, L]
                 self.train_text_classifier = text_classifier.detach()
                 self.train_dataname = dataname
-            return self.train_text_classifier, self.train_num_templates
+            return self.train_text_classifier.clone(), self.train_num_templates
         else:
             if self.test_dataname != dataname:
                 self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata)
@@ -333,7 +338,7 @@ class SAM3MC_o365(nn.Module):
                 self.language_mask = torch.min(language_mask.view(language_features.shape[0],len(VILD_PROMPT),language_features.shape[1]), dim=1).values# [num_names, L]
                 self.test_text_classifier = text_classifier.detach()
                 self.test_dataname = dataname
-            return self.test_text_classifier, self.test_num_templates
+            return self.test_text_classifier.clone(), self.test_num_templates
 
     @property
     def device(self):
@@ -381,7 +386,7 @@ class SAM3MC_o365(nn.Module):
             
             # 图形特征
             backbone_out_vision = self.detector.backbone.forward_image(images.tensor)
-            img_feat = backbone_out_vision["vision_features"].detach() # bs, C, H', W'
+            img_feat = backbone_out_vision["vision_features"].detach() # bs, D, H', W'
             backbone_fpn = backbone_out_vision["backbone_fpn"]
             for k in range(len(backbone_fpn)):
                 backbone_fpn[k] = backbone_fpn[k].detach()
@@ -540,14 +545,20 @@ class SAM3MC_o365(nn.Module):
         use_aux = self.use_aux and self.training
         aux_outputs = []
 
+        if self.use_cdt:
+            text_classifier = self.cdt(img_feat,text_classifier)
+
         for i in range(6):
             assert queries.shape[0] == 6
             if use_aux or i == 5 :
                 tp_queries = queries[i,:,:N,:].clone() # 避免DAC造成的tp_queries翻倍
                 tp_queries = F.normalize(tp_queries, dim=-1, p=2)
+
+                if self.use_cdt:
+                    query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, text_classifier) # bs, N, C
+                else:
+                    query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier) # bs, N, C
                 
-                
-                query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier) # bs, N, C
                 
                 logit_scale = self.logit_scale.exp() # 必须取指数！使其变为 ~14.2 或者更大
                 logit_scale = torch.clamp(logit_scale, max=100.0) # 加上上限防止溢出
