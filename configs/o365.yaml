@@ -21,6 +21,7 @@ SOLVER:
   BASE_LR: 0.00002
   LR_SCHEDULER_NAME: WarmupPolyLR
   MAX_ITER: 200000 # 295000 # 55000 
+  # MAX_ITER: 123
   CHECKPOINT_PERIOD: 20000
 
   CLASS_WEIGHT: 2.0
@@ -30,6 +31,7 @@ SOLVER:
 
 TEST:
   EVAL_PERIOD: 20000
+  # EVAL_PERIOD: 50
   INSTANCE_ON: True   # 测 AP (Objects365 的主要指标)
   PANOPTIC_ON: True   # 测 PQ
   SEMANTIC_ON: True   # 测 mIoU
@@ -44,6 +46,6 @@ INPUT:
   # 图片读取格式
   FORMAT: "RGB"
 
-OUTPUT_DIR: ./out/obj/cdt_2ep
+OUTPUT_DIR: ./out/obj/nocdt_2ep
 # OUTPUT_DIR: ./out/test
   
