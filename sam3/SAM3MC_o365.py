@@ -114,9 +114,16 @@ class SAM3MC_o365(nn.Module):
         init_value = math.log(target_multiplier)
         self.logit_scale = nn.Parameter(torch.ones([]) * init_value)
 
-        self.use_cdt = False
+        self.use_cdt = True
+        self.num_cdt = 2
         if self.use_cdt:
-            self.cdt = ContentDependentTransfer(d_model = 256, nhead = 8, panoptic_on = True)
+            # 使用 nn.ModuleList 包装
+            self.cdt = nn.ModuleList([
+                ContentDependentTransfer(d_model=256, nhead=8, panoptic_on=True) 
+                for _ in range(self.num_cdt)
+            ])
+        else:
+            self.cdt = None
 
         self.text_encoder_cache = {} 
         # -------------------------------------------------------
@@ -145,10 +152,14 @@ class SAM3MC_o365(nn.Module):
         # criterion损失函数
         # -------------------------------------------------------
 
+        losses = ["labels", "masks"]
+
         # loss weights
         class_weight = cfg.SOLVER.CLASS_WEIGHT
         dice_weight = cfg.SOLVER.DICE_WEIGHT
         mask_weight = cfg.SOLVER.MASK_WEIGHT
+
+
 
         weight_dict = {}
         criterion_weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
@@ -159,7 +170,41 @@ class SAM3MC_o365(nn.Module):
                 for k in criterion_weight_dict.keys():
                     weight_dict[f"{k}_{i}"] = criterion_weight_dict[k]
         
-        
+        self.encoder_loss = True
+        if self.encoder_loss:
+            encoder_weight_dict = {
+                "loss_ce": class_weight,  
+                "loss_mask": mask_weight, 
+                "loss_dice": dice_weight   
+            }
+
+            encoder_matcher = HungarianMatcher(
+                cost_class=class_weight,
+                cost_mask=mask_weight,
+                cost_dice=dice_weight,
+                num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
+            )
+
+            encoder_weight_dict = {
+                "loss_ce": class_weight * 1.0,  
+                "loss_mask": mask_weight * 0.5, 
+                "loss_dice": dice_weight * 0.2  
+            }
+
+            self.encoder_criterion = SetCriterion(
+                matcher=encoder_matcher,
+                weight_dict=encoder_weight_dict,
+                losses=losses,
+                num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
+                oversample_ratio=cfg.SOLVER.OVERSAMPLE_RATIO,
+                importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
+            )
+            prior_prob = 0.01
+            bias_value = -np.log((1 - prior_prob) / prior_prob)
+            target_multiplier = 3
+            init_value = math.log(target_multiplier)
+            self.encoder_logit_bias = nn.Parameter(torch.ones([]) * bias_value)
+            self.encoder_logit_scale = nn.Parameter(torch.ones([]) * init_value)
 
         # building criterion
         matcher = HungarianMatcher(
@@ -169,7 +214,6 @@ class SAM3MC_o365(nn.Module):
             num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
         )
         
-        losses = ["labels", "masks"]
 
         self.criterion = SetCriterion(
             matcher=matcher,
@@ -452,9 +496,15 @@ class SAM3MC_o365(nn.Module):
             # text_classifier, num_templates = self.get_text_classifier(meta['dataname'])
             text_classifier, num_templates = self.get_text_classifier(dataname)
 
+
             # others
             geometric_prompt = self.detector._get_dummy_prompt(bs)
         
+        if self.use_cdt:
+            # text_classifier = self.cdt(img_feat,text_classifier)
+            for layer in self.cdt:
+                text_classifier = layer(img_feat,text_classifier) # 逐层通过
+
         batch_gt_names_idx = []
         for i in range(bs):
             # gt_classes = get_gt_labels_from_sem_seg(batched_inputs[i]["sem_seg"].to(self.device))
@@ -524,6 +574,38 @@ class SAM3MC_o365(nn.Module):
             backbone_out, encoder_out, _ = self.detector._run_encoder(
                 backbone_out, find_input, prompt, prompt_mask
             )
+
+        fusion_feat = encoder_out["encoder_hidden_states"] # H'*W', bs, D
+        fusion_feat = fusion_feat.permute(1,0,2) # bs, H'*W', D
+        fusion_feat = F.normalize(fusion_feat, dim=-1)
+
+        encoder_logits = torch.einsum("bld,bcd->blc", fusion_feat, text_classifier)
+
+        e_logit_scale = self.encoder_logit_scale.exp()
+        e_logit_scale = torch.clamp(e_logit_scale, max=100.0)
+        encoder_logits = encoder_logits * e_logit_scale + self.encoder_logit_bias
+
+        encoder_logits = aggregate_name_to_class_logits(encoder_logits, num_templates)
+
+        encoder_score = encoder_logits.max(-1).values # [bs, HW]
+        k_selected = 200
+        topk_values, topk_indices = torch.topk(encoder_score, k_selected, dim=1) # [bs, k]
+        topk_indices_unsqueezed = topk_indices.unsqueeze(-1).repeat(1, 1, fusion_feat.shape[-1])
+        topK_fusion_feat = torch.gather(fusion_feat, 1, topk_indices_unsqueezed) # [bs, k, D]
+        encoder_mask_logits = torch.einsum("bkd,bld->bkl", topK_fusion_feat, fusion_feat)
+        if self.use_cdt:
+            encoder_mask_logits = torch.einsum("bkd,bld->bkl", topK_fusion_feat, fusion_feat)
+        else:
+            encoder_mask_logits = torch.einsum("bkd,ld->bkl", topK_fusion_feat, fusion_feat)
+        encoder_mask_logits = encoder_mask_logits.view(bs, k_selected, img_feat.shape[-2], img_feat.shape[-1])
+        num_classes = encoder_logits.shape[-1]
+        encoder_cls_logits = torch.gather(
+            encoder_logits, 
+            1, 
+            topk_indices.unsqueeze(-1).expand(-1, -1, num_classes)
+        )
+
+
         out = {
             "encoder_hidden_states": encoder_out["encoder_hidden_states"],
             "prev_encoder_out": {
@@ -598,9 +680,6 @@ class SAM3MC_o365(nn.Module):
         use_aux = self.use_aux and self.training
         aux_outputs = []
 
-        if self.use_cdt:
-            text_classifier = self.cdt(img_feat,text_classifier)
-
         for i in range(6):
             assert queries.shape[0] == 6
             if use_aux or i == 5 :
@@ -656,6 +735,13 @@ class SAM3MC_o365(nn.Module):
                 else:
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
+            
+            encoder_outputs = {'pred_logits': encoder_cls_logits, 'pred_masks': encoder_mask_logits}
+            encoder_losses = self.encoder_criterion(encoder_outputs, targets)
+            for k in list(encoder_losses.keys()):
+                # print("loss:", k, losses[k].item())
+                if k in self.criterion.weight_dict:
+                    losses[k + '_encoder'] = encoder_losses[k] * self.encoder_criterion.weight_dict[k]
 
             return losses
         
@@ -899,6 +985,31 @@ class SAM3MC_o365(nn.Module):
             
         return result
 
+def aggregate_name_to_class_logits(query_names_results, num_templates):
+    """
+    将包含同义词/模板的 name logits 转化为唯一类别的 class logits。
+    
+    参数:
+        query_names_results (torch.Tensor): 形状为 [bs, N, total_names] 的张量
+        num_templates (list[int]): 每个类别包含的名称/模板数量列表，长度为 num_classes
+        
+    返回:
+        query_cls_results (torch.Tensor): 形状为 [bs, N, num_classes] 的张量
+    """
+    # 使用 torch.split 根据每个类别的模板数量对最后一维进行拆分
+    # 这会返回一个包含多个张量的 list，每个张量形状为 [bs, N, num_t]
+    name_splits = torch.split(query_names_results, num_templates, dim=-1)
+    
+    # 对每个分块取最大值 (max pooling over synonyms/templates)
+    # s.max(-1).values 得到形状为 [bs, N] 的张量
+    cls_logits_list = [s.max(dim=-1).values for s in name_splits]
+    
+    # 在最后一维堆叠，得到 [bs, N, num_classes]
+    query_cls_results = torch.stack(cls_logits_list, dim=-1)
+    
+    return query_cls_results
+
+
 def get_gt_labels_from_sem_seg(sem_seg):
     """
     基于 sem_seg_2_gt_masks 逻辑提取当前图像中存在的有效类别 ID。
@@ -1054,5 +1165,5 @@ def get_dataname(batched_input):
         return "ade20k"
     
     # 如果都匹配不上，返回一个默认值或抛出警告
-    # print(f"Warning: Could not infer dataname from {file_name}, using default 'lvis_v1_val'")
+    print(f"Warning: Could not infer dataname from {file_name}, using default 'lvis_v1_val'")
     return "lvis_v1_val"
