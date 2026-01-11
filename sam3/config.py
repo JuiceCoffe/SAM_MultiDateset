@@ -49,3 +49,10 @@ def add_sam3_config(cfg):
     cfg.TEST.INSTANCE_ON = False
     cfg.TEST.PANOPTIC_ON = False
     cfg.TEST.DETECTIONS_PER_IMAGE = 100 # 实例分割每张图保留多少个结果
+
+    cfg.DATALOADER.DATASET_RATIO = [1.0]
+    cfg.DATALOADER.USE_DIFF_BS_SIZE = False
+    cfg.DATALOADER.DATASET_BS = [2]
+    cfg.DATALOADER.USE_RFS = [False]
+    cfg.DATALOADER.DATASET_ANN = ["box"]
+    cfg.DATALOADER.MULTI_DATASET_GROUPING = True

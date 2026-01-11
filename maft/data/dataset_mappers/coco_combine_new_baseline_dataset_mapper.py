@@ -118,14 +118,11 @@ class COCOCombineNewBaselineDatasetMapper:
         
         # transform instnace masks
         #assert "annotations" in dataset_dict
+
         if "annotations" in dataset_dict  :
             
             file_name = dataset_dict["file_name"]
-            if "obj365" in file_name:
-                dataset_dict["dataname"] = "objects365_v1_masktrain"
-            else:
-                dataset_dict["dataname"] = "lvis_v1_train"
-                
+
             for anno in dataset_dict["annotations"]:
                 anno.pop("keypoints", None)
 
@@ -169,6 +166,7 @@ class COCOCombineNewBaselineDatasetMapper:
             classes = [int(obj["category_id"]) for obj in annos]
             classes = torch.tensor(classes, dtype=torch.int64)
         elif "pan_seg_file_name" in dataset_dict:
+
             pan_seg_gt = utils.read_image(dataset_dict.pop("pan_seg_file_name"), "RGB")
             segments_info = dataset_dict["segments_info"]
 
@@ -233,7 +231,7 @@ class COCOCombineNewBaselineDatasetMapper:
 
         dataset_dict["meta"] = {
             **{k: dataset_dict[k] for k in ["file_name", "height", "width", "image_id"] if k in dataset_dict},
-            "dataname": "objects365_v1_masktrain" if "obj365" in dataset_dict["file_name"] else ("lvis_v1_train" if "annotations" in dataset_dict else "openvocab_coco_2017_train_panoptic_with_sem_seg")
+            "dataname": dataset_dict["dataname"]
         }
 
         

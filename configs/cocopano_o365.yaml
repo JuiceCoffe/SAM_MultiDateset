@@ -1,0 +1,80 @@
+MODEL:
+  # --- 保持 SAM3 的模型设置 ---
+  PIXEL_MEAN : [127.5, 127.5, 127.5]
+  PIXEL_STD : [127.5, 127.5, 127.5]
+  META_ARCHITECTURE: "SAM3MC_o365"
+  SAM3:
+    BPE_PATH: "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
+    ENABLE_SEGMENTATION: True
+  # WEIGHTS: "/data/hmp/sam3.pt"
+  WEIGHTS: /data/hmp/TASK/OVS/mysamclean/out/mixtest/model_0022499.pth
+
+DATASETS:
+  TRAIN: ("coco_2017_train_panoptic", "objects365_v1_masktrain", )
+  TEST: ("openvocab_ade20k_panoptic_val",) 
+
+SOLVER:
+  AMP:
+    ENABLED: True
+  IMS_PER_BATCH: 4 
+  BASE_LR: 0.00002
+  LR_SCHEDULER_NAME: WarmupPolyLR
+  MAX_ITER: 150000
+  CHECKPOINT_PERIOD: 7500
+  
+  # Loss 权重保持你原本的设置
+  CLASS_WEIGHT: 2.0
+  MASK_WEIGHT: 5.0
+  DICE_WEIGHT: 5.0
+  USE_AUX : True
+  
+
+INPUT:
+  # --- 保持 Mapper 设置 ---
+  DATASET_MAPPER_NAME: "coco_combine_lsj"
+  IMAGE_SIZE: 1008
+  MIN_SCALE: 0.1
+  MAX_SCALE: 2.0
+  FORMAT: "RGB"
+  # 建议开启，学长的配置里有，对于 LSJ (Large Scale Jittering) 训练通常配套颜色增强
+  COLOR_AUG_SSD: True 
+  MASK_FORMAT: "bitmask" # 明确指定 mask 格式，防止二义性
+
+# ============================================================
+#新增的核心部分：支持多数据集混合训练的 Loader 配置
+# ============================================================
+DATALOADER:
+  # 激活你代码中的 MultiDatasetSampler
+  SAMPLER_TRAIN: "MultiDatasetSampler"
+  
+  # 对应 TRAIN 中的两个数据集 [Obj365, COCO]
+  # 1.0 : 1.0 表示采样概率相等
+  DATASET_RATIO: [1.0, 1.0]
+
+  DATASET_BS: [2, 4]
+  
+  # 对应数据集的 Batch Size 占位符 (配合 USE_DIFF_BS_SIZE: False 使用)
+  
+  
+  # 针对长尾分布采样：Obj365开启(True)，COCO关闭(False)
+  USE_RFS: [False, True]
+  
+  # 指定标注类型，用于计算采样频率
+  DATASET_ANN: ['box', 'box']
+  
+  # 其他 Loader 参数
+  NUM_WORKERS: 12
+  FILTER_EMPTY_ANNOTATIONS: True
+  ASPECT_RATIO_GROUPING: True
+  USE_DIFF_BS_SIZE: True
+
+
+TEST:
+  EVAL_PERIOD: 7500
+  INSTANCE_ON: True   
+  PANOPTIC_ON: True   
+  SEMANTIC_ON: True   
+
+# OUTPUT_DIR: ./out/obj1_coco1/
+OUTPUT_DIR: ./out/mixtest
+VERSION: 2

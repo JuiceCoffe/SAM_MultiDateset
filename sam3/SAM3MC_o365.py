@@ -110,23 +110,34 @@ class SAM3MC_o365(nn.Module):
         bias_value = -np.log((1 - prior_prob) / prior_prob)
         self.logit_bias = nn.Parameter(torch.ones([]) * bias_value)
 
-        target_multiplier = 2.9029
+        target_multiplier = 3
         init_value = math.log(target_multiplier)
         self.logit_scale = nn.Parameter(torch.ones([]) * init_value)
 
         self.use_cdt = False
         if self.use_cdt:
             self.cdt = ContentDependentTransfer(d_model = 256, nhead = 8, panoptic_on = True)
+
+        self.text_encoder_cache = {} 
         # -------------------------------------------------------
         # 训练配置
         # -------------------------------------------------------
         # 你需要检查 sam3_loss 的初始化参数
-
         self.train_dataname = None
         self.test_dataname = None
         self.test_metadata = {i: MetadataCatalog.get(i) for i in cfg.DATASETS.TEST}
-        self.train_metadata = MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
-        _, self.train_num_templates, self.train_class_names = self.prepare_class_names_from_metadata(self.train_metadata, self.train_metadata)
+        # 【修改】建立 Metadata 字典，方便后续查找
+        self.train_metadata_dict = {name: MetadataCatalog.get(name) for name in cfg.DATASETS.TRAIN}
+        
+        # 【修改】这里初始化为 None 或第一个数据集的均可，反正 get_text_classifier 会覆盖它
+        # 重要的是 self.train_class_names 和 num_templates 只是临时变量
+        if len(cfg.DATASETS.TRAIN) > 0:
+            self.train_metadata = MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
+        else:
+            self.train_metadata = None 
+            
+        self.train_num_templates = None 
+        self.train_class_names = None
 
         self.use_aux = cfg.SOLVER.USE_AUX
 
@@ -277,35 +288,74 @@ class SAM3MC_o365(nn.Module):
     def get_text_classifier(self, dataname):
         if self.training:
             if self.train_dataname != dataname:
-                text_classifier = []
-                language_mask = []
-                # this is needed to avoid oom, which may happen when num of class is large
-                bs = 128
-                print("Generating text classifier for", dataname, "with", len(self.train_class_names), "classes.")
-                for idx in range(0, len(self.train_class_names), bs):
-                    state_text = self.detector.backbone.forward_text(self.train_class_names[idx:idx+bs], device=self.device)
+                if dataname in self.text_encoder_cache:
+                    cache = self.text_encoder_cache[dataname]
+                    # 从 CPU 缓存加载并移回 GPU
+                    self.language_features = cache["language_features"].to(self.device)
+                    self.language_mask = cache["language_mask"].to(self.device)
+                    self.train_text_classifier = cache["text_classifier"].to(self.device)
+                    
+                    # 直接恢复列表，不要再重新计算
+                    self.train_num_templates = cache["num_templates"] 
+                    self.train_class_names = cache["class_names"]
 
-                    batch_text_feat = state_text["language_features"].detach()
-                    mask = state_text["language_mask"] # bs, L
-                    batch_text_feat = batch_text_feat.permute(1,0,2) # -> bs, L, D 
-                    text_classifier.append(batch_text_feat)
-                    language_mask.append(mask) # bs, L
-                text_classifier = torch.cat(text_classifier, dim=0)
-                language_mask = torch.cat(language_mask, dim=0) # (num_names * VILD_PROMPT,  L)
-                # average across templates and normalization.
-                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_classifier.shape[-2], text_classifier.shape[-1]) # num_names, VILD_PROMPT, L, D
-                text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
+                else:
+                    # ============== 关键修改开始 ==============
+                    # 获取 metadata
+                    if dataname in self.train_metadata_dict:
+                        current_metadata = self.train_metadata_dict[dataname]
+                    else:
+                        current_metadata = MetadataCatalog.get(dataname)
 
-                text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 # [num_names, VILD_PROMPT, L, D] 掩码掉 padding 部分
-                language_features = text_classifier.mean(1) # num_names, L, D
-                text_classifier = text_classifier.mean(-2) 
-                text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
-                text_classifier = text_classifier.mean(1)
-                text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
-                
-                self.language_features = language_features.detach() # num_names , L, D
-                self.language_mask = torch.min(language_mask.view(language_features.shape[0],len(VILD_PROMPT),language_features.shape[1]), dim=1).values# [num_names, L]
-                self.train_text_classifier = text_classifier.detach()
+                    # 计算类别名和模板数量
+                    # 【注意】这里不要用 self.train_num_templates[dataname]，因为它不是字典
+                    # 直接覆盖 self.train_num_templates 为当前数据集的 List
+                    _, self.train_num_templates, self.train_class_names = self.prepare_class_names_from_metadata(
+                        current_metadata, current_metadata
+                    )
+                    # ============== 关键修改结束 ==============
+
+                    # --- 原有生成逻辑开始 ---
+                    text_classifier = []
+                    language_mask = []
+                    # this is needed to avoid oom, which may happen when num of class is large
+                    bs = 128
+                    print("Generating text classifier for", dataname, "with", len(self.train_class_names), "classes.")
+                    for idx in range(0, len(self.train_class_names), bs):
+                        state_text = self.detector.backbone.forward_text(self.train_class_names[idx:idx+bs], device=self.device)
+
+                        batch_text_feat = state_text["language_features"].detach()
+                        mask = state_text["language_mask"] # bs, L
+                        batch_text_feat = batch_text_feat.permute(1,0,2) # -> bs, L, D 
+                        text_classifier.append(batch_text_feat)
+                        language_mask.append(mask) # bs, L
+                    text_classifier = torch.cat(text_classifier, dim=0)
+                    language_mask = torch.cat(language_mask, dim=0) # (num_names * VILD_PROMPT,  L)
+                    # average across templates and normalization.
+                    text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_classifier.shape[-2], text_classifier.shape[-1]) # num_names, VILD_PROMPT, L, D
+                    text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
+
+                    text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 # [num_names, VILD_PROMPT, L, D] 掩码掉 padding 部分
+                    language_features = text_classifier.mean(1) # num_names, L, D
+                    text_classifier = text_classifier.mean(-2) 
+                    text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
+                    text_classifier = text_classifier.mean(1)
+                    text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
+                    
+                    self.language_features = language_features.detach() # num_names , L, D
+                    self.language_mask = torch.min(language_mask.view(language_features.shape[0],len(VILD_PROMPT),language_features.shape[1]), dim=1).values# [num_names, L]
+                    self.train_text_classifier = text_classifier.detach()
+                    # --- 原有生成逻辑结束 ---
+
+                    # 【新增】2. 将生成的特征移至 CPU 并存入缓存
+                    self.text_encoder_cache[dataname] = {
+                        "language_features": self.language_features.cpu(),
+                        "language_mask": self.language_mask.cpu(),
+                        "text_classifier": self.train_text_classifier.cpu(),
+                        "num_templates": self.train_num_templates, # 缓存当前的 List
+                        "class_names": self.train_class_names      # 缓存当前的 List
+                    }
+
                 self.train_dataname = dataname
             return self.train_text_classifier.clone(), self.train_num_templates
         else:

@@ -43,5 +43,6 @@ INPUT:
   # 图片读取格式
   FORMAT: "RGB"
 
-OUTPUT_DIR: ./out/coco_pano/cdt2_4ep
+# OUTPUT_DIR: ./out/coco_pano/cdt2_4ep
+OUTPUT_DIR: ./out/test
   

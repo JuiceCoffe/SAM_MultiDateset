@@ -60,6 +60,7 @@ from maft import (
 
 from maft.data.dataset_mappers.coco_combine_new_baseline_dataset_mapper import COCOCombineNewBaselineDatasetMapper
 
+from sam3.data.custom_dataset_dataloader import build_custom_train_loader
 from sam3.config import add_sam3_config
 from sam3.modeling_d2 import SAM3Wrapper # 导入这个类就会自动触发 REGISTER
 # from sam3.SAM3MC import SAM3MC
@@ -140,7 +141,13 @@ class Trainer(DefaultTrainer):
 
     @classmethod
     def build_train_loader(cls, cfg):
-        # Semantic segmentation dataset mapper
+        
+        if cfg.DATALOADER.SAMPLER_TRAIN == "MultiDatasetSampler":
+            mapper = COCOCombineNewBaselineDatasetMapper(cfg, True) 
+            data_loader = build_custom_train_loader(cfg, mapper=mapper)   
+            return data_loader
+
+
         if cfg.INPUT.DATASET_MAPPER_NAME == "mask_former_semantic":
             mapper = MaskFormerSemanticDatasetMapper(cfg, True)
             return build_detection_train_loader(cfg, mapper=mapper)
