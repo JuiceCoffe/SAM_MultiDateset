@@ -297,7 +297,7 @@ def main(args):
     # 获取当前进程应使用的 GPU 编号
     # Detectron2 会在 launch 时自动设置好当前进程的设备环境
     current_device = torch.cuda.current_device()
-    reserve_gb = 22  # 你想要固定的显存大小
+    reserve_gb = 16  # 你想要固定的显存大小
     
     print(f"==> 进程 {comm.get_rank()} 正在 GPU:{current_device} 上预分配 {reserve_gb}GB 显存...")
     try:

@@ -179,7 +179,7 @@ class SAM3MC_o365(nn.Module):
                 for k in criterion_weight_dict.keys():
                     weight_dict[f"{k}_{i}"] = criterion_weight_dict[k]
         
-        self.encoder_loss = True
+        self.encoder_loss = cfg.SOLVER.ENCODER_LOSS
         if self.encoder_loss:
             encoder_losses = ["labels", "masks",]
             encoder_weight_dict = {
@@ -608,31 +608,32 @@ class SAM3MC_o365(nn.Module):
         fusion_feat = fusion_feat.permute(1,0,2) # bs, H'*W', D
         fusion_feat = F.normalize(fusion_feat, dim=-1)
 
-        encoder_logits = torch.einsum("bld,bcd->blc", fusion_feat, text_classifier)
+        if self.encoder_loss:
+            encoder_logits = torch.einsum("bld,bcd->blc", fusion_feat, text_classifier)
 
-        e_logit_scale = self.encoder_logit_scale.exp()
-        e_logit_scale = torch.clamp(e_logit_scale, max=100.0)
-        encoder_logits = encoder_logits * e_logit_scale + self.encoder_logit_bias
+            e_logit_scale = self.encoder_logit_scale.exp()
+            e_logit_scale = torch.clamp(e_logit_scale, max=100.0)
+            encoder_logits = encoder_logits * e_logit_scale + self.encoder_logit_bias
 
-        encoder_logits = aggregate_name_to_class_logits(encoder_logits, num_templates)
+            encoder_logits = aggregate_name_to_class_logits(encoder_logits, num_templates)
 
-        encoder_score = encoder_logits.max(-1).values # [bs, HW]
-        k_selected = 200
-        topk_values, topk_indices = torch.topk(encoder_score, k_selected, dim=1) # [bs, k]
-        topk_indices_unsqueezed = topk_indices.unsqueeze(-1).repeat(1, 1, fusion_feat.shape[-1])
-        topK_fusion_feat = torch.gather(fusion_feat, 1, topk_indices_unsqueezed) # [bs, k, D]
-        encoder_mask_logits = torch.einsum("bkd,bld->bkl", topK_fusion_feat, fusion_feat)
-        if self.use_cdt:
+            encoder_score = encoder_logits.max(-1).values # [bs, HW]
+            k_selected = 200
+            topk_values, topk_indices = torch.topk(encoder_score, k_selected, dim=1) # [bs, k]
+            topk_indices_unsqueezed = topk_indices.unsqueeze(-1).repeat(1, 1, fusion_feat.shape[-1])
+            topK_fusion_feat = torch.gather(fusion_feat, 1, topk_indices_unsqueezed) # [bs, k, D]
             encoder_mask_logits = torch.einsum("bkd,bld->bkl", topK_fusion_feat, fusion_feat)
-        else:
-            encoder_mask_logits = torch.einsum("bkd,ld->bkl", topK_fusion_feat, fusion_feat)
-        encoder_mask_logits = encoder_mask_logits.view(bs, k_selected, img_feat.shape[-2], img_feat.shape[-1])
-        num_classes = encoder_logits.shape[-1]
-        encoder_cls_logits = torch.gather(
-            encoder_logits, 
-            1, 
-            topk_indices.unsqueeze(-1).expand(-1, -1, num_classes)
-        )
+            if self.use_cdt:
+                encoder_mask_logits = torch.einsum("bkd,bld->bkl", topK_fusion_feat, fusion_feat)
+            else:
+                encoder_mask_logits = torch.einsum("bkd,ld->bkl", topK_fusion_feat, fusion_feat)
+            encoder_mask_logits = encoder_mask_logits.view(bs, k_selected, img_feat.shape[-2], img_feat.shape[-1])
+            num_classes = encoder_logits.shape[-1]
+            encoder_cls_logits = torch.gather(
+                encoder_logits, 
+                1, 
+                topk_indices.unsqueeze(-1).expand(-1, -1, num_classes)
+            )
 
 
         out = {
@@ -780,12 +781,13 @@ class SAM3MC_o365(nn.Module):
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
             
-            encoder_outputs = {'pred_logits': encoder_cls_logits, 'pred_masks': encoder_mask_logits}
-            encoder_losses = self.encoder_criterion(encoder_outputs, targets)
-            for k in list(encoder_losses.keys()):
-                # print("loss:", k, losses[k].item())
-                if k in self.criterion.weight_dict:
-                    losses[k + '_encoder'] = encoder_losses[k] * self.encoder_criterion.weight_dict[k]
+            if self.encoder_loss:
+                encoder_outputs = {'pred_logits': encoder_cls_logits, 'pred_masks': encoder_mask_logits}
+                encoder_losses = self.encoder_criterion(encoder_outputs, targets)
+                for k in list(encoder_losses.keys()):
+                    # print("loss:", k, losses[k].item())
+                    if k in self.criterion.weight_dict:
+                        losses[k + '_encoder'] = encoder_losses[k] * self.encoder_criterion.weight_dict[k]
 
             return losses
         

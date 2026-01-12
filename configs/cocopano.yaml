@@ -29,6 +29,8 @@ SOLVER:
   DICE_WEIGHT: 5.0
   USE_AUX : True
 
+  ENCODER_LOSS: FALSE
+
 INPUT:
   DATASET_MAPPER_NAME: "coco_combine_lsj"
   IMAGE_SIZE: 1008
@@ -66,12 +68,13 @@ DATALOADER:
   USE_DIFF_BS_SIZE: False
 
 TEST:
-  EVAL_PERIOD: 7500
+  EVAL_PERIOD: 75
   INSTANCE_ON: True   
   PANOPTIC_ON: True   
   SEMANTIC_ON: True   
 
 # 修改输出目录名称以区分实验
 VERSION: 2
-OUTPUT_DIR: ./out/test
+# OUTPUT_DIR: ./out/test
+OUTPUT_DIR: ./out/cocopano_box
   

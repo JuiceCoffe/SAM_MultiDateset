@@ -45,6 +45,7 @@ def add_sam3_config(cfg):
     cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO = 0.75
 
     cfg.SOLVER.USE_AUX = True
+    cfg.SOLVER.ENCODER_LOSS = False
 
     cfg.TEST.SEMANTIC_ON = True
     cfg.TEST.INSTANCE_ON = False
