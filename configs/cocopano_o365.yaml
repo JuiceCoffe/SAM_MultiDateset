@@ -6,6 +6,7 @@ MODEL:
   SAM3:
     BPE_PATH: "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
     ENABLE_SEGMENTATION: True
+    NUM_CDT: 2
   WEIGHTS: "/data/hmp/sam3.pt"
   # WEIGHTS: /data/hmp/TASK/OVS/mysamclean/out/mixtest/model_0022499.pth
 
@@ -51,7 +52,7 @@ DATALOADER:
   # 1.0 : 1.0 表示采样概率相等
   DATASET_RATIO: [1.0, 1.0]
 
-  DATASET_BS: [2, 4]
+  DATASET_BS: [4, 2]
   
   # 对应数据集的 Batch Size 占位符 (配合 USE_DIFF_BS_SIZE: False 使用)
   
@@ -76,5 +77,5 @@ TEST:
   SEMANTIC_ON: True   
 
 # OUTPUT_DIR: ./out/obj1_coco1/
-OUTPUT_DIR: ./out/mixtest
+OUTPUT_DIR: ./out/obj1_coco1_cdt2
 VERSION: 2

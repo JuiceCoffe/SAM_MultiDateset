@@ -114,8 +114,9 @@ class SAM3MC_o365(nn.Module):
         init_value = math.log(target_multiplier)
         self.logit_scale = nn.Parameter(torch.ones([]) * init_value)
 
-        self.use_cdt = True
-        self.num_cdt = 2
+
+        self.num_cdt = cfg.MODEL.SAM3.NUM_CDT    
+        self.use_cdt = False if cfg.MODEL.SAM3.NUM_CDT == 0 else True
         if self.use_cdt:
             # 使用 nn.ModuleList 包装
             self.cdt = nn.ModuleList([

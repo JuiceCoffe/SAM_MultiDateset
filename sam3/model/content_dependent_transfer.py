@@ -46,7 +46,7 @@ class ShortCut_CrossAttention(nn.Module):
                                    key_padding_mask=memory_key_padding_mask)[0]
         
         tgt2 = self.norm(tgt2) 
-        tgt2 = self.activation(tgt2) # <--- 建议加上这一行 (ReLU)
+        # tgt2 = self.activation(tgt2) # <--- 建议加上这一行 (ReLU)
         tgt2 = self.MLP(tgt2)
         tgt = tgt + tgt2
 
