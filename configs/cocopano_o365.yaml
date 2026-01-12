@@ -29,6 +29,7 @@ SOLVER:
   DICE_WEIGHT: 5.0
   USE_AUX : True
   
+  ENCODER_LOSS: FALSE
 
 INPUT:
   # --- 保持 Mapper 设置 ---
@@ -77,5 +78,5 @@ TEST:
   SEMANTIC_ON: True   
 
 # OUTPUT_DIR: ./out/obj1_coco1/
-OUTPUT_DIR: ./out/obj1_coco1_cdt2
+OUTPUT_DIR: ./out/obj1_coco1_box
 VERSION: 2
