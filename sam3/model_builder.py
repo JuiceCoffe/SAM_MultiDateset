@@ -203,7 +203,7 @@ def _create_transformer_decoder() -> TransformerDecoder:
         resolution=1008,
         stride=14,
         use_act_checkpoint=True,
-        presence_token=True,
+        presence_token=False, # no presence token
     ) 
 
     return decoder
