@@ -7,6 +7,8 @@ from torch.cuda.amp import autocast
 
 from detectron2.projects.point_rend.point_features import point_sample
 
+from sam3.model.box_ops import box_cxcywh_to_xyxy, generalized_box_iou
+
 
 def batch_dice_loss(inputs: torch.Tensor, targets: torch.Tensor):
     """
@@ -71,7 +73,7 @@ class HungarianMatcher(nn.Module):
     while the others are un-matched (and thus treated as non-objects).
     """
 
-    def __init__(self, cost_class: float = 1, cost_mask: float = 1, cost_dice: float = 1, num_points: int = 0):
+    def __init__(self, cost_class: float = 1, cost_mask: float = 1, cost_dice: float = 1, cost_bbox: float = 1.0, cost_giou: float = 1.0,  num_points: int = 0):
         """Creates the matcher
 
         Params:
@@ -83,6 +85,9 @@ class HungarianMatcher(nn.Module):
         self.cost_class = cost_class
         self.cost_mask = cost_mask
         self.cost_dice = cost_dice
+
+        self.cost_bbox = cost_bbox # 新增
+        self.cost_giou = cost_giou # 新增
 
         assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
 
@@ -118,6 +123,21 @@ class HungarianMatcher(nn.Module):
             cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
             # =========== 修改结束 ===========
 
+            # --- 2. Box Cost (修改点：加入健壮性检查) ---
+            cost_bbox = 0
+            cost_giou = 0
+            # 只有当 outputs 中有框，且 Matcher 设置了框的权重时才计算
+            if "pred_boxes" in outputs and (self.cost_bbox > 0 or self.cost_giou > 0):
+                out_bbox = outputs["pred_boxes"][b].float()
+                tgt_bbox = targets[b]["boxes"].float()
+                
+                # L1 Cost
+                cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+                # GIoU Cost
+                cost_giou = -generalized_box_iou(
+                    box_cxcywh_to_xyxy(out_bbox), 
+                    box_cxcywh_to_xyxy(tgt_bbox)
+                )
 
             out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
             # gt masks are already padded when preparing target
@@ -153,6 +173,8 @@ class HungarianMatcher(nn.Module):
                 self.cost_mask * cost_mask
                 + self.cost_class * cost_class
                 + self.cost_dice * cost_dice
+                + self.cost_bbox * cost_bbox   # 加入 Box L1
+                + self.cost_giou * cost_giou   # 加入 GIoU
             )
             C = C.reshape(num_queries, -1).cpu()
 

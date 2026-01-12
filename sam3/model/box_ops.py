@@ -84,7 +84,15 @@ def masks_to_boxes(masks):
 
     boxes = torch.stack([x_min, y_min, x_max, y_max], 1)
     # Invalidate boxes corresponding to empty masks.
-    boxes = boxes * masks.flatten(-2).any(-1)
+
+    
+    # boxes = boxes * masks.flatten(-2).any(-1)
+    # --- 修改这里 ---
+    # 将 [N] 变为 [N, 1]，使其能够与 [N, 4] 进行逐元素相乘
+    has_object = masks.flatten(-2).any(-1).unsqueeze(-1) 
+    boxes = boxes * has_object
+    # ----------------
+
     return boxes
 
 

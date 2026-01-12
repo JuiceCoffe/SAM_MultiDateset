@@ -1,4 +1,3 @@
-# sam3/modeling_d2.py
 from typing import Tuple
 
 import torch
@@ -39,6 +38,7 @@ from maft.utils.text_templetes import VILD_PROMPT
 from .loss.matcher import HungarianMatcher
 from .loss.criterion import SetCriterion
 from sam3.model.content_dependent_transfer import ContentDependentTransfer
+from sam3.model.box_ops import masks_to_boxes, box_xyxy_to_cxcywh
 
 from maft.modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
 
@@ -153,17 +153,25 @@ class SAM3MC_o365(nn.Module):
         # criterion损失函数
         # -------------------------------------------------------
 
-        losses = ["labels", "masks"]
+        
 
         # loss weights
         class_weight = cfg.SOLVER.CLASS_WEIGHT
         dice_weight = cfg.SOLVER.DICE_WEIGHT
         mask_weight = cfg.SOLVER.MASK_WEIGHT
-
+        # DETR 常用推荐值: bbox=5.0, giou=2.0
+        bbox_weight = getattr(cfg.SOLVER, "BBOX_WEIGHT", 5.0)
+        giou_weight = getattr(cfg.SOLVER, "GIOU_WEIGHT", 2.0)
 
 
         weight_dict = {}
-        criterion_weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
+        criterion_weight_dict = {
+            "loss_ce": class_weight, 
+            "loss_mask": mask_weight, 
+            "loss_dice": dice_weight,
+            'loss_bbox':bbox_weight, 
+            'loss_giou':giou_weight
+        }
         weight_dict.update(criterion_weight_dict)
 
         if self.use_aux:
@@ -173,10 +181,11 @@ class SAM3MC_o365(nn.Module):
         
         self.encoder_loss = True
         if self.encoder_loss:
+            encoder_losses = ["labels", "masks",]
             encoder_weight_dict = {
                 "loss_ce": class_weight,  
                 "loss_mask": mask_weight, 
-                "loss_dice": dice_weight   
+                "loss_dice": dice_weight,
             }
 
             encoder_matcher = HungarianMatcher(
@@ -195,7 +204,7 @@ class SAM3MC_o365(nn.Module):
             self.encoder_criterion = SetCriterion(
                 matcher=encoder_matcher,
                 weight_dict=encoder_weight_dict,
-                losses=losses,
+                losses=encoder_losses,
                 num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
                 oversample_ratio=cfg.SOLVER.OVERSAMPLE_RATIO,
                 importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
@@ -207,11 +216,15 @@ class SAM3MC_o365(nn.Module):
             self.encoder_logit_bias = nn.Parameter(torch.ones([]) * bias_value)
             self.encoder_logit_scale = nn.Parameter(torch.ones([]) * init_value)
 
+
+        losses = ["labels", "masks", "boxes"]
         # building criterion
         matcher = HungarianMatcher(
             cost_class=class_weight,
             cost_mask=mask_weight,
             cost_dice=dice_weight,
+            cost_bbox=bbox_weight, # 新增：用于匹配计算
+            cost_giou=giou_weight, # 新增：用于匹配计算
             num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
         )
         
@@ -266,10 +279,25 @@ class SAM3MC_o365(nn.Module):
                 gt_masks = gt_masks.tensor
             padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
             padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+            
+            # ---------------- 修改开始 ----------------
+            # 1. 从 Mask 生成绝对坐标的 Box (xyxy格式)
+            gt_boxes_xyxy = masks_to_boxes(padded_masks)
+            
+            # 2. 归一化 Box 坐标到 [0, 1] (除以 padded后的宽高)
+            # scale: [w, h, w, h]
+            scale = torch.tensor([w_pad, h_pad, w_pad, h_pad], dtype=torch.float32, device=gt_boxes_xyxy.device)
+            gt_boxes_norm = gt_boxes_xyxy / scale
+
+            # 3. 转换为 (cx, cy, w, h) 格式，这是 DETR/SAM3 计算 Loss 要求的格式
+            gt_boxes_cxcywh = box_xyxy_to_cxcywh(gt_boxes_norm)
+            # ---------------- 修改结束 ----------------
+
             new_targets.append(
                 {
                     "labels": targets_per_image.gt_classes,
                     "masks": padded_masks,
+                    "boxes": gt_boxes_cxcywh, # <--- 传入处理好的 boxes
                 }
             )
         return new_targets
@@ -649,6 +677,9 @@ class SAM3MC_o365(nn.Module):
         outputs = out
         # print("outputs keys:", outputs.keys())
         # print('aux:',outputs['aux_outputs'][0].keys())
+        # print('aux box:',outputs['aux_outputs'][0]['pred_boxes'].shape)
+        # print('aux pred_boxes_xyxy:',outputs['aux_outputs'][0]['pred_boxes_xyxy'].shape)
+
 
         out_masks = outputs["pred_masks"].clone()
 
@@ -667,6 +698,10 @@ class SAM3MC_o365(nn.Module):
 
         # print("out_masks shape:", out_masks.shape, "out_probs shape:", out_probs.shape, "out_semseg shape:", out_semseg.shape, "presence_score shape:", presence_score.shape)
         # out_masks shape: torch.Size([1, 200, 1008, 1008]) out_probs shape: torch.Size([1, 200]) out_semseg shape: torch.Size([1, 1, 1008, 1008]) presence_score shape: torch.Size([1, 1, 1])
+        pred_boxes = outputs['pred_boxes']
+        pred_boxes_xyxy = outputs['pred_boxes_xyxy']
+        # print("pred_boxes:",pred_boxes.shape)
+        # print("pred_boxes_xyxy:",pred_boxes_xyxy.shape)
         
 
         bs, N, H, W = out_masks.shape
@@ -683,8 +718,9 @@ class SAM3MC_o365(nn.Module):
 
         for i in range(6):
             assert queries.shape[0] == 6
+            assert queries.shape[2] == N
             if use_aux or i == 5 :
-                tp_queries = queries[i,:,:N,:].clone() # 避免DAC造成的tp_queries翻倍
+                tp_queries = queries[i,:,:,:].clone() 
                 tp_queries = F.normalize(tp_queries, dim=-1, p=2)
 
                 if self.use_cdt:
@@ -707,7 +743,12 @@ class SAM3MC_o365(nn.Module):
                     
 
                 if i<5:
-                    aux_outputs.append({'pred_logits': query_cls_results, 'pred_masks': outputs['aux_outputs'][i]["pred_masks"]})
+                    aux_outputs.append({
+                        'pred_logits': query_cls_results, 
+                        'pred_masks': outputs['aux_outputs'][i]["pred_masks"], 
+                        'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'],
+                        'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"],
+                    })
                 else:
                     query_cls_results_final = query_cls_results
 
@@ -724,6 +765,8 @@ class SAM3MC_o365(nn.Module):
             criterion_pred = {
                 'pred_logits': query_cls_results_final,
                 'pred_masks': outputs["pred_masks"],
+                'pred_boxes': outputs['pred_boxes'],
+                'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
                 'aux_outputs': aux_outputs if use_aux is True else None,
             }
 

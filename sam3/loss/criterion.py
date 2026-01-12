@@ -20,6 +20,7 @@ from detectron2.projects.point_rend.point_features import (
 )
 
 from maft.utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
+from sam3.model.box_ops import box_cxcywh_to_xyxy, generalized_box_iou
 
 
 def sigmoid_focal_loss( 
@@ -240,6 +241,32 @@ class SetCriterion(nn.Module):
         del target_masks
         return losses
 
+    # ---------------- 修改开始：新增 loss_boxes 函数 ----------------
+    def loss_boxes(self, outputs, targets, indices, num_masks):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+        """
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        
+        # 取出匹配好的预测框和GT框
+        src_boxes = outputs['pred_boxes'][idx]
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+        # 1. L1 Loss
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+        losses = {}
+        losses['loss_bbox'] = loss_bbox.sum() / num_masks
+
+        # 2. GIoU Loss
+        loss_giou = 1 - torch.diag(generalized_box_iou(
+            box_cxcywh_to_xyxy(src_boxes),
+            box_cxcywh_to_xyxy(target_boxes))
+        )
+        losses['loss_giou'] = loss_giou.sum() / num_masks
+        
+        return losses
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -256,6 +283,7 @@ class SetCriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels,
             'masks': self.loss_masks,
+            'boxes': self.loss_boxes, # <--- 务必在这里注册 'boxes'
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)

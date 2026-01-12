@@ -168,24 +168,44 @@ def _create_transformer_decoder() -> TransformerDecoder:
         use_text_cross_attention=True,
     )
 
+    # decoder = TransformerDecoder(
+    #     layer=decoder_layer,
+    #     num_layers=6,
+    #     num_queries=200,
+    #     return_intermediate=True,
+    #     box_refine=True,
+    #     num_o2m_queries=0,
+    #     dac=True,
+    #     boxRPB="log",
+    #     d_model=256,
+    #     frozen=False,
+    #     interaction_layer=None,
+    #     dac_use_selfatt_ln=True,
+    #     resolution=1008,
+    #     stride=14,
+    #     use_act_checkpoint=True,
+    #     presence_token=True,
+    # )
+
     decoder = TransformerDecoder(
         layer=decoder_layer,
         num_layers=6,
-        num_queries=200,
+        num_queries=200,   
         return_intermediate=True,
         box_refine=True,
-        num_o2m_queries=0,
-        dac=True,
+        num_o2m_queries=0,    
+        dac=False,            
         boxRPB="log",
         d_model=256,
         frozen=False,
         interaction_layer=None,
-        dac_use_selfatt_ln=True,
+        dac_use_selfatt_ln=False, # 【建议修改】既然不用 dac，该参数已无意义，设为 False 即可
         resolution=1008,
         stride=14,
         use_act_checkpoint=True,
         presence_token=True,
-    )
+    ) 
+
     return decoder
 
 
