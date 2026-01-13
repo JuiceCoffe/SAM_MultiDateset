@@ -177,7 +177,7 @@ class SetCriterion(nn.Module):
             # 5. 计算 Sigmoid Focal Loss
             # 注意：这里调用你上面定义的 sigmoid_focal_loss
             # num_masks 通常建议替换为 num_boxes 或者匹配到的正样本总数，用于归一化
-            loss_ce = sigmoid_focal_loss(
+            loss_focal = sigmoid_focal_loss(
                 src_logits, 
                 target_classes_onehot, 
                 num_masks, 
@@ -186,7 +186,7 @@ class SetCriterion(nn.Module):
                 no_reduction=False
             )
 
-            losses = {"loss_ce": loss_ce}
+            losses = {"loss_focal": loss_focal}
             return losses
     
     def loss_masks(self, outputs, targets, indices, num_masks):

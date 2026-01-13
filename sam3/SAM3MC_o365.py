@@ -107,16 +107,11 @@ class SAM3MC_o365(nn.Module):
         # 通过 cfg 控制是否启用，硬编码输入输出维度为 256
         self.use_query_proj = cfg.MODEL.SAM3.USE_QUERY_PROJ
         if self.use_query_proj:
-            self.query_proj = nn.Linear(256, 256)
+            self.query_proj = nn.Linear(256, 256, bias=False)
             
-            # 可选：初始化策略
-            # 1. Xavier Normal (标准做法)
-            nn.init.xavier_normal_(self.query_proj.weight)
-            nn.init.constant_(self.query_proj.bias, 0)
-            
-            # 2. 或者使用 Identity 初始化（一开始不改变特征，训练更稳定），看你需求
-            # nn.init.eye_(self.query_proj.weight)
-            # nn.init.constant_(self.query_proj.bias, 0)
+            # 【关键】初始化策略：建议初始化为 Identity (单位矩阵)
+            # 这样在训练开始时，特征保持原样，随着训练进行逐渐学习对齐，比随机初始化更稳
+            nn.init.eye_(self.query_proj.weight)
         else:
             self.query_proj = None
 
@@ -183,7 +178,7 @@ class SAM3MC_o365(nn.Module):
 
         weight_dict = {}
         criterion_weight_dict = {
-            "loss_ce": class_weight, 
+            "loss_focal": class_weight, 
             "loss_mask": mask_weight, 
             "loss_dice": dice_weight,
             'loss_bbox':bbox_weight, 
@@ -200,7 +195,7 @@ class SAM3MC_o365(nn.Module):
         if self.encoder_loss:
             encoder_losses = ["labels", "masks",]
             encoder_weight_dict = {
-                "loss_ce": class_weight,  
+                "loss_focal": class_weight,  
                 "loss_mask": mask_weight, 
                 "loss_dice": dice_weight,
             }
@@ -213,7 +208,7 @@ class SAM3MC_o365(nn.Module):
             )
 
             encoder_weight_dict = {
-                "loss_ce": class_weight * 1.0,  
+                "loss_focal": class_weight * 1.0,  
                 "loss_mask": mask_weight * 0.5, 
                 "loss_dice": dice_weight * 0.2  
             }
