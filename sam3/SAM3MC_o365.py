@@ -103,6 +103,24 @@ class SAM3MC_o365(nn.Module):
         # -------------------------------------------------------
         self.mask_pooling = MaskPooling()
 
+        # 【新增】Query Projector 配置
+        # 通过 cfg 控制是否启用，硬编码输入输出维度为 256
+        self.use_query_proj = cfg.MODEL.SAM3.USE_QUERY_PROJ
+        if self.use_query_proj:
+            self.query_proj = nn.Linear(256, 256)
+            
+            # 可选：初始化策略
+            # 1. Xavier Normal (标准做法)
+            nn.init.xavier_normal_(self.query_proj.weight)
+            nn.init.constant_(self.query_proj.bias, 0)
+            
+            # 2. 或者使用 Identity 初始化（一开始不改变特征，训练更稳定），看你需求
+            # nn.init.eye_(self.query_proj.weight)
+            # nn.init.constant_(self.query_proj.bias, 0)
+        else:
+            self.query_proj = None
+
+
         # 【新增】初始化 logit_bias
         # 我们希望初始概率 p = 0.01
         # Sigmoid(x) = 0.01  =>  x = log(0.01 / (1 - 0.01)) ≈ -4.595
@@ -721,6 +739,10 @@ class SAM3MC_o365(nn.Module):
             assert queries.shape[2] == N
             if use_aux or i == 5 :
                 tp_queries = queries[i,:,:,:].clone() 
+
+                if self.use_query_proj:
+                    tp_queries = self.query_proj(tp_queries)
+
                 tp_queries = F.normalize(tp_queries, dim=-1, p=2)
 
                 if self.use_cdt:

@@ -19,6 +19,7 @@ def add_sam3_config(cfg):
     cfg.MODEL.SAM3.COMPILE = False
     
     cfg.MODEL.SAM3.NUM_CDT = 0
+    cfg.MODEL.SAM3.USE_QUERY_PROJ = False
 
     cfg.INPUT.DATASET_MAPPER_NAME = "mask_former_semantic"
     cfg.INPUT.IMAGE_SIZE = 1008
