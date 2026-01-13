@@ -159,9 +159,8 @@ class SAM3MC_o365(nn.Module):
         class_weight = cfg.SOLVER.CLASS_WEIGHT
         dice_weight = cfg.SOLVER.DICE_WEIGHT
         mask_weight = cfg.SOLVER.MASK_WEIGHT
-        # DETR 常用推荐值: bbox=5.0, giou=2.0
-        bbox_weight = getattr(cfg.SOLVER, "BBOX_WEIGHT", 5.0)
-        giou_weight = getattr(cfg.SOLVER, "GIOU_WEIGHT", 2.0)
+        bbox_weight = cfg.SOLVER.BBOX_WEIGHT
+        giou_weight = cfg.SOLVER.GIOU_WEIGHT
 
 
         weight_dict = {}
