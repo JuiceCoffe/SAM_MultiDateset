@@ -7,10 +7,10 @@ MODEL:
   SAM3:
     BPE_PATH: "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
     ENABLE_SEGMENTATION: True
-    NUM_CDT: 0
-    USE_QUERY_PROJ: True
-  # WEIGHTS: "/data/hmp/sam3.pt"
-  WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
+    NUM_CDT: 1
+    USE_QUERY_PROJ: False
+  WEIGHTS: "/data/hmp/sam3.pt"
+  # WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
 
 DATASETS:
   # 只保留 COCO Panoptic
@@ -20,11 +20,11 @@ DATASETS:
 SOLVER:
   AMP:
     ENABLED: True
-  IMS_PER_BATCH: 4
+  IMS_PER_BATCH: 16
   BASE_LR: 0.00002
   LR_SCHEDULER_NAME: WarmupPolyLR
   MAX_ITER: 60000
-  CHECKPOINT_PERIOD: 7500
+  CHECKPOINT_PERIOD: 3750
   
   CLASS_WEIGHT: 2.0
   MASK_WEIGHT: 5.0
@@ -71,7 +71,7 @@ DATALOADER:
   USE_DIFF_BS_SIZE: False
 
 TEST:
-  EVAL_PERIOD: 7500
+  EVAL_PERIOD: 3750
   INSTANCE_ON: True   
   PANOPTIC_ON: True   
   SEMANTIC_ON: True   
@@ -80,5 +80,5 @@ TEST:
 VERSION: 2
 
 # OUTPUT_DIR: ./out/test/
-OUTPUT_DIR: ./out/cocopano_box_noencoder_nocdt_Qproj
+OUTPUT_DIR: ./out/cocopano_box_1cdt_cliplogit
   

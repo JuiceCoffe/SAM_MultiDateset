@@ -6,7 +6,8 @@ MODEL:
   SAM3:
     BPE_PATH: "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
     ENABLE_SEGMENTATION: True
-    NUM_CDT: 2
+    NUM_CDT: 0
+    USE_QUERY_PROJ: True
   WEIGHTS: "/data/hmp/sam3.pt"
   # WEIGHTS: /data/hmp/TASK/OVS/mysamclean/out/mixtest/model_0022499.pth
 
@@ -17,11 +18,11 @@ DATASETS:
 SOLVER:
   AMP:
     ENABLED: True
-  IMS_PER_BATCH: 4 
+  IMS_PER_BATCH: 12
   BASE_LR: 0.00002
   LR_SCHEDULER_NAME: WarmupPolyLR
   MAX_ITER: 150000
-  CHECKPOINT_PERIOD: 7500
+  CHECKPOINT_PERIOD: 10000
   
   # Loss 权重保持你原本的设置
   CLASS_WEIGHT: 2.0
@@ -72,11 +73,11 @@ DATALOADER:
 
 
 TEST:
-  EVAL_PERIOD: 7500
+  EVAL_PERIOD: 10000
   INSTANCE_ON: True   
   PANOPTIC_ON: True   
   SEMANTIC_ON: True   
 
 # OUTPUT_DIR: ./out/obj1_coco1/
-OUTPUT_DIR: ./out/obj1_coco1_box
+OUTPUT_DIR: ./out/obj1_coco1_box_qproj
 VERSION: 2
