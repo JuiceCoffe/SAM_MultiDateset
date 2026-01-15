@@ -1,5 +1,4 @@
 MODEL:
-  # --- 保持 SAM3 的模型设置 ---
   PIXEL_MEAN : [127.5, 127.5, 127.5]
   PIXEL_STD : [127.5, 127.5, 127.5]
   META_ARCHITECTURE: "SAM3MC_o365"
@@ -9,8 +8,8 @@ MODEL:
     NUM_CDT: 0
 
     USE_QUERY_PROJ: True
-    QUERY_PROJ_DIM: 1024
-  # WEIGHTS: "/data/hmp/sam3.pt"
+    USE_PE_TEXT: FALSE
+  WEIGHTS: "/data/hmp/sam3.pt"
   # WEIGHTS: /data/hmp/TASK/OVS/mysamMultiDateset/out/cocopano_box_1cdt_cliplogit/model_0007499.pth
 
 DATASETS:
@@ -23,7 +22,7 @@ SOLVER:
   IMS_PER_BATCH: 12
   BASE_LR: 0.00002
   LR_SCHEDULER_NAME: WarmupPolyLR
-  MAX_ITER: 50000
+  MAX_ITER: 75000
   CHECKPOINT_PERIOD: 5000
   
   # Loss 权重保持你原本的设置
@@ -52,7 +51,7 @@ DATALOADER:
 
   DATASET_RATIO: [1.0, 1.0]
 
-  DATASET_BS: [4, 2]
+  DATASET_BS: [8, 2]
   
   # 针对长尾分布采样：Obj365开启(True)，COCO关闭(False)
   USE_RFS: [False, True]
@@ -74,5 +73,5 @@ TEST:
   SEMANTIC_ON: True   
 
 # OUTPUT_DIR: ./out/obj1_coco1/
-OUTPUT_DIR: ./out/copa1_objcopa
+OUTPUT_DIR: ./out/objcopa_qproj
 VERSION: 2

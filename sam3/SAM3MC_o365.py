@@ -110,8 +110,7 @@ class SAM3MC_o365(nn.Module):
             if self.use_pe_text:
                 self.query_proj = nn.Linear(256, 1024, bias=False)
             else:
-                print("当前未使用1024维文本特征，无需投影！")
-                exit(0)
+                self.query_proj = nn.Linear(256, 256, bias=False)
             # 【关键】初始化策略：建议初始化为 Identity (单位矩阵)
             # 这样在训练开始时，特征保持原样，随着训练进行逐渐学习对齐，比随机初始化更稳
             nn.init.eye_(self.query_proj.weight)
