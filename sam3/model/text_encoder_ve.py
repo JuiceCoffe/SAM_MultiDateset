@@ -244,7 +244,7 @@ class TextTransformer(nn.Module):
             if isinstance(self.text_projection, nn.Linear):
                 pooled = self.text_projection(pooled)
             else:
-                pooled = pooled @ self.text_projection
+                pooled = pooled @ self.text_projection # 1024 -> 512
         if self.output_tokens:
             return pooled, tokens
         return pooled
@@ -305,6 +305,8 @@ class VETextEncoder(nn.Module):
             )  # [b, seq_len, d=1024]
             _, text_memory = self.encoder(tokenized)  # [b, seq_len, d=1024]
 
+            pe_textfeat = text_memory.clone()
+
             assert text_memory.shape[1] == inputs_embeds.shape[1]
             # Invert attention mask because its the opposite in pytorch transformer
             text_attention_mask = text_attention_mask.ne(1)
@@ -319,10 +321,15 @@ class VETextEncoder(nn.Module):
             assert (
                 input_boxes is None or len(input_boxes) == 0
             ), "Can't replace boxes in text if it's already encoded"
+        
+        pe_text_out = {
+            "pe_textfeat": pe_textfeat
+        }
 
         # Note that the input_embeds are returned in pytorch's convention (sequence first)
         return (
             text_attention_mask,
             text_memory_resized,
             inputs_embeds.transpose(0, 1),
+            pe_text_out
         )

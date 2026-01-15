@@ -24,7 +24,7 @@ class SAM3VLBackbone(nn.Module):
     def __init__(
         self,
         visual: Sam3DualViTDetNeck,
-        text,
+        text, # VETextEncoder
         compile_visual: bool = False,
         act_ckpt_whole_vision_backbone: bool = False,
         act_ckpt_whole_language_backbone: bool = False,
@@ -154,7 +154,7 @@ class SAM3VLBackbone(nn.Module):
         )
 
         with sdpa_context:
-            text_attention_mask, text_memory, text_embeds = self.language_backbone(
+            text_attention_mask, text_memory, text_embeds, pe_text_out = self.language_backbone(
                 text_to_encode, input_boxes, device=device
             )
 
@@ -173,5 +173,6 @@ class SAM3VLBackbone(nn.Module):
         output["language_embeds"] = (
             text_embeds  # Text embeddings before forward to the encoder
         )
+        output["pe_text_out"] = pe_text_out
 
         return output

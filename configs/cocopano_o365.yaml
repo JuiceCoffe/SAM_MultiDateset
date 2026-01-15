@@ -6,10 +6,12 @@ MODEL:
   SAM3:
     BPE_PATH: "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
     ENABLE_SEGMENTATION: True
-    NUM_CDT: 1
-    USE_QUERY_PROJ: False
+    NUM_CDT: 0
+
+    USE_QUERY_PROJ: True
+    QUERY_PROJ_DIM: 1024
   # WEIGHTS: "/data/hmp/sam3.pt"
-  WEIGHTS: /data/hmp/TASK/OVS/mysamMultiDateset/out/cocopano_box_1cdt_cliplogit/model_0007499.pth
+  # WEIGHTS: /data/hmp/TASK/OVS/mysamMultiDateset/out/cocopano_box_1cdt_cliplogit/model_0007499.pth
 
 DATASETS:
   TRAIN: ("coco_2017_train_panoptic", "objects365_v1_masktrain", )

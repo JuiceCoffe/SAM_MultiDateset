@@ -101,14 +101,17 @@ class SAM3MC_o365(nn.Module):
         # -------------------------------------------------------
         # 新增模块
         # -------------------------------------------------------
-        self.mask_pooling = MaskPooling()
+        self.use_pe_text = cfg.MODEL.SAM3.USE_PE_TEXT
 
         # 【新增】Query Projector 配置
         # 通过 cfg 控制是否启用，硬编码输入输出维度为 256
         self.use_query_proj = cfg.MODEL.SAM3.USE_QUERY_PROJ
         if self.use_query_proj:
-            self.query_proj = nn.Linear(256, 256, bias=False)
-            
+            if self.use_pe_text:
+                self.query_proj = nn.Linear(256, 1024, bias=False)
+            else:
+                print("当前未使用1024维文本特征，无需投影！")
+                exit(0)
             # 【关键】初始化策略：建议初始化为 Identity (单位矩阵)
             # 这样在训练开始时，特征保持原样，随着训练进行逐渐学习对齐，比随机初始化更稳
             nn.init.eye_(self.query_proj.weight)
@@ -131,9 +134,11 @@ class SAM3MC_o365(nn.Module):
         self.num_cdt = cfg.MODEL.SAM3.NUM_CDT    
         self.use_cdt = False if cfg.MODEL.SAM3.NUM_CDT == 0 else True
         if self.use_cdt:
-            # 使用 nn.ModuleList 包装
+            if self.use_pe_text:
+                print("CDT模块当前仅支持256文本特征输入，请关闭PE文本特征选项！")
+            text_classifier_dim = 256
             self.cdt = nn.ModuleList([
-                ContentDependentTransfer(d_model=256, nhead=8, panoptic_on=True) 
+                ContentDependentTransfer(d_model=text_classifier_dim, nhead=8, panoptic_on=True) 
                 for _ in range(self.num_cdt)
             ])
         else:
@@ -402,6 +407,7 @@ class SAM3MC_o365(nn.Module):
 
                     # --- 原有生成逻辑开始 ---
                     text_classifier = []
+                    text_feat = []
                     language_mask = []
                     # this is needed to avoid oom, which may happen when num of class is large
                     bs = 128
@@ -412,16 +418,25 @@ class SAM3MC_o365(nn.Module):
                         batch_text_feat = state_text["language_features"].detach()
                         mask = state_text["language_mask"] # bs, L
                         batch_text_feat = batch_text_feat.permute(1,0,2) # -> bs, L, D 
-                        text_classifier.append(batch_text_feat)
+                        if self.use_pe_text:
+                            text_classifier.append(state_text["pe_text_out"]["pe_textfeat"])
+                        else:    
+                            text_classifier.append(batch_text_feat)
+                        text_feat.append(batch_text_feat)
                         language_mask.append(mask) # bs, L
                     text_classifier = torch.cat(text_classifier, dim=0)
+                    text_feat = torch.cat(text_feat, dim=0)
                     language_mask = torch.cat(language_mask, dim=0) # (num_names * VILD_PROMPT,  L)
                     # average across templates and normalization.
+                    text_feat = text_feat.reshape(text_feat.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_feat.shape[-2], text_feat.shape[-1]) # num_names, VILD_PROMPT, L, D
+                    text_feat /= (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
+                    text_feat[language_mask.view(text_feat.shape[0],text_feat.shape[1],text_feat.shape[2])] = 0.0 # [num_names, VILD_PROMPT, L, D] 掩码掉 padding 部分
+                    
+                    language_features = text_feat.mean(1) # num_names, L, D
+
                     text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_classifier.shape[-2], text_classifier.shape[-1]) # num_names, VILD_PROMPT, L, D
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
-
                     text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 # [num_names, VILD_PROMPT, L, D] 掩码掉 padding 部分
-                    language_features = text_classifier.mean(1) # num_names, L, D
                     text_classifier = text_classifier.mean(-2) 
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                     text_classifier = text_classifier.mean(1)
@@ -447,6 +462,7 @@ class SAM3MC_o365(nn.Module):
             if self.test_dataname != dataname:
                 self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata)
                 text_classifier = []
+                text_feat = []
                 language_mask = []
                 # this is needed to avoid oom, which may happen when num of class is large
                 bs = 128
@@ -457,16 +473,25 @@ class SAM3MC_o365(nn.Module):
                     batch_text_feat = state_text["language_features"].detach()
                     mask = state_text["language_mask"] # bs, L
                     batch_text_feat = batch_text_feat.permute(1,0,2) # -> bs, L, D 
-                    text_classifier.append(batch_text_feat)
+                    if self.use_pe_text:
+                        text_classifier.append(state_text["pe_text_out"]["pe_textfeat"])
+                    else:    
+                        text_classifier.append(batch_text_feat)
+                    text_feat.append(batch_text_feat)
                     language_mask.append(mask) # bs, L
                 text_classifier = torch.cat(text_classifier, dim=0)
+                text_feat = torch.cat(text_feat, dim=0)
                 language_mask = torch.cat(language_mask, dim=0) # (num_names * VILD_PROMPT,  L)
                 # average across templates and normalization.
+                text_feat = text_feat.reshape(text_feat.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_feat.shape[-2], text_feat.shape[-1]) # num_names, VILD_PROMPT, L, D
+                text_feat /= (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
+                text_feat[language_mask.view(text_feat.shape[0],text_feat.shape[1],text_feat.shape[2])] = 0.0 # [num_names, VILD_PROMPT, L, D] 掩码掉 padding 部分
+                
+                language_features = text_feat.mean(1) # num_names, L, D
+
                 text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_classifier.shape[-2], text_classifier.shape[-1]) # num_names, VILD_PROMPT, L, D
                 text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
-
                 text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 # [num_names, VILD_PROMPT, L, D] 掩码掉 padding 部分
-                language_features = text_classifier.mean(1) # num_names, L, D
                 text_classifier = text_classifier.mean(-2) 
                 text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                 text_classifier = text_classifier.mean(1)

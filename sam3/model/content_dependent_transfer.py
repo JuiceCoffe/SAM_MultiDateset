@@ -51,7 +51,6 @@ class ShortCut_CrossAttention(nn.Module):
         tgt = tgt + tgt2
 
         return tgt
-0
 
 
 

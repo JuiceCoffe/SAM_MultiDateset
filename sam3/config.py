@@ -11,7 +11,7 @@ def add_sam3_config(cfg):
     # 对应 build_sam3_image_model 中的参数
     cfg.MODEL.SAM3.MODEL_TYPE = "sam3_image" # 预留，也许有 sam3_video
     cfg.MODEL.SAM3.BPE_PATH = "sam3/assets/bpe_simple_vocab_16e6.txt.gz" # 默认路径
-    
+    cfg.MODEL.SAM3.USE_PE_TEXT = False
 
     # 功能开关
     cfg.MODEL.SAM3.ENABLE_SEGMENTATION = True
