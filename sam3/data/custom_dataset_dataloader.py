@@ -174,6 +174,21 @@ def get_detection_dataset_dicts_with_source(
             # 强烈建议加上下面这一行，配合之前的 Mapper 修复，彻底解决名字匹配问题
             d['dataname'] = dataset_name 
 
+        # --- [核心修改开始]：增加物体数量过滤 ---
+        MAX_TARGETS_THRESHOLD = 100 
+        num_before_dense_filter = len(dicts)
+        # 只有当包含标注信息时才进行过滤
+        if "annotations" in dicts[0]:
+            dicts = [d for d in dicts if len(d.get("annotations", [])) <= MAX_TARGETS_THRESHOLD]
+        
+        num_after_dense_filter = len(dicts)
+        num_dropped = num_before_dense_filter - num_after_dense_filter
+        if num_dropped > 0:
+            logging.getLogger(__name__).info(
+                f"Filtered {num_dropped} images from {dataset_name} with > {MAX_TARGETS_THRESHOLD} targets."
+            )
+        # --- [核心修改结束] ---
+
         # 打印统计信息 (只针对有 instances 的)
         if "annotations" in dicts[0]:
             try:

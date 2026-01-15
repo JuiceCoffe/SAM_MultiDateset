@@ -8,7 +8,7 @@ MODEL:
     NUM_CDT: 0
 
     USE_QUERY_PROJ: True
-    USE_PE_TEXT: FALSE
+    USE_PE_TEXT: True
   WEIGHTS: "/data/hmp/sam3.pt"
   # WEIGHTS: /data/hmp/TASK/OVS/mysamMultiDateset/out/cocopano_box_1cdt_cliplogit/model_0007499.pth
 
@@ -51,7 +51,7 @@ DATALOADER:
 
   DATASET_RATIO: [1.0, 1.0]
 
-  DATASET_BS: [8, 2]
+  DATASET_BS: [8, 8]
   
   # 针对长尾分布采样：Obj365开启(True)，COCO关闭(False)
   USE_RFS: [False, True]
@@ -73,5 +73,5 @@ TEST:
   SEMANTIC_ON: True   
 
 # OUTPUT_DIR: ./out/obj1_coco1/
-OUTPUT_DIR: ./out/objcopa_qproj
+OUTPUT_DIR: ./out/objcopa_qproj_PEtext
 VERSION: 2
