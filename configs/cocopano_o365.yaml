@@ -33,7 +33,6 @@ SOLVER:
   ENCODER_LOSS: FALSE
 
 INPUT:
-  # --- 保持 Mapper 设置 ---
   DATASET_MAPPER_NAME: "coco_combine_lsj"
   IMAGE_SIZE: 1008
   MIN_SCALE: 0.1
