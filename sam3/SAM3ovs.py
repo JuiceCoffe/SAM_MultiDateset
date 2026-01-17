@@ -154,13 +154,12 @@ class SAM3ovs(nn.Module):
                 hidden_dim = 1024, 
                 output_dim = 256
             )
-            for module in self.mask_feat_proj.modules():
-                if isinstance(module, nn.Linear):
-                    # Xavier/Glorot 初始化是处理激活函数的强大默认选项
-                    nn.init.xavier_uniform_(module.weight)
-                    # 将偏置初始化为0
-                    if module.bias is not None:
-                        nn.init.zeros_(module.bias)
+            for m in self.mask_feat_proj.modules():
+                if isinstance(m, nn.Linear):
+                    # 使用 Kaiming 初始化，适用于 ReLU/GELU
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
         else:
             self.use_mask_encoder = False
             self.tracker = None
