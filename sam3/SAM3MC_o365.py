@@ -43,11 +43,38 @@ from sam3.model.memory import SimpleMaskEncoder
 from sam3.model.content_dependent_transfer import ContentDependentTransfer
 from sam3.model.box_ops import masks_to_boxes, box_xyxy_to_cxcywh
 
-from maft.modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
+from maft.modeling.transformer_decoder.fcclip_transformer_decoder import get_classification_logits
 
 import random
 
 import math
+
+class MaskPooling(nn.Module):
+    def __init__(
+        self,
+    ):
+        super().__init__()
+
+    def forward(self, x, mask):
+        """
+        Args:
+            x: [B, C, H, W]
+            mask: [B, Q, H, W]
+        """
+        if not x.shape[-2:] == mask.shape[-2:]:
+            # reshape mask to x
+            mask = F.interpolate(mask, size=x.shape[-2:], mode='bilinear', align_corners=False)
+        with torch.no_grad():
+            mask = mask.detach()
+            mask = (mask > 0).to(mask.dtype)
+            denorm = mask.sum(dim=(-1, -2), keepdim=True) + 1e-8
+
+        mask_pooled_x = torch.einsum(
+            "bchw,bqhw->bqc",
+            x,
+            mask / denorm,
+        )
+        return mask_pooled_x
 
 class FakeTracker(nn.Module):
     def __init__(self):
@@ -297,6 +324,8 @@ class SAM3MC_o365(nn.Module):
             # elif 'dot_prod_scoring' in name:
             #     param.requires_grad = False
             elif 'geometry_encoder' in name:
+                param.requires_grad = False
+            elif 'maskmem_backbone' in name:
                 param.requires_grad = False
             else:
                 param.requires_grad = True
@@ -787,7 +816,9 @@ class SAM3MC_o365(nn.Module):
                     queries_masks_feats = self.mask_feat_proj(queries_masks_feats)
                     if self.use_cdt == True:
                         raise RuntimeError("CDT和MASK ENCODER暂时不混用")
-                    query_names_results = torch.einsum("bnd,bcd->bnc", queries_masks_feats, text_classifier) # bs, N, C
+                    if self.use_pe_text == True:
+                        raise RuntimeError("PE TEXT和MASK ENCODER暂时不混用")
+                    query_names_results = torch.einsum("bnd,cd->bnc", queries_masks_feats, text_classifier) # bs, N, C
                 else:
                     tp_queries = queries[i,:,:,:].clone() 
 
@@ -987,6 +1018,8 @@ class SAM3MC_o365(nn.Module):
         Returns:
             visual_embeddings: [B, N, C_out] 提取出的每个 Mask 的视觉语义向量
         """
+        chunk_size=200
+
         with torch.set_grad_enabled(self.mask_encoder_requires_grad):
             # 确保 Tracker 存在且包含 maskmem_backbone
             if self.tracker is None or not hasattr(self.tracker, "maskmem_backbone"):
@@ -998,22 +1031,48 @@ class SAM3MC_o365(nn.Module):
             
             # 将 Mask Logits 转换为概率 [0, 1]
             mask_probs = torch.sigmoid(pred_masks)
+
             
             # [B, N, H, W] -> [B*N, 1, H, W]
             flat_masks = mask_probs.flatten(0, 1).unsqueeze(1)
             
-            maskmem_out = self.tracker.maskmem_backbone(
-                img_feat.repeat_interleave(N, dim=0), # [B, C, H', W'] -> [B*N, C, H', W']
-                flat_masks, 
-                skip_mask_sigmoid = True,
-            )
+            #一次性计算逻辑
+            # maskmem_out = self.tracker.maskmem_backbone(
+            #     img_feat.repeat_interleave(N, dim=0), # [B, C, H', W'] -> [B*N, C, H', W']
+            #     flat_masks, 
+            #     skip_mask_sigmoid = True,
+            # )
             
-            # 获取视觉特征 [B*N, C_out, H_mem, W_mem]
-            mask_feats = maskmem_out["vision_features_before_proj"]
+            # # 获取视觉特征 [B*N, C_out, H_mem, W_mem]
+            # mask_feats = maskmem_out["vision_features_before_proj"]
+            # pooled_mask_feats = self.mask_pooling(mask_feats, flat_masks)
+
+            pooled_mask_feats = []
+            total_num = B * N
+
+            for i in range(0, total_num, chunk_size):
+                # 1. 确定当前 batch 的范围
+                end_idx = min(i + chunk_size, total_num)
+                cur_flat_masks = flat_masks[i:end_idx]
+                
+                # 2. 计算当前 chunk 对应的图像索引 (例如 i=10, N=4, 则属于第 2 张图)
+                img_indices = torch.arange(i, end_idx, device=img_feat.device) // N
+                cur_img_feat = img_feat[img_indices]
+
+                # 3. 分步推理
+                maskmem_out = self.tracker.maskmem_backbone(
+                    cur_img_feat, 
+                    cur_flat_masks, 
+                    skip_mask_sigmoid=True,
+                )
+                
+                cur_mask_feats = maskmem_out["vision_features_before_proj"]
+                cur_pooled = self.mask_pooling(cur_mask_feats, cur_flat_masks)
+                pooled_mask_feats.append(cur_pooled)
+            pooled_mask_feats = torch.cat(pooled_mask_feats, dim=0)
             
-            pooled_mask_feats = self.mask_pooling(mask_feats, pred_masks)
-            
-            pooled_mask_feats = pooled_mask_feats.view(B, N, -1)
+
+            pooled_mask_feats = pooled_mask_feats.view(B, N, C_feat)
             
             pooled_mask_feats = F.normalize(pooled_mask_feats, dim=-1)
 
