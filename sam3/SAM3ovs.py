@@ -77,10 +77,6 @@ class MaskPooling(nn.Module):
         return mask_pooled_x
 
 class MLP(nn.Module):
-    """
-    参考 LLaVA 等 SOTA 多模态模型设计的对齐器。
-    去掉了中间的 LayerNorm，保持特征的数值敏感度。
-    """
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
         super().__init__()
         self.layers = nn.Sequential(
