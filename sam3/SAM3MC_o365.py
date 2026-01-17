@@ -1051,13 +1051,21 @@ class SAM3MC_o365(nn.Module):
             total_num = B * N
 
             for i in range(0, total_num, chunk_size):
-                # 1. 确定当前 batch 的范围
                 end_idx = min(i + chunk_size, total_num)
-                cur_flat_masks = flat_masks[i:end_idx]
                 
-                # 2. 计算当前 chunk 对应的图像索引 (例如 i=10, N=4, 则属于第 2 张图)
-                img_indices = torch.arange(i, end_idx, device=img_feat.device) // N
-                cur_img_feat = img_feat[img_indices]
+                # 找到当前 chunk 对应的是哪几张图
+                b_start = i // N
+                b_end = (end_idx - 1) // N
+                
+                if b_start == b_end:
+                    # print("当前 chunk 全属于同一张图，直接取该图，显存开销极小")
+                    cur_img_feat = img_feat[b_start:b_start+1].expand(end_idx - i, -1, -1, -1)
+                else:
+                    # print("跨图时使用索引")
+                    img_indices = torch.arange(i, end_idx, device=img_feat.device) // N
+                    cur_img_feat = img_feat[img_indices]
+
+                cur_flat_masks = flat_masks[i:end_idx]
 
                 # 3. 分步推理
                 maskmem_out = self.tracker.maskmem_backbone(

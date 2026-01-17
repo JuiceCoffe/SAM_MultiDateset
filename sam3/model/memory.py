@@ -195,13 +195,12 @@ class SimpleMaskEncoder(nn.Module):
         x = x + masks
         x = self.fuser(x)
 
-        x_ori = x.clone()
+        # x = self.out_proj(x)
 
-        x = self.out_proj(x)
+        # pos = self.position_encoding(x).to(x.dtype)
 
-        pos = self.position_encoding(x).to(x.dtype)
-
-        return {"vision_features": x, 
-                "vision_pos_enc": [pos],
-                "vision_features_before_proj": x_ori,
+        return {
+                # "vision_features": x, 
+                # "vision_pos_enc": [pos],
+                "vision_features_before_proj": x,
                 }

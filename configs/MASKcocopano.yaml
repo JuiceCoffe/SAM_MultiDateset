@@ -24,7 +24,7 @@ SOLVER:
   IMS_PER_BATCH: 8
   BASE_LR: 0.00002
   LR_SCHEDULER_NAME: WarmupPolyLR
-  MAX_ITER: 60000
+  MAX_ITER: 30000
   CHECKPOINT_PERIOD: 5000
   
   CLASS_WEIGHT: 2.0
@@ -83,5 +83,5 @@ TEST:
 VERSION: 2
 
 # OUTPUT_DIR: ./out/test/
-OUTPUT_DIR: ./out/cocopano_mask/
+OUTPUT_DIR: ./out/MASK_cocopano/
   
