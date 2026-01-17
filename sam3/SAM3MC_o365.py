@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
 from torch import nn
@@ -76,6 +76,23 @@ class MaskPooling(nn.Module):
         )
         return mask_pooled_x
 
+class MLP(nn.Module):
+    """
+    一个简单的3层多层感知机（MLP），用于特征投影。
+    结构: Linear -> LayerNorm -> GELU -> Linear
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),  # 为训练稳定性添加层归一化
+            nn.GELU(),                 # 使用GELU作为现代激活函数
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
+
 class FakeTracker(nn.Module):
     def __init__(self):
         super().__init__()
@@ -133,11 +150,22 @@ class SAM3MC_o365(nn.Module):
         )
         if cfg.MODEL.SAM3.USE_MASK_ENCODER:
             self.use_mask_encoder = True
+            self.mask_encoder_requires_grad = cfg.MODEL.SAM3.MASK_ENCODER_REQUIRES_GRAD
+
             self.tracker = FakeTracker()
             self.mask_pooling = MaskPooling()
-            self.mask_encoder_requires_grad = cfg.MODEL.SAM3.MASK_ENCODER_REQUIRES_GRAD
-            self.mask_feat_proj = nn.Linear(256, 256, bias=False)
-            nn.init.eye_(self.mask_feat_proj.weight)
+            self.mask_feat_proj = MLP(
+                input_dim = 256, 
+                hidden_dim = 1024, 
+                output_dim = 256
+            )
+            for module in self.mask_feat_proj.modules():
+                if isinstance(module, nn.Linear):
+                    # Xavier/Glorot 初始化是处理激活函数的强大默认选项
+                    nn.init.xavier_uniform_(module.weight)
+                    # 将偏置初始化为0
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
         else:
             self.use_mask_encoder = False
             self.tracker = None
@@ -814,6 +842,7 @@ class SAM3MC_o365(nn.Module):
                         pred_masks = outputs['aux_outputs'][i]["pred_masks"] if i<5 else outputs["pred_masks"],
                     )
                     queries_masks_feats = self.mask_feat_proj(queries_masks_feats)
+                    queries_masks_feats = F.normalize(queries_masks_feats, dim=-1, p=2)
                     if self.use_cdt == True:
                         raise RuntimeError("CDT和MASK ENCODER暂时不混用")
                     if self.use_pe_text == True:
