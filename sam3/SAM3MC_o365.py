@@ -29,14 +29,17 @@ from sam3.model_builder import (
     _create_segmentation_head,
     _create_geometry_encoder,
     _create_sam3_model,
+
+    _create_tracker_maskmem_backbone,
 )
 from sam3.model.data_misc import FindStage, interpolate
 
 from maft.utils.text_templetes import VILD_PROMPT
 # VILD_PROMPT = ["{}"]
 
-from .loss.matcher import HungarianMatcher
-from .loss.criterion import SetCriterion
+from sam3.loss.matcher import HungarianMatcher
+from sam3.loss.criterion import SetCriterion
+from sam3.model.memory import SimpleMaskEncoder
 from sam3.model.content_dependent_transfer import ContentDependentTransfer
 from sam3.model.box_ops import masks_to_boxes, box_xyxy_to_cxcywh
 
@@ -46,6 +49,14 @@ import random
 
 import math
 
+class FakeTracker(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.maskmem_backbone = _create_tracker_maskmem_backbone() 
+        assert isinstance(self.maskmem_backbone, SimpleMaskEncoder)
+        
+    def forward(self, x):
+        pass
 
 @META_ARCH_REGISTRY.register()
 class SAM3MC_o365(nn.Module):
@@ -93,6 +104,17 @@ class SAM3MC_o365(nn.Module):
             inst_predictor,
             cfg.eval_only,
         )
+        if cfg.MODEL.SAM3.USE_MASK_ENCODER:
+            self.use_mask_encoder = True
+            self.tracker = FakeTracker()
+            self.mask_pooling = MaskPooling()
+            self.mask_encoder_requires_grad = cfg.MODEL.SAM3.MASK_ENCODER_REQUIRES_GRAD
+            self.mask_feat_proj = nn.Linear(256, 256, bias=False)
+            nn.init.eye_(self.mask_feat_proj.weight)
+        else:
+            self.use_mask_encoder = False
+            self.tracker = None
+        
         if cfg.eval_only:
             self.detector.eval()
         print("SAM3创建成功!")
@@ -757,17 +779,27 @@ class SAM3MC_o365(nn.Module):
             assert queries.shape[0] == 6
             assert queries.shape[2] == N
             if use_aux or i == 5 :
-                tp_queries = queries[i,:,:,:].clone() 
-
-                if self.use_query_proj:
-                    tp_queries = self.query_proj(tp_queries)
-
-                tp_queries = F.normalize(tp_queries, dim=-1, p=2)
-
-                if self.use_cdt:
-                    query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, text_classifier) # bs, N, C
+                if self.use_mask_encoder:
+                    queries_masks_feats = self._get_mask_feat(
+                        img_feat = img_feat,
+                        pred_masks = outputs['aux_outputs'][i]["pred_masks"] if i<5 else outputs["pred_masks"],
+                    )
+                    queries_masks_feats = self.mask_feat_proj(queries_masks_feats)
+                    if self.use_cdt == True:
+                        raise RuntimeError("CDT和MASK ENCODER暂时不混用")
+                    query_names_results = torch.einsum("bnd,bcd->bnc", queries_masks_feats, text_classifier) # bs, N, C
                 else:
-                    query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier) # bs, N, C
+                    tp_queries = queries[i,:,:,:].clone() 
+
+                    if self.use_query_proj:
+                        tp_queries = self.query_proj(tp_queries)
+
+                    tp_queries = F.normalize(tp_queries, dim=-1, p=2)
+
+                    if self.use_cdt:
+                        query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, text_classifier) # bs, N, C
+                    else:
+                        query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier) # bs, N, C
                 
                 
                 logit_scale = self.logit_scale.exp()
@@ -939,6 +971,53 @@ class SAM3MC_o365(nn.Module):
 
             return results
 
+    def _get_mask_feat(
+        self,
+        img_feat,  # Tensor: Backbone 输出特征 [B, C, H_feat, W_feat]
+        pred_masks,         # Tensor: 预测的 Mask Logits [B, N, H_mask, W_mask]
+    ):
+        """
+        Mask Feedback Loop 核心实现：
+        利用 Tracker 的 Mask Encoder 将 Mask 对应的图像区域编码为视觉向量。
+        
+        Args:
+            img_feat: 视觉 Backbone 的特征图 (通常是 Stage 2 或 Stage 3 的输出)
+            pred_masks: Decoder 输出的 Mask Logits, 形状为 [B, N, H, W]
+            
+        Returns:
+            visual_embeddings: [B, N, C_out] 提取出的每个 Mask 的视觉语义向量
+        """
+        with torch.set_grad_enabled(self.mask_encoder_requires_grad):
+            # 确保 Tracker 存在且包含 maskmem_backbone
+            if self.tracker is None or not hasattr(self.tracker, "maskmem_backbone"):
+                raise RuntimeError("必须启用 USE_MASK_ENCODER 并初始化 Tracker 才能使用 Mask Feedback Loop")
+
+            # 1. 准备数据维度
+            B, N, H_mask, W_mask = pred_masks.shape
+            _, C_feat, H_feat, W_feat = img_feat.shape
+            
+            # 将 Mask Logits 转换为概率 [0, 1]
+            mask_probs = torch.sigmoid(pred_masks)
+            
+            # [B, N, H, W] -> [B*N, 1, H, W]
+            flat_masks = mask_probs.flatten(0, 1).unsqueeze(1)
+            
+            maskmem_out = self.tracker.maskmem_backbone(
+                img_feat.repeat_interleave(N, dim=0), # [B, C, H', W'] -> [B*N, C, H', W']
+                flat_masks, 
+                skip_mask_sigmoid = True,
+            )
+            
+            # 获取视觉特征 [B*N, C_out, H_mem, W_mem]
+            mask_feats = maskmem_out["vision_features_before_proj"]
+            
+            pooled_mask_feats = self.mask_pooling(mask_feats, pred_masks)
+            
+            pooled_mask_feats = pooled_mask_feats.view(B, N, -1)
+            
+            pooled_mask_feats = F.normalize(pooled_mask_feats, dim=-1)
+
+            return pooled_mask_feats
 
 
     def panoptic_inference(self, mask_cls, mask_pred, dataname):
