@@ -67,6 +67,7 @@ from sam3.modeling_d2 import SAM3Wrapper # 导入这个类就会自动触发 REG
 from sam3.SAM3MC_ora import SAM3MC_ora
 from sam3.SAM3MC_DINO import SAM3MC_DINO
 from sam3.SAM3MC_o365 import SAM3MC_o365
+from sam3.SAM3ovs import SAM3ovs
 
 
 # 临时修复 lvis 报错：AttributeError: module 'numpy' has no attribute 'float'.
