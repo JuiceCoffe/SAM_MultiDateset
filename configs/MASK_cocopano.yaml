@@ -82,5 +82,5 @@ TEST:
 VERSION: 2
 
 # OUTPUT_DIR: ./out/test/
-OUTPUT_DIR: ./out/MASK_cocopano/
+OUTPUT_DIR: ./out/MASK/cocopano/
   

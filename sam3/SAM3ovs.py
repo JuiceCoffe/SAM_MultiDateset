@@ -78,15 +78,14 @@ class MaskPooling(nn.Module):
 
 class MLP(nn.Module):
     """
-    一个简单的3层多层感知机（MLP），用于特征投影。
-    结构: Linear -> LayerNorm -> GELU -> Linear
+    参考 LLaVA 等 SOTA 多模态模型设计的对齐器。
+    去掉了中间的 LayerNorm，保持特征的数值敏感度。
     """
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),  # 为训练稳定性添加层归一化
-            nn.GELU(),                 # 使用GELU作为现代激活函数
+            nn.GELU(),
             nn.Linear(hidden_dim, output_dim)
         )
 
