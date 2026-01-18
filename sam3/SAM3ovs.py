@@ -264,8 +264,8 @@ class SAM3ovs(nn.Module):
         if self.use_aux:
             for i in range (5):
                 for k in criterion_weight_dict.keys():
-                    if "focal" in k:
-                        continue
+                    # if "focal" in k:
+                    #     continue
                     weight_dict[f"{k}_{i}"] = criterion_weight_dict[k]
         
         self.encoder_loss = cfg.SOLVER.ENCODER_LOSS
@@ -792,11 +792,6 @@ class SAM3ovs(nn.Module):
         # print('aux box:',outputs['aux_outputs'][0]['pred_boxes'].shape)
         # print('aux pred_boxes_xyxy:',outputs['aux_outputs'][0]['pred_boxes_xyxy'].shape)
 
-
-        out_masks = outputs["pred_masks"].clone()
-
-        out_masks = out_masks.sigmoid()
-
         # presence_score = outputs["presence_logit_dec"].sigmoid().unsqueeze(1) # 在多类别情况下认为失效
 
         # out_semseg = outputs["semantic_seg"] # 原语义分割头输出，舍去
@@ -816,77 +811,72 @@ class SAM3ovs(nn.Module):
         # print("pred_boxes_xyxy:",pred_boxes_xyxy.shape)
         
 
-        bs, N, H, W = out_masks.shape
+        bs, N, H, W = outputs["pred_masks"].shape
         C_ = text_classifier.shape[0] # num_names 
 
-        queries_masks = out_masks # out_probs是通过与池化prompt投影卷积实现的，多类别下失效，直接用原始mask_logits
-
         queries = outputs["obj_queries"] # 6, bs, N, D
-        pixel_embed = outputs["pixel_embed"] # bs, D, H', W'
-        instance_embeds = outputs["instance_embeds"] 
+
 
         use_aux = self.use_aux and self.training
         aux_outputs = []
+        query_cls_results_final = None # 存储最后一层的分类结果
 
         for i in range(6):
             assert queries.shape[0] == 6
-            assert queries.shape[2] == N
-            if i == 5 :
-                if self.use_mask_encoder:
+            # 判断是否是 Aux 层，或者最后一层
+            is_final_layer = (i == 5)
+            is_aux_layer = (i < 5) and use_aux
+
+            if is_final_layer or is_aux_layer:
+                # 获取 mask logits
+                current_pred_masks = outputs['aux_outputs'][i]["pred_masks"] if i < 5 else outputs["pred_masks"]
+                
+                # --- Classification Branch ---
+                if is_final_layer and self.use_mask_encoder:
+                    # 使用 Mask Feedback
+                    # 注意：_get_mask_feat 内部 tracker 需要 logits 输入 (配合 skip_mask_sigmoid=False)
                     queries_masks_feats = self._get_mask_feat(
                         img_feat = img_feat,
-                        pred_masks = outputs['aux_outputs'][i]["pred_masks"] if i<5 else outputs["pred_masks"],
+                        pred_masks = current_pred_masks, # Logits
                     )
                     queries_masks_feats = self.mask_feat_proj(queries_masks_feats)
                     queries_masks_feats = F.normalize(queries_masks_feats, dim=-1, p=2)
-                    if self.use_cdt == True:
-                        raise RuntimeError("CDT和MASK ENCODER暂时不混用")
-                    if self.use_pe_text == True:
-                        raise RuntimeError("PE TEXT和MASK ENCODER暂时不混用")
-                    query_names_results = torch.einsum("bnd,cd->bnc", queries_masks_feats, text_classifier) # bs, N, C
+                    
+                    if self.use_cdt or self.use_pe_text:
+                        raise RuntimeError("CDT/PE TEXT和MASK ENCODER暂时不混用")
+                    
+                    query_names_results = torch.einsum("bnd,cd->bnc", queries_masks_feats, text_classifier) 
                 else:
+                    # 使用 Query (FC-CLIP style)
                     tp_queries = queries[i,:,:,:].clone() 
-
                     if self.use_query_proj:
                         tp_queries = self.query_proj(tp_queries)
-
                     tp_queries = F.normalize(tp_queries, dim=-1, p=2)
 
                     if self.use_cdt:
-                        query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, text_classifier) # bs, N, C
+                        query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, text_classifier) 
                     else:
-                        query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier) # bs, N, C
-                
-                
+                        query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier)
+
+                # Scaling
                 logit_scale = self.logit_scale.exp()
                 logit_scale = torch.clamp(logit_scale, max=100.0)
                 query_names_results = logit_scale * query_names_results + self.logit_bias
 
-                query_cls_results= []
-                cur_idx = 0
-                for num_t in num_templates: 
-                    query_cls_results.append(query_names_results[:,:, cur_idx: cur_idx + num_t].max(-1).values)
-                    cur_idx += num_t
-                query_cls_results_final = torch.stack(query_cls_results, dim=-1) # bs, N, num_classes
-                # print(f"aux query_cls_results[{i}] shape:", query_cls_results.shape)
-                    
-            elif use_aux:
-                # 生成全 0 的 Logits
-                # 注意：全 0意味着概率均等，Hungarian Matcher 将完全依赖 Mask IoU 和 Box 距离进行匹配
-                # 这正是我们想要的：Aux 层只负责几何对齐
-                dummy_logits = torch.zeros(
-                    bs, N, len(num_templates), 
-                    device=self.device, dtype=outputs["pred_masks"].dtype
-                )
+                # Aggregation (Template -> Class)
+                # 使用 Helper Function 替换原有循环
+                current_query_cls_results = aggregate_name_to_class_logits(query_names_results, num_templates)
 
-                aux_outputs.append({
-                    # 'pred_logits': query_cls_results, 
-                    'pred_logits': dummy_logits,
-                    'pred_masks': outputs['aux_outputs'][i]["pred_masks"], 
-                    'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'],
-                    'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"],
-                })
-                
+                # 保存输出
+                if is_final_layer:
+                    query_cls_results_final = current_query_cls_results
+                else:
+                    aux_outputs.append({
+                        'pred_logits': current_query_cls_results, 
+                        'pred_masks': current_pred_masks, 
+                        'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'],
+                        'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"],
+                    })
 
 
 
@@ -1061,12 +1051,8 @@ class SAM3ovs(nn.Module):
             B, N, H_mask, W_mask = pred_masks.shape
             _, C_feat, H_feat, W_feat = img_feat.shape
             
-            # 将 Mask Logits 转换为概率 [0, 1]
-            mask_probs = torch.sigmoid(pred_masks)
-
-            
             # [B, N, H, W] -> [B*N, 1, H, W]
-            flat_masks = mask_probs.flatten(0, 1).unsqueeze(1)
+            flat_masks = pred_masks.flatten(0, 1).unsqueeze(1)
             
             #一次性计算逻辑
             # maskmem_out = self.tracker.maskmem_backbone(
@@ -1103,7 +1089,7 @@ class SAM3ovs(nn.Module):
                 maskmem_out = self.tracker.maskmem_backbone(
                     cur_img_feat, 
                     cur_flat_masks, 
-                    skip_mask_sigmoid=True,
+                    skip_mask_sigmoid=False, # 此时输入mask logits而非probs
                 )
                 
                 cur_mask_feats = maskmem_out["vision_features_before_proj"]
@@ -1114,7 +1100,7 @@ class SAM3ovs(nn.Module):
 
             pooled_mask_feats = pooled_mask_feats.view(B, N, C_feat)
             
-            pooled_mask_feats = F.normalize(pooled_mask_feats, dim=-1)
+            # pooled_mask_feats = F.normalize(pooled_mask_feats, dim=-1)
 
             return pooled_mask_feats
 

@@ -12,7 +12,7 @@ def add_sam3_config(cfg):
     cfg.MODEL.SAM3.MODEL_TYPE = "sam3_image" # 预留，也许有 sam3_video
     cfg.MODEL.SAM3.BPE_PATH = "sam3/assets/bpe_simple_vocab_16e6.txt.gz" # 默认路径
     cfg.MODEL.SAM3.USE_PE_TEXT = False
-    cfg.MODEL.SAM3.USE_MASK_ENCODER = True
+    cfg.MODEL.SAM3.USE_MASK_ENCODER = False
     cfg.MODEL.SAM3.MASK_ENCODER_REQUIRES_GRAD = False
 
     # 功能开关

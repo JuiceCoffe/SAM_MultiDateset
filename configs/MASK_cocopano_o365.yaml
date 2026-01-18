@@ -8,6 +8,7 @@ MODEL:
     NUM_CDT: 0
     USE_QUERY_PROJ: FALSE
     USE_PE_TEXT: FALSE
+    USE_MASK_ENCODER: TRUE
   WEIGHTS: "/data/hmp/sam3.pt"
   # WEIGHTS: /data/hmp/TASK/OVS/mysamMultiDateset/out/cocopano_box_1cdt_cliplogit/model_0007499.pth
 
@@ -21,7 +22,7 @@ SOLVER:
   IMS_PER_BATCH: 12
   BASE_LR: 0.00002
   LR_SCHEDULER_NAME: WarmupPolyLR
-  MAX_ITER: 60000
+  MAX_ITER: 30000
   CHECKPOINT_PERIOD: 5000
   
   # Loss 权重保持你原本的设置
@@ -50,7 +51,7 @@ INPUT:
 DATALOADER:
   SAMPLER_TRAIN: "MultiDatasetSampler"
 
-  DATASET_RATIO: [1.0, 1.0]
+  DATASET_RATIO: [2.0, 1.0]
 
   DATASET_BS: [4, 4]
   
@@ -74,5 +75,5 @@ TEST:
   SEMANTIC_ON: True   
 
 # OUTPUT_DIR: ./out/test
-OUTPUT_DIR: ./out/MASK/objcopa_qproj_PEtext
+OUTPUT_DIR: ./out/MASK/objcopa
 VERSION: 2
