@@ -91,39 +91,53 @@ class MLP(nn.Module):
 class ResMLPAdapter(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.1):
         super().__init__()
-        # 投影到隐层维度
-        self.input_proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
-        
-        # 残差块 1
+        # ... (层定义保持不变) ...
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
         self.ln1 = nn.LayerNorm(hidden_dim)
         self.dense1 = nn.Linear(hidden_dim, hidden_dim)
         self.act1 = nn.GELU()
-        
-        # 残差块 2
-        self.ln2 = nn.LayerNorm(hidden_dim)
-        self.dense2 = nn.Linear(hidden_dim, output_dim)
-        
         self.dropout = nn.Dropout(dropout)
+        
+        # 最后一层投影
+        self.ln_out = nn.LayerNorm(hidden_dim)
+        self.output_proj = nn.Linear(hidden_dim, output_dim)
 
+        self._init_weights()
+
+    def _init_weights(self):
+        # 1. 基础初始化：对所有 Linear 使用 Xavier 或 Kaiming
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight) # 或者 kaiming
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # 2. 【关键】零初始化残差分支的最后一层
+        # 这样初始 forward 结果就是 input_proj(x) + 0
+        # 如果 input_dim != hidden_dim，input_proj 还是会有影响，但至少 dense 部分是 0
+        nn.init.constant_(self.dense1.weight, 0)
+        nn.init.constant_(self.dense1.bias, 0)
+        
+        # 如果 output_proj 是最终输出，也可以把它初始化为 0 (或者接近 0 的极小值)
+        # 这样能保证最初输出的特征极其平滑，不会产生巨大的 Logit
+        nn.init.constant_(self.output_proj.weight, 0)
+        nn.init.constant_(self.output_proj.bias, 0)
 
     def forward(self, x):
-        # x: [B, N, input_dim]
-        x = self.input_proj(x)
+        # x: [B, N, 256]
+        x = self.input_proj(x) # -> [B, N, 1024]
         
-        # ResBlock 1
+        # Residual Block inside Hidden Dim
         residual = x
         out = self.ln1(x)
         out = self.dense1(out)
         out = self.act1(out)
         out = self.dropout(out)
-        x = x + residual # 残差连接
+        x = x + out # Add residual (1024 + 1024)
         
-        # ResBlock 2
-        residual = x
-        out = self.ln2(x)
-        out = self.dense2(out)
-        out = self.dropout(out)
-        x = x + residual # 残差连接
+        # Output Projection
+        x = self.ln_out(x)
+        x = self.output_proj(x) # -> [B, N, 256]
         
         return x
 
@@ -188,11 +202,10 @@ class SAM3ovs(nn.Module):
 
             self.tracker = FakeTracker()
             self.mask_pooling = MaskPooling()
-            self.mask_feat_proj = MLP(
-                input_dim = 256, 
-                hidden_dim = 1024, 
-                output_dim = 256
-            )
+            # self.mask_feat_proj = MLP(input_dim = 256, hidden_dim = 1024, output_dim = 256)
+            
+            self.mask_feat_proj = ResMLPAdapter(input_dim = 256, hidden_dim = 1024, output_dim = 256)
+
             for m in self.mask_feat_proj.modules():
                 if isinstance(m, nn.Linear):
                     # 改回 Kaiming Normal，让初始就有较强的信号流
@@ -366,6 +379,16 @@ class SAM3ovs(nn.Module):
             oversample_ratio=cfg.SOLVER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
         )
+
+        if self.use_aux:
+            aux_class_decay = cfg.SOLVER.AUX_CLASS_DECAY
+            print(f"Applying Aux Classification Weight Decay: {aux_class_decay}")
+            
+            for i in range(5): # 遍历 5 个辅助层
+                key = f"loss_focal_{i}"
+                if key in self.criterion.weight_dict:
+                    original_weight = self.criterion.weight_dict[key]
+                    self.criterion.weight_dict[key] = original_weight * aux_class_decay
 
         # -------------------------------------------------------
         # 【新增】Inference 参数配置
@@ -900,7 +923,7 @@ class SAM3ovs(nn.Module):
 
                 # Scaling
                 logit_scale = self.logit_scale.exp()
-                logit_scale = torch.clamp(logit_scale, max=100.0)
+                logit_scale = torch.clamp(logit_scale, max=20.0)
                 query_names_results = logit_scale * query_names_results + self.logit_bias
 
                 # Aggregation (Template -> Class)

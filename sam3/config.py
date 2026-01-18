@@ -50,6 +50,7 @@ def add_sam3_config(cfg):
     cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO = 0.75
     cfg.SOLVER.LARGE_MULTIPLIER = 5.0
     cfg.SOLVER.LARGE_LR_MODEL = []
+    cfg.SOLVER.AUX_CLASS_DECAY = 1.0
 
     cfg.SOLVER.USE_AUX = True
     cfg.SOLVER.ENCODER_LOSS = False
