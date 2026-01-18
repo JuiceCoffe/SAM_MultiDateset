@@ -35,7 +35,8 @@ SOLVER:
   USE_AUX : True
 
   ENCODER_LOSS: FALSE
-
+  LARGE_MULTIPLIER: 5.0
+  LARGE_LR_MODEL: ['mask_feat_proj']
 
 INPUT:
   DATASET_MAPPER_NAME: "coco_combine_lsj"

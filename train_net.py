@@ -228,10 +228,10 @@ class Trainer(DefaultTrainer):
                     hyperparams["lr"] = hyperparams["lr"] *  cfg.SOLVER.BACKBONE_MULTIPLIER
 
 
-                elif any(x in module_name for x in ["mask_feat_proj", "query_proj", "cdt"]):
+                elif any(x in module_name for x in cfg.SOLVER.LARGE_LR_MODEL):
                     # 建议倍率设为 10.0，或者在 cfg 中新增一个参数 cfg.SOLVER.MLP_MULTIPLIER
                     # 因为这些层是随机初始化的，需要更大的步长来对齐语义
-                    multiplier = getattr(cfg.SOLVER, "MLP_MULTIPLIER", 5.0) 
+                    multiplier = getattr(cfg.SOLVER, "LARGE_MULTIPLIER", 5.0) 
                     hyperparams["lr"] = hyperparams["lr"] * multiplier
                     # 可以在第一次执行时打印一下，确认是否拦截成功
                     print(f"Set custom LR for {module_name}: {hyperparams['lr']}")
