@@ -88,6 +88,45 @@ class MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.layers(x)
 
+class ResMLPAdapter(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.1):
+        super().__init__()
+        # 投影到隐层维度
+        self.input_proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
+        
+        # 残差块 1
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.dense1 = nn.Linear(hidden_dim, hidden_dim)
+        self.act1 = nn.GELU()
+        
+        # 残差块 2
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.dense2 = nn.Linear(hidden_dim, output_dim)
+        
+        self.dropout = nn.Dropout(dropout)
+
+
+    def forward(self, x):
+        # x: [B, N, input_dim]
+        x = self.input_proj(x)
+        
+        # ResBlock 1
+        residual = x
+        out = self.ln1(x)
+        out = self.dense1(out)
+        out = self.act1(out)
+        out = self.dropout(out)
+        x = x + residual # 残差连接
+        
+        # ResBlock 2
+        residual = x
+        out = self.ln2(x)
+        out = self.dense2(out)
+        out = self.dropout(out)
+        x = x + residual # 残差连接
+        
+        return x
+
 class FakeTracker(nn.Module):
     def __init__(self):
         super().__init__()
@@ -156,10 +195,11 @@ class SAM3ovs(nn.Module):
             )
             for m in self.mask_feat_proj.modules():
                 if isinstance(m, nn.Linear):
-                    # 使用 Kaiming 初始化，适用于 ReLU/GELU
+                    # 改回 Kaiming Normal，让初始就有较强的信号流
                     nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
+
         else:
             self.use_mask_encoder = False
             self.tracker = None

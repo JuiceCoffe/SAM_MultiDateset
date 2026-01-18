@@ -21,7 +21,7 @@ DATASETS:
 SOLVER:
   AMP:
     ENABLED: True
-  IMS_PER_BATCH: 8
+  IMS_PER_BATCH: 16
   BASE_LR: 0.00002
   LR_SCHEDULER_NAME: WarmupPolyLR
   MAX_ITER: 30000
@@ -59,7 +59,7 @@ DATALOADER:
   DATASET_RATIO: [1.0]
 
   # # Batch Size 对应单个数据集
-  DATASET_BS: [4]
+  DATASET_BS: [2]
   
   # COCO 通常不需要 RFS (Repeat Factor Sampling)
   USE_RFS: [False]
@@ -84,5 +84,5 @@ TEST:
 VERSION: 2
 
 # OUTPUT_DIR: ./out/test/
-OUTPUT_DIR: ./out/MASK/cocopano/
+OUTPUT_DIR: ./out/MASK/cocopano_2/
   

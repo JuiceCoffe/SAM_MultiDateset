@@ -58,8 +58,7 @@ from maft import (
     # add_fcclip_config,
 )
 
-from maft.data.dataset_mappers.coco_combine_new_baseline_dataset_mapper import COCOCombineNewBaselineDatasetMapper
-
+from sam3.data.dataset_mappers.coco_combine_new_baseline_dataset_mapper import COCOCombineNewBaselineDatasetMapper
 from sam3.data.custom_dataset_dataloader import build_custom_train_loader
 from sam3.config import add_sam3_config
 from sam3.modeling_d2 import SAM3Wrapper # 导入这个类就会自动触发 REGISTER
