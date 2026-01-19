@@ -10,8 +10,8 @@ MODEL:
     USE_QUERY_PROJ: FALSE
     USE_PE_TEXT: FALSE
     USE_MASK_ENCODER: TRUE
-  WEIGHTS: "/data/hmp/sam3.pt"
-  # WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
+  # WEIGHTS: "/data/hmp/sam3.pt"
+  WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
 
 DATASETS:
   # 只保留 COCO Panoptic
@@ -76,7 +76,7 @@ DATALOADER:
   USE_DIFF_BS_SIZE: True
 
 TEST:
-  EVAL_PERIOD: 5000
+  EVAL_PERIOD: 50
   INSTANCE_ON: True   
   PANOPTIC_ON: True   
   SEMANTIC_ON: True   

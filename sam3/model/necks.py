@@ -122,4 +122,8 @@ class Sam3DualViTDetNeck(nn.Module):
                 sam2_pos_out = self.position_encoding(sam2_x_out).to(sam2_x_out.dtype)
                 sam2_out.append(sam2_x_out)
                 sam2_pos.append(sam2_pos_out)
-        return sam3_out, sam3_pos, sam2_out, sam2_pos
+
+        new_out = {
+            "PE_img_feat":xs[-1],
+        }
+        return sam3_out, sam3_pos, sam2_out, sam2_pos, new_out

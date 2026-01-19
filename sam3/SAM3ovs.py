@@ -204,7 +204,7 @@ class SAM3ovs(nn.Module):
             self.mask_pooling = MaskPooling()
             # self.mask_feat_proj = MLP(input_dim = 256, hidden_dim = 1024, output_dim = 256)
             
-            self.mask_feat_proj = ResMLPAdapter(input_dim = 256, hidden_dim = 1024, output_dim = 256)
+            self.mask_feat_proj = ResMLPAdapter(input_dim = 1024, hidden_dim = 5096, output_dim = 1024)
 
             for m in self.mask_feat_proj.modules():
                 if isinstance(m, nn.Linear):
@@ -268,12 +268,15 @@ class SAM3ovs(nn.Module):
             self.cdt = None
 
         self.text_encoder_cache = {} 
+        self.pe_text_encoder_cache = {} 
         # -------------------------------------------------------
         # 训练配置
         # -------------------------------------------------------
         # 你需要检查 sam3_loss 的初始化参数
         self.train_dataname = None
         self.test_dataname = None
+        self.train_pe_dataname = None
+        self.test_pe_dataname = None
         self.test_metadata = {i: MetadataCatalog.get(i) for i in cfg.DATASETS.TEST}
         # 【修改】建立 Metadata 字典，方便后续查找
         self.train_metadata_dict = {name: MetadataCatalog.get(name) for name in cfg.DATASETS.TRAIN}
@@ -512,6 +515,132 @@ class SAM3ovs(nn.Module):
         self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(metadata, self.train_metadata)
         self.test_text_classifier = None
         return
+
+    def get_pe_classifier(self, dataname):
+        if self.training:
+            if self.train_pe_dataname != dataname:
+                if dataname in self.pe_text_encoder_cache:
+                    cache = self.pe_text_encoder_cache[dataname]
+                    # 从 CPU 缓存加载并移回 GPU
+                    self.language_features = cache["language_features"].to(self.device)
+                    self.language_mask = cache["language_mask"].to(self.device)
+                    self.train_text_classifier = cache["text_classifier"].to(self.device)
+                    
+                    # 直接恢复列表，不要再重新计算
+                    self.train_num_templates = cache["num_templates"] 
+                    self.train_class_names = cache["class_names"]
+
+                else:
+                    # ============== 关键修改开始 ==============
+                    # 获取 metadata
+                    if dataname in self.train_metadata_dict:
+                        current_metadata = self.train_metadata_dict[dataname]
+                    else:
+                        current_metadata = MetadataCatalog.get(dataname)
+
+                    # 计算类别名和模板数量
+                    # 【注意】这里不要用 self.train_num_templates[dataname]，因为它不是字典
+                    # 直接覆盖 self.train_num_templates 为当前数据集的 List
+                    _, self.train_num_templates, self.train_class_names = self.prepare_class_names_from_metadata(
+                        current_metadata, current_metadata
+                    )
+                    # ============== 关键修改结束 ==============
+
+                    # --- 原有生成逻辑开始 ---
+                    text_classifier = []
+                    text_feat = []
+                    language_mask = []
+                    # this is needed to avoid oom, which may happen when num of class is large
+                    bs = 128
+                    print("Generating text classifier for", dataname, "with", len(self.train_class_names), "classes.")
+                    for idx in range(0, len(self.train_class_names), bs):
+                        state_text = self.detector.backbone.forward_text(self.train_class_names[idx:idx+bs], device=self.device)
+
+                        batch_text_feat = state_text["language_features"].detach()
+                        mask = state_text["language_mask"] # bs, L
+                        batch_text_feat = batch_text_feat.permute(1,0,2) # -> bs, L, D 
+
+                        text_classifier.append(state_text["pe_text_out"]["pe_textfeat"])
+
+                        text_feat.append(batch_text_feat)
+                        language_mask.append(mask) # bs, L
+                    text_classifier = torch.cat(text_classifier, dim=0)
+                    text_feat = torch.cat(text_feat, dim=0)
+                    language_mask = torch.cat(language_mask, dim=0) # (num_names * VILD_PROMPT,  L)
+                    # average across templates and normalization.
+                    text_feat = text_feat.reshape(text_feat.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_feat.shape[-2], text_feat.shape[-1]) # num_names, VILD_PROMPT, L, D
+                    text_feat /= (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
+                    text_feat[language_mask.view(text_feat.shape[0],text_feat.shape[1],text_feat.shape[2])] = 0.0 # [num_names, VILD_PROMPT, L, D] 掩码掉 padding 部分
+                    
+                    language_features = text_feat.mean(1) # num_names, L, D
+
+                    text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_classifier.shape[-2], text_classifier.shape[-1]) # num_names, VILD_PROMPT, L, D
+                    text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
+                    text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 # [num_names, VILD_PROMPT, L, D] 掩码掉 padding 部分
+                    text_classifier = text_classifier.mean(-2) 
+                    text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
+                    text_classifier = text_classifier.mean(1)
+                    text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
+                    
+                    self.pe_language_features = language_features.detach() # num_names , L, D
+                    self.pe_language_mask = torch.min(language_mask.view(language_features.shape[0],len(VILD_PROMPT),language_features.shape[1]), dim=1).values# [num_names, L]
+                    self.pe_train_text_classifier = text_classifier.detach()
+                    # --- 原有生成逻辑结束 ---
+
+                    # 【新增】2. 将生成的特征移至 CPU 并存入缓存
+                    self.pe_text_encoder_cache[dataname] = {
+                        "language_features": self.pe_language_features.cpu(),
+                        "language_mask": self.pe_language_mask.cpu(),
+                        "text_classifier": self.pe_train_text_classifier.cpu(),
+                        "num_templates": self.train_num_templates, # 缓存当前的 List
+                        "class_names": self.train_class_names      # 缓存当前的 List
+                    }
+
+                self.train_pe_dataname = dataname
+            return self.pe_train_text_classifier.clone(), self.train_num_templates
+        else:
+            if self.test_pe_dataname != dataname:
+                self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata)
+                text_classifier = []
+                text_feat = []
+                language_mask = []
+                # this is needed to avoid oom, which may happen when num of class is large
+                bs = 128
+                print("Generating text classifier for", dataname, "with", len(self.test_class_names), "classes.")
+                for idx in range(0, len(self.test_class_names), bs):
+                    state_text = self.detector.backbone.forward_text(self.test_class_names[idx:idx+bs], device=self.device)
+
+                    batch_text_feat = state_text["language_features"].detach()
+                    mask = state_text["language_mask"] # bs, L
+                    batch_text_feat = batch_text_feat.permute(1,0,2) # -> bs, L, D 
+
+                    text_classifier.append(state_text["pe_text_out"]["pe_textfeat"])
+
+                    text_feat.append(batch_text_feat)
+                    language_mask.append(mask) # bs, L
+                text_classifier = torch.cat(text_classifier, dim=0)
+                text_feat = torch.cat(text_feat, dim=0)
+                language_mask = torch.cat(language_mask, dim=0) # (num_names * VILD_PROMPT,  L)
+                # average across templates and normalization.
+                text_feat = text_feat.reshape(text_feat.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_feat.shape[-2], text_feat.shape[-1]) # num_names, VILD_PROMPT, L, D
+                text_feat /= (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
+                text_feat[language_mask.view(text_feat.shape[0],text_feat.shape[1],text_feat.shape[2])] = 0.0 # [num_names, VILD_PROMPT, L, D] 掩码掉 padding 部分
+                
+                language_features = text_feat.mean(1) # num_names, L, D
+
+                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_classifier.shape[-2], text_classifier.shape[-1]) # num_names, VILD_PROMPT, L, D
+                text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
+                text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 # [num_names, VILD_PROMPT, L, D] 掩码掉 padding 部分
+                text_classifier = text_classifier.mean(-2) 
+                text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
+                text_classifier = text_classifier.mean(1)
+                text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
+                
+                self.pe_language_features = language_features.detach() # num_names , L, D
+                self.pe_language_mask = torch.min(language_mask.view(language_features.shape[0],len(VILD_PROMPT),language_features.shape[1]), dim=1).values# [num_names, L]
+                self.pe_test_text_classifier = text_classifier.detach()
+                self.test_pe_dataname = dataname
+            return self.pe_test_text_classifier.clone(), self.test_num_templates
 
     def get_text_classifier(self, dataname):
         if self.training:
@@ -900,7 +1029,7 @@ class SAM3ovs(nn.Module):
                     # 使用 Mask Feedback
                     # 注意：_get_mask_feat 内部 tracker 需要 logits 输入 (配合 skip_mask_sigmoid=False)
                     queries_masks_feats = self._get_mask_feat(
-                        img_feat = img_feat,
+                        img_feat = backbone_out_vision["PE_img_feat"].detach(),
                         pred_masks = current_pred_masks, # Logits
                     )
                     queries_masks_feats = self.mask_feat_proj(queries_masks_feats)
@@ -908,8 +1037,8 @@ class SAM3ovs(nn.Module):
                     
                     if self.use_cdt or self.use_pe_text:
                         raise RuntimeError("CDT/PE TEXT和MASK ENCODER暂时不混用")
-                    
-                    query_names_results = torch.einsum("bnd,cd->bnc", queries_masks_feats, text_classifier) 
+                    pe_text_classifier, _ = self.get_pe_classifier(dataname)
+                    query_names_results = torch.einsum("bnd,cd->bnc", queries_masks_feats, pe_text_classifier) 
                 else:
                     # 使用 Query (FC-CLIP style)
                     tp_queries = queries[i,:,:,:].clone() 
