@@ -5,26 +5,27 @@ MODEL:
   SAM3:
     BPE_PATH: "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
     ENABLE_SEGMENTATION: True
-    NUM_CDT: 0
+    NUM_CDT: 1
 
     USE_QUERY_PROJ: False
     USE_PE_TEXT: False
-  WEIGHTS: "/data/hmp/sam3.pt"
-  # WEIGHTS: /data/hmp/TASK/OVS/mysamMultiDateset/out/cocopano/box/model_0003749.pth
+  # WEIGHTS: "/data/hmp/sam3.pt"
+  WEIGHTS: /data/hmp/TASK/OVS/mysamMultiDateset/out/cocopano_box_1cdt_cliplogit/model_0007499.pth
 
 DATASETS:
-  TRAIN: ("coco_2017_train_panoptic", "objects365_v1_masktrain", )
+  TRAIN: ("coco_2017_train_panoptic", "openvocab_coco_2017_train_stuff_sem_seg","objects365_v1_masktrain",)  
   TEST: ("openvocab_ade20k_panoptic_val",) 
-  
+
+  ONLY_INSTANCE: True
 
 SOLVER:
   AMP:
     ENABLED: True
   IMS_PER_BATCH: 12
-  BASE_LR: 0.00005
+  BASE_LR: 0.00002
   LR_SCHEDULER_NAME: WarmupPolyLR
-  MAX_ITER: 40000
-  CHECKPOINT_PERIOD: 5000
+  MAX_ITER: 30000
+  CHECKPOINT_PERIOD: 10000
   
   # Loss 权重保持你原本的设置
   CLASS_WEIGHT: 2.0
@@ -50,15 +51,15 @@ INPUT:
 DATALOADER:
   SAMPLER_TRAIN: "MultiDatasetSampler"
 
-  DATASET_RATIO: [1.0, 1.0]
+  DATASET_RATIO: [1.0, 1.0, 1.0]
 
-  DATASET_BS: [8, 8]
+  DATASET_BS: [4, 4, 4]
   
   # 针对长尾分布采样：Obj365开启(True)，COCO关闭(False)
-  USE_RFS: [False, True]
+  USE_RFS: [False, False, True]
   
   # 指定标注类型，用于计算采样频率
-  DATASET_ANN: ['box', 'box']
+  DATASET_ANN: ['box', 'box', 'box']
   
   # 其他 Loader 参数
   NUM_WORKERS: 12
@@ -74,5 +75,5 @@ TEST:
   SEMANTIC_ON: True   
 
 # OUTPUT_DIR: ./out/obj1_coco1/
-OUTPUT_DIR: ./out/objcopa
+OUTPUT_DIR: ./out/copa_objcopastf
 VERSION: 2

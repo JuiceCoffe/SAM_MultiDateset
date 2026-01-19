@@ -61,3 +61,5 @@ def add_sam3_config(cfg):
     cfg.DATALOADER.USE_RFS = [False]
     cfg.DATALOADER.DATASET_ANN = ["box"]
     cfg.DATALOADER.MULTI_DATASET_GROUPING = True
+
+    cfg.DATASETS.ONLY_INSTANCE = True

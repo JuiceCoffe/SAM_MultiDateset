@@ -165,7 +165,7 @@ class SAM3MC_o365(nn.Module):
         self.train_class_names = None
 
         self.use_aux = cfg.SOLVER.USE_AUX
-
+        self.only_instance = cfg.DATASETS.ONLY_INSTANCE
         # -------------------------------------------------------
         # criterion损失函数
         # -------------------------------------------------------
@@ -285,35 +285,112 @@ class SAM3MC_o365(nn.Module):
                 print(name)
         # exit()
 
-    def prepare_targets(self, targets, images):
+    # def prepare_targets(self, targets, images):
+    #     h_pad, w_pad = images.tensor.shape[-2:]
+    #     new_targets = []
+    #     for targets_per_image in targets:
+    #         # pad gt
+    #         gt_masks = targets_per_image.gt_masks
+    #         if isinstance(gt_masks, BitMasks):
+    #             gt_masks = gt_masks.tensor
+    #         padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+    #         padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+            
+    #         # ---------------- 修改开始 ----------------
+    #         # 1. 从 Mask 生成绝对坐标的 Box (xyxy格式)
+    #         gt_boxes_xyxy = masks_to_boxes(padded_masks)
+            
+    #         # 2. 归一化 Box 坐标到 [0, 1] (除以 padded后的宽高)
+    #         # scale: [w, h, w, h]
+    #         scale = torch.tensor([w_pad, h_pad, w_pad, h_pad], dtype=torch.float32, device=gt_boxes_xyxy.device)
+    #         gt_boxes_norm = gt_boxes_xyxy / scale
+
+    #         # 3. 转换为 (cx, cy, w, h) 格式，这是 DETR/SAM3 计算 Loss 要求的格式
+    #         gt_boxes_cxcywh = box_xyxy_to_cxcywh(gt_boxes_norm)
+    #         # ---------------- 修改结束 ----------------
+
+    #         new_targets.append(
+    #             {
+    #                 "labels": targets_per_image.gt_classes,
+    #                 "masks": padded_masks,
+    #                 "boxes": gt_boxes_cxcywh, # <--- 传入处理好的 boxes
+    #             }
+    #         )
+    #     return new_targets
+    def prepare_targets(self, targets, images, batched_inputs):
         h_pad, w_pad = images.tensor.shape[-2:]
         new_targets = []
-        for targets_per_image in targets:
-            # pad gt
+        
+        # 遍历 batch 中的每一张图
+        for i, targets_per_image in enumerate(targets):
+            # 获取当前图片的数据集名称
+            dataname = get_dataname(batched_inputs[i])
+            
+            # ---------------- 过滤逻辑开始 ----------------
+            # 这里的逻辑是：如果开启了 only_instance，且当前数据集是 COCO Stuff
+            # 那么我们就把其中的 Thing 类别（Person, Car 等）过滤掉，只保留 Stuff
+            # 避免与 Object365 的 Instance 标注冲突
+            
+            gt_classes = targets_per_image.gt_classes
             gt_masks = targets_per_image.gt_masks
             if isinstance(gt_masks, BitMasks):
                 gt_masks = gt_masks.tensor
-            padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
-            padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
             
-            # ---------------- 修改开始 ----------------
-            # 1. 从 Mask 生成绝对坐标的 Box (xyxy格式)
-            gt_boxes_xyxy = masks_to_boxes(padded_masks)
-            
-            # 2. 归一化 Box 坐标到 [0, 1] (除以 padded后的宽高)
-            # scale: [w, h, w, h]
-            scale = torch.tensor([w_pad, h_pad, w_pad, h_pad], dtype=torch.float32, device=gt_boxes_xyxy.device)
-            gt_boxes_norm = gt_boxes_xyxy / scale
+            # 生成一个全是 True 的 mask
+            keep_indices = torch.ones(len(gt_classes), dtype=torch.bool, device=gt_classes.device)
 
-            # 3. 转换为 (cx, cy, w, h) 格式，这是 DETR/SAM3 计算 Loss 要求的格式
-            gt_boxes_cxcywh = box_xyxy_to_cxcywh(gt_boxes_norm)
-            # ---------------- 修改结束 ----------------
+            # ---------------- 修改开始 ----------------
+            if self.only_instance:
+                # 判断是否为 COCO Stuff 数据集
+                is_coco_stuff = "openvocab_coco_2017_train_stuff_sem_seg" in dataname
+                
+                if is_coco_stuff:
+                    # 1. 筛选逻辑：只保留 ID >= 80 的 Stuff
+                    keep_indices = gt_classes >= 80
+                    
+                    # 应用筛选
+                    gt_classes = gt_classes[keep_indices]
+                    gt_masks = gt_masks[keep_indices]
+                    
+                    # 2. 【关键修正】Label Shift (标签对齐)
+                    # 因为我们在 get_text_classifier 中移除了前 80 个类 (Things)
+                    # 所以原来的 Label 80 (Stuff start) 现在必须变成 Label 0
+                    gt_classes = gt_classes - 80
+
+                    # if len(gt_classes) > 0:
+                    #     print(f"DEBUG: [Targets] 原本最小ID >= 80, 现已 Shift。当前图片最小 Label: {gt_classes.min().item()}, 最大 Label: {gt_classes.max().item()}")
+                else:
+                    # 对于非 COCO Stuff 数据集（如 Obj365），不做特殊处理，直接应用 keep_indices (全True)
+                    gt_classes = gt_classes[keep_indices]
+                    gt_masks = gt_masks[keep_indices]
+            # ---------------- 过滤逻辑结束 ----------------
+
+            # pad gt
+            padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+            # 注意：这里的 gt_masks 已经是过滤后的了
+            if gt_masks.shape[0] > 0:
+                padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+            
+            # 1. 从 Mask 生成绝对坐标的 Box (xyxy格式)
+            # 注意：masks_to_boxes 需要处理空 mask 的情况，虽然理论上 targets 不会为空，但过滤后可能为空
+            if padded_masks.shape[0] > 0:
+                gt_boxes_xyxy = masks_to_boxes(padded_masks)
+                
+                # 2. 归一化 Box 坐标到 [0, 1]
+                scale = torch.tensor([w_pad, h_pad, w_pad, h_pad], dtype=torch.float32, device=gt_boxes_xyxy.device)
+                gt_boxes_norm = gt_boxes_xyxy / scale
+
+                # 3. 转换为 (cx, cy, w, h)
+                gt_boxes_cxcywh = box_xyxy_to_cxcywh(gt_boxes_norm)
+            else:
+                # 如果过滤后没有物体了，给空 tensor
+                gt_boxes_cxcywh = torch.zeros((0, 4), device=padded_masks.device)
 
             new_targets.append(
                 {
-                    "labels": targets_per_image.gt_classes,
-                    "masks": padded_masks,
-                    "boxes": gt_boxes_cxcywh, # <--- 传入处理好的 boxes
+                    "labels": gt_classes, # 过滤后的 labels
+                    "masks": padded_masks, # 过滤后的 masks
+                    "boxes": gt_boxes_cxcywh, # 过滤后的 boxes
                 }
             )
         return new_targets
@@ -403,6 +480,53 @@ class SAM3MC_o365(nn.Module):
                         current_metadata, current_metadata
                     )
                     # ============== 关键修改结束 ==============
+
+                    # 如果开启 only_instance 且当前是 COCO Stuff，我们需要移除前 80 个 Things 类
+                    # 这样生成的 text_classifier 就只包含 Stuff 类，且从 0 开始索引
+                    # ---------------- 修改开始 ----------------
+                    is_coco_stuff = "openvocab_coco_2017_train_stuff_sem_seg" in dataname
+                    
+                    if self.only_instance and is_coco_stuff:
+                        num_things_classes = 80 
+                        
+                        if len(self.train_num_templates) > num_things_classes:
+                            print(f"[{dataname}] Filtering out {num_things_classes} Thing classes for Stuff training.")
+                            
+                            # 1. 计算前 80 个类总共占用了多少个文本 Prompt 
+                            # 【关键修正】这里必须乘以每个同义词对应的 Prompt 数量 (len(VILD_PROMPT))
+                            # train_num_templates 存的是同义词数量，train_class_names 存的是展开后的 Prompt
+                            num_synonyms_to_skip = sum(self.train_num_templates[:num_things_classes])
+                            offset_text_idx = num_synonyms_to_skip * len(VILD_PROMPT)
+                            
+                            # 2. 截断 class_names (输入给 Text Encoder 的文本列表)
+                            self.train_class_names = self.train_class_names[offset_text_idx:]
+                            
+                            # 3. 截断 num_templates (用于后续 Logit 聚合的计数列表)
+                            self.train_num_templates = self.train_num_templates[num_things_classes:]
+                    # ---------------- 修改结束 ----------------
+
+                        # ======= 新增打印验证逻辑 =======
+                        # print(f"\n" + "="*40)
+                        # print(f"DEBUG: 数据集 [{dataname}] 类别过滤完成")
+                        # print(f"剩余类别数量 (num_classes): {len(self.train_num_templates)}")
+                        
+                        # # 提取每个类别的第一个模板名进行展示
+                        # display_names = []
+                        # current_idx = 0
+                        # for num_t in self.train_num_templates:
+                        #     # 取该类别的第一个 prompt 作为代表名
+                        #     display_names.append(self.train_class_names[current_idx])
+                        #     current_idx += num_t
+                        
+                        # print("前 10 个 Stuff 类别示例:")
+                        # for i, name in enumerate(display_names[:10]):
+                        #     print(f"  Class {i}: {name}")
+                        
+                        # print("最后 5 个 Stuff 类别示例:")
+                        # for i, name in enumerate(display_names[-5:]):
+                        #     print(f"  Class {len(display_names)-5+i}: {name}")
+                        # print("="*40 + "\n")
+                        # ===============================
 
                     # --- 原有生成逻辑开始 ---
                     text_classifier = []
@@ -799,7 +923,7 @@ class SAM3MC_o365(nn.Module):
             # mask classification target
             if "instances" in batched_inputs[0]:
                 gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-                targets = self.prepare_targets(gt_instances, images)
+                targets = self.prepare_targets(gt_instances, images, batched_inputs)
             else:
                 targets = None
 

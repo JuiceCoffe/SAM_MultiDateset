@@ -13,9 +13,10 @@ MODEL:
   # WEIGHTS: /data/hmp/TASK/OVS/mysamMultiDateset/out/cocopano/box/model_0003749.pth
 
 DATASETS:
-  TRAIN: ("coco_2017_train_panoptic", "objects365_v1_masktrain", )
+  TRAIN: ("coco_2017_train_panoptic", "openvocab_coco_2017_train_stuff_sem_seg",)  
   TEST: ("openvocab_ade20k_panoptic_val",) 
-  
+
+  ONLY_INSTANCE: True
 
 SOLVER:
   AMP:
@@ -55,7 +56,7 @@ DATALOADER:
   DATASET_BS: [8, 8]
   
   # 针对长尾分布采样：Obj365开启(True)，COCO关闭(False)
-  USE_RFS: [False, True]
+  USE_RFS: [False, False]
   
   # 指定标注类型，用于计算采样频率
   DATASET_ANN: ['box', 'box']
@@ -74,5 +75,5 @@ TEST:
   SEMANTIC_ON: True   
 
 # OUTPUT_DIR: ./out/obj1_coco1/
-OUTPUT_DIR: ./out/objcopa
+OUTPUT_DIR: ./out/test
 VERSION: 2
