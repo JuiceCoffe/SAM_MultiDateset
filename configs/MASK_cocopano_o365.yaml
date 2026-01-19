@@ -2,6 +2,7 @@ MODEL:
   PIXEL_MEAN : [127.5, 127.5, 127.5]
   PIXEL_STD : [127.5, 127.5, 127.5]
   META_ARCHITECTURE: "SAM3ovs"
+
   SAM3:
     BPE_PATH: "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
     ENABLE_SEGMENTATION: True
@@ -9,8 +10,9 @@ MODEL:
     USE_QUERY_PROJ: FALSE
     USE_PE_TEXT: FALSE
     USE_MASK_ENCODER: TRUE
-  WEIGHTS: "/data/hmp/sam3.pt"
-  # WEIGHTS: /data/hmp/TASK/OVS/mysamMultiDateset/out/cocopano_box_1cdt_cliplogit/model_0007499.pth
+    MASK_ENCODER_REQUIRES_GRAD: True
+  # WEIGHTS: "/data/hmp/sam3.pt"
+  WEIGHTS: /data/hmp/TASK/OVS/sam_ovs/out/MASK/cocopano_3/model_0014999.pth
 
 DATASETS:
   TRAIN: ("coco_2017_train_panoptic", "objects365_v1_masktrain", )
@@ -22,7 +24,7 @@ SOLVER:
   IMS_PER_BATCH: 12
   BASE_LR: 0.00002
   LR_SCHEDULER_NAME: WarmupPolyLR
-  MAX_ITER: 30000
+  MAX_ITER: 40000
   CHECKPOINT_PERIOD: 5000
   
   # Loss 权重保持你原本的设置
@@ -34,6 +36,9 @@ SOLVER:
   USE_AUX : True
   
   ENCODER_LOSS: FALSE
+  LARGE_MULTIPLIER: 1.0
+  LARGE_LR_MODEL: ['mask_feat_proj']
+  AUX_CLASS_DECAY: 0.3
 
 INPUT:
   DATASET_MAPPER_NAME: "coco_combine_lsj"
@@ -41,7 +46,6 @@ INPUT:
   MIN_SCALE: 0.1
   MAX_SCALE: 2.0
   FORMAT: "RGB"
-  # 建议开启，学长的配置里有，对于 LSJ (Large Scale Jittering) 训练通常配套颜色增强
   COLOR_AUG_SSD: True 
   MASK_FORMAT: "bitmask" # 明确指定 mask 格式，防止二义性
 
@@ -53,7 +57,7 @@ DATALOADER:
 
   DATASET_RATIO: [2.0, 1.0]
 
-  DATASET_BS: [4, 4]
+  DATASET_BS: [2, 1]
   
   # 针对长尾分布采样：Obj365开启(True)，COCO关闭(False)
   USE_RFS: [False, True]
@@ -75,5 +79,5 @@ TEST:
   SEMANTIC_ON: True   
 
 # OUTPUT_DIR: ./out/test
-OUTPUT_DIR: ./out/MASK/objcopa
+OUTPUT_DIR: ./out/MASK/copa_objcopa
 VERSION: 2

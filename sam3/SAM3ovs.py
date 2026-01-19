@@ -412,9 +412,10 @@ class SAM3ovs(nn.Module):
             #     param.requires_grad = False
             elif 'geometry_encoder' in name:
                 param.requires_grad = False
-            elif 'maskmem_backbone' in name:
-                param.requires_grad = False
             else:
+                param.requires_grad = True
+            
+            if 'maskmem_backbone' in name:
                 param.requires_grad = True
         
         print('='*10,'Parameters to be trained', '='*10)
@@ -1103,67 +1104,68 @@ class SAM3ovs(nn.Module):
         Returns:
             visual_embeddings: [B, N, C_out] 提取出的每个 Mask 的视觉语义向量
         """
-        chunk_size=100
+        
 
         with torch.set_grad_enabled(self.mask_encoder_requires_grad):
-            # 确保 Tracker 存在且包含 maskmem_backbone
-            if self.tracker is None or not hasattr(self.tracker, "maskmem_backbone"):
-                raise RuntimeError("必须启用 USE_MASK_ENCODER 并初始化 Tracker 才能使用 Mask Feedback Loop")
+        #     chunk_size=50
+        #     # 确保 Tracker 存在且包含 maskmem_backbone
+        #     if self.tracker is None or not hasattr(self.tracker, "maskmem_backbone"):
+        #         raise RuntimeError("必须启用 USE_MASK_ENCODER 并初始化 Tracker 才能使用 Mask Feedback Loop")
 
-            # 1. 准备数据维度
-            B, N, H_mask, W_mask = pred_masks.shape
-            _, C_feat, H_feat, W_feat = img_feat.shape
+        #     # 1. 准备数据维度
+        #     B, N, H_mask, W_mask = pred_masks.shape
+        #     _, C_feat, H_feat, W_feat = img_feat.shape
             
-            # [B, N, H, W] -> [B*N, 1, H, W]
-            flat_masks = pred_masks.flatten(0, 1).unsqueeze(1)
+        #     # [B, N, H, W] -> [B*N, 1, H, W]
+        #     flat_masks = pred_masks.flatten(0, 1).unsqueeze(1)
             
-            #一次性计算逻辑
-            # maskmem_out = self.tracker.maskmem_backbone(
-            #     img_feat.repeat_interleave(N, dim=0), # [B, C, H', W'] -> [B*N, C, H', W']
-            #     flat_masks, 
-            #     skip_mask_sigmoid = True,
-            # )
+        #     #一次性计算逻辑
+        #     # maskmem_out = self.tracker.maskmem_backbone(
+        #     #     img_feat.repeat_interleave(N, dim=0), # [B, C, H', W'] -> [B*N, C, H', W']
+        #     #     flat_masks, 
+        #     #     skip_mask_sigmoid = True,
+        #     # )
             
-            # # 获取视觉特征 [B*N, C_out, H_mem, W_mem]
-            # mask_feats = maskmem_out["vision_features_before_proj"]
-            # pooled_mask_feats = self.mask_pooling(mask_feats, flat_masks)
+        #     # # 获取视觉特征 [B*N, C_out, H_mem, W_mem]
+        #     # mask_feats = maskmem_out["vision_features_before_proj"]
+        #     # pooled_mask_feats = self.mask_pooling(mask_feats, flat_masks)
 
-            pooled_mask_feats = []
-            total_num = B * N
+        #     pooled_mask_feats = []
+        #     total_num = B * N
 
-            for i in range(0, total_num, chunk_size):
-                end_idx = min(i + chunk_size, total_num)
+        #     for i in range(0, total_num, chunk_size):
+        #         end_idx = min(i + chunk_size, total_num)
                 
-                # 找到当前 chunk 对应的是哪几张图
-                b_start = i // N
-                b_end = (end_idx - 1) // N
+        #         # 找到当前 chunk 对应的是哪几张图
+        #         b_start = i // N
+        #         b_end = (end_idx - 1) // N
                 
-                if b_start == b_end:
-                    # print("当前 chunk 全属于同一张图，直接取该图，显存开销极小")
-                    cur_img_feat = img_feat[b_start:b_start+1].expand(end_idx - i, -1, -1, -1)
-                else:
-                    # print("跨图时使用索引")
-                    img_indices = torch.arange(i, end_idx, device=img_feat.device) // N
-                    cur_img_feat = img_feat[img_indices]
+        #         if b_start == b_end:
+        #             # print("当前 chunk 全属于同一张图，直接取该图，显存开销极小")
+        #             cur_img_feat = img_feat[b_start:b_start+1].expand(end_idx - i, -1, -1, -1)
+        #         else:
+        #             # print("跨图时使用索引")
+        #             img_indices = torch.arange(i, end_idx, device=img_feat.device) // N
+        #             cur_img_feat = img_feat[img_indices]
 
-                cur_flat_masks = flat_masks[i:end_idx]
+        #         cur_flat_masks = flat_masks[i:end_idx]
 
-                # 3. 分步推理
-                maskmem_out = self.tracker.maskmem_backbone(
-                    cur_img_feat, 
-                    cur_flat_masks, 
-                    skip_mask_sigmoid=False, # 此时输入mask logits而非probs
-                )
+        #         # 3. 分步推理
+        #         maskmem_out = self.tracker.maskmem_backbone(
+        #             cur_img_feat, 
+        #             cur_flat_masks, 
+        #             skip_mask_sigmoid=False, # 此时输入mask logits而非probs
+        #         )
                 
-                cur_mask_feats = maskmem_out["vision_features_before_proj"]
-                cur_pooled = self.mask_pooling(cur_mask_feats, cur_flat_masks)
-                pooled_mask_feats.append(cur_pooled)
-            pooled_mask_feats = torch.cat(pooled_mask_feats, dim=0)
+        #         cur_mask_feats = maskmem_out["vision_features_before_proj"]
+        #         cur_pooled = self.mask_pooling(cur_mask_feats, cur_flat_masks)
+        #         pooled_mask_feats.append(cur_pooled)
+        #     pooled_mask_feats = torch.cat(pooled_mask_feats, dim=0)
             
 
-            pooled_mask_feats = pooled_mask_feats.view(B, N, C_feat)
+            # pooled_mask_feats = pooled_mask_feats.view(B, N, C_feat)
             
-            # pooled_mask_feats = F.normalize(pooled_mask_feats, dim=-1)
+            pooled_mask_feats = self.mask_pooling(img_feat, pred_masks)
 
             return pooled_mask_feats
 
