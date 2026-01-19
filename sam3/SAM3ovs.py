@@ -291,9 +291,14 @@ class SAM3ovs(nn.Module):
             self.train_metadata = None 
             
         self.train_num_templates = None 
+        self.pe_train_num_templates = None 
         self.train_class_names = None
 
         self.use_aux = cfg.SOLVER.USE_AUX
+
+        self.only_instance = False
+        if hasattr(cfg.DATASETS, "ONLY_INSTANCE"):
+            self.only_instance = cfg.DATASETS.ONLY_INSTANCE
 
         # -------------------------------------------------------
         # criterion损失函数
@@ -429,35 +434,102 @@ class SAM3ovs(nn.Module):
                 print(name)
         # exit()
 
-    def prepare_targets(self, targets, images):
+    # def prepare_targets(self, targets, images, batched_inputs):
+    #     h_pad, w_pad = images.tensor.shape[-2:]
+    #     new_targets = []
+    #     for targets_per_image in targets:
+    #         # pad gt
+    #         gt_masks = targets_per_image.gt_masks
+    #         if isinstance(gt_masks, BitMasks):
+    #             gt_masks = gt_masks.tensor
+    #         padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+    #         padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+            
+    #         # ---------------- 修改开始 ----------------
+    #         # 1. 从 Mask 生成绝对坐标的 Box (xyxy格式)
+    #         gt_boxes_xyxy = masks_to_boxes(padded_masks)
+            
+    #         # 2. 归一化 Box 坐标到 [0, 1] (除以 padded后的宽高)
+    #         # scale: [w, h, w, h]
+    #         scale = torch.tensor([w_pad, h_pad, w_pad, h_pad], dtype=torch.float32, device=gt_boxes_xyxy.device)
+    #         gt_boxes_norm = gt_boxes_xyxy / scale
+
+    #         # 3. 转换为 (cx, cy, w, h) 格式，这是 DETR/SAM3 计算 Loss 要求的格式
+    #         gt_boxes_cxcywh = box_xyxy_to_cxcywh(gt_boxes_norm)
+    #         # ---------------- 修改结束 ----------------
+
+    #         new_targets.append(
+    #             {
+    #                 "labels": targets_per_image.gt_classes,
+    #                 "masks": padded_masks,
+    #                 "boxes": gt_boxes_cxcywh, # <--- 传入处理好的 boxes
+    #             }
+    #         )
+    #     return new_targets
+    def prepare_targets(self, targets, images, batched_inputs):
         h_pad, w_pad = images.tensor.shape[-2:]
         new_targets = []
-        for targets_per_image in targets:
-            # pad gt
+        
+        # 遍历 batch 中的每一张图
+        for i, targets_per_image in enumerate(targets):
+            # 获取当前图片的数据集名称
+            dataname = get_dataname(batched_inputs[i])
+            
+            # ---------------- 过滤逻辑开始 ----------------
+            # 这里的逻辑是：如果开启了 only_instance，且当前数据集是 COCO Stuff
+            # 那么我们就把其中的 Thing 类别（Person, Car 等）过滤掉，只保留 Stuff
+            # 避免与 Object365 的 Instance 标注冲突
+            
+            gt_classes = targets_per_image.gt_classes
             gt_masks = targets_per_image.gt_masks
             if isinstance(gt_masks, BitMasks):
                 gt_masks = gt_masks.tensor
-            padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
-            padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
             
-            # ---------------- 修改开始 ----------------
-            # 1. 从 Mask 生成绝对坐标的 Box (xyxy格式)
-            gt_boxes_xyxy = masks_to_boxes(padded_masks)
-            
-            # 2. 归一化 Box 坐标到 [0, 1] (除以 padded后的宽高)
-            # scale: [w, h, w, h]
-            scale = torch.tensor([w_pad, h_pad, w_pad, h_pad], dtype=torch.float32, device=gt_boxes_xyxy.device)
-            gt_boxes_norm = gt_boxes_xyxy / scale
+            # 生成一个全是 True 的 mask
+            keep_indices = torch.ones(len(gt_classes), dtype=torch.bool, device=gt_classes.device)
 
-            # 3. 转换为 (cx, cy, w, h) 格式，这是 DETR/SAM3 计算 Loss 要求的格式
-            gt_boxes_cxcywh = box_xyxy_to_cxcywh(gt_boxes_norm)
-            # ---------------- 修改结束 ----------------
+            if self.only_instance:
+                # 判断是否为 COCO Stuff 数据集 (根据你的命名习惯调整关键词)
+                is_coco_stuff = "stuff" in dataname or "coco_2017_train_panoptic" in dataname
+                
+                if is_coco_stuff:
+                    # COCO Stuff 164K / Panoptic 标准定义:
+                    # ID 0-79 是 Things (与 COCO Detection 80类对应)
+                    # ID 80-170 是 Stuff
+                    # 所以我们只保留 ID >= 80 的类别
+                    keep_indices = gt_classes >= 80
+            
+            # 应用过滤
+            gt_classes = gt_classes[keep_indices]
+            gt_masks = gt_masks[keep_indices]
+            # ---------------- 过滤逻辑结束 ----------------
+
+            # pad gt
+            padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+            # 注意：这里的 gt_masks 已经是过滤后的了
+            if gt_masks.shape[0] > 0:
+                padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+            
+            # 1. 从 Mask 生成绝对坐标的 Box (xyxy格式)
+            # 注意：masks_to_boxes 需要处理空 mask 的情况，虽然理论上 targets 不会为空，但过滤后可能为空
+            if padded_masks.shape[0] > 0:
+                gt_boxes_xyxy = masks_to_boxes(padded_masks)
+                
+                # 2. 归一化 Box 坐标到 [0, 1]
+                scale = torch.tensor([w_pad, h_pad, w_pad, h_pad], dtype=torch.float32, device=gt_boxes_xyxy.device)
+                gt_boxes_norm = gt_boxes_xyxy / scale
+
+                # 3. 转换为 (cx, cy, w, h)
+                gt_boxes_cxcywh = box_xyxy_to_cxcywh(gt_boxes_norm)
+            else:
+                # 如果过滤后没有物体了，给空 tensor
+                gt_boxes_cxcywh = torch.zeros((0, 4), device=padded_masks.device)
 
             new_targets.append(
                 {
-                    "labels": targets_per_image.gt_classes,
-                    "masks": padded_masks,
-                    "boxes": gt_boxes_cxcywh, # <--- 传入处理好的 boxes
+                    "labels": gt_classes, # 过滤后的 labels
+                    "masks": padded_masks, # 过滤后的 masks
+                    "boxes": gt_boxes_cxcywh, # 过滤后的 boxes
                 }
             )
         return new_targets
@@ -520,18 +592,18 @@ class SAM3ovs(nn.Module):
 
     def get_pe_classifier(self, dataname):
         if self.training:
+            # 如果 dataname 发生变化，需要重新获取或生成
             if self.train_pe_dataname != dataname:
                 if dataname in self.pe_text_encoder_cache:
                     cache = self.pe_text_encoder_cache[dataname]
                     # 从 CPU 缓存加载并移回 GPU
-                    self.language_features = cache["language_features"].to(self.device)
-                    self.language_mask = cache["language_mask"].to(self.device)
-                    self.train_text_classifier = cache["text_classifier"].to(self.device)
+                    self.pe_language_features = cache["language_features"].to(self.device)
+                    self.pe_language_mask = cache["language_mask"].to(self.device)
+                    self.pe_train_text_classifier = cache["text_classifier"].to(self.device)
                     
-                    # 直接恢复列表，不要再重新计算
-                    self.train_num_templates = cache["num_templates"] 
-                    self.train_class_names = cache["class_names"]
-
+                    # 【修改】使用 PE 专用的变量加载 num_templates
+                    self.pe_train_num_templates = cache["num_templates"] 
+                    # 注意：这里我们不需要恢复 class_names，因为它只在生成阶段有用
                 else:
                     # ============== 关键修改开始 ==============
                     # 获取 metadata
@@ -541,20 +613,19 @@ class SAM3ovs(nn.Module):
                         current_metadata = MetadataCatalog.get(dataname)
 
                     # 计算类别名和模板数量
-                    # 【注意】这里不要用 self.train_num_templates[dataname]，因为它不是字典
-                    # 直接覆盖 self.train_num_templates 为当前数据集的 List
-                    _, self.train_num_templates, self.train_class_names = self.prepare_class_names_from_metadata(
+                    # 【修改】将结果赋值给 self.pe_train_num_templates，避免与 get_text_classifier 冲突
+                    _, self.pe_train_num_templates, self.train_class_names = self.prepare_class_names_from_metadata(
                         current_metadata, current_metadata
                     )
                     # ============== 关键修改结束 ==============
-
-                    # --- 原有生成逻辑开始 ---
+                    # print(dataname, ":self.pe_train_num_templates", self.pe_train_num_templates)
+                    
+                    # --- 生成逻辑保持不变，只需注意下方缓存保存的部分 ---
                     text_classifier = []
                     text_feat = []
                     language_mask = []
-                    # this is needed to avoid oom, which may happen when num of class is large
                     bs = 128
-                    print("Generating text classifier for", dataname, "with", len(self.train_class_names), "classes.")
+                    print("Generating PE text classifier for", dataname, "with", len(self.train_class_names), "classes.")
                     for idx in range(0, len(self.train_class_names), bs):
                         state_text = self.detector.backbone.forward_text(self.train_class_names[idx:idx+bs], device=self.device)
 
@@ -568,38 +639,42 @@ class SAM3ovs(nn.Module):
                         language_mask.append(mask) # bs, L
                     text_classifier = torch.cat(text_classifier, dim=0)
                     text_feat = torch.cat(text_feat, dim=0)
-                    language_mask = torch.cat(language_mask, dim=0) # (num_names * VILD_PROMPT,  L)
-                    # average across templates and normalization.
-                    text_feat = text_feat.reshape(text_feat.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_feat.shape[-2], text_feat.shape[-1]) # num_names, VILD_PROMPT, L, D
-                    text_feat /= (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
-                    text_feat[language_mask.view(text_feat.shape[0],text_feat.shape[1],text_feat.shape[2])] = 0.0 # [num_names, VILD_PROMPT, L, D] 掩码掉 padding 部分
+                    language_mask = torch.cat(language_mask, dim=0) 
                     
-                    language_features = text_feat.mean(1) # num_names, L, D
+                    text_feat = text_feat.reshape(text_feat.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_feat.shape[-2], text_feat.shape[-1]) 
+                    text_feat /= (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
+                    text_feat[language_mask.view(text_feat.shape[0],text_feat.shape[1],text_feat.shape[2])] = 0.0 
+                    
+                    language_features = text_feat.mean(1) 
 
-                    text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_classifier.shape[-2], text_classifier.shape[-1]) # num_names, VILD_PROMPT, L, D
+                    text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_classifier.shape[-2], text_classifier.shape[-1])
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
-                    text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 # [num_names, VILD_PROMPT, L, D] 掩码掉 padding 部分
+                    text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 
                     text_classifier = text_classifier.mean(-2) 
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                     text_classifier = text_classifier.mean(1)
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                     
-                    self.pe_language_features = language_features.detach() # num_names , L, D
-                    self.pe_language_mask = torch.min(language_mask.view(language_features.shape[0],len(VILD_PROMPT),language_features.shape[1]), dim=1).values# [num_names, L]
+                    self.pe_language_features = language_features.detach() 
+                    self.pe_language_mask = torch.min(language_mask.view(language_features.shape[0],len(VILD_PROMPT),language_features.shape[1]), dim=1).values
                     self.pe_train_text_classifier = text_classifier.detach()
-                    # --- 原有生成逻辑结束 ---
+                    # --- 生成逻辑结束 ---
 
-                    # 【新增】2. 将生成的特征移至 CPU 并存入缓存
+                    # print("pe_text_classifier generated shape:", self.pe_train_text_classifier.shape)
+
+                    # 【修改】保存缓存时，保存 self.pe_train_num_templates
                     self.pe_text_encoder_cache[dataname] = {
                         "language_features": self.pe_language_features.cpu(),
                         "language_mask": self.pe_language_mask.cpu(),
                         "text_classifier": self.pe_train_text_classifier.cpu(),
-                        "num_templates": self.train_num_templates, # 缓存当前的 List
-                        "class_names": self.train_class_names      # 缓存当前的 List
+                        "num_templates": self.pe_train_num_templates, # <--- 关键修改
+                        "class_names": self.train_class_names      
                     }
 
                 self.train_pe_dataname = dataname
-            return self.pe_train_text_classifier.clone(), self.train_num_templates
+            
+            # 【修改】返回 PE 专用的模板列表
+            return self.pe_train_text_classifier.clone(), self.pe_train_num_templates
         else:
             if self.test_pe_dataname != dataname:
                 self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata)
@@ -1039,7 +1114,7 @@ class SAM3ovs(nn.Module):
                     
                     if self.use_cdt or self.use_pe_text:
                         raise RuntimeError("CDT/PE TEXT和MASK ENCODER暂时不混用")
-                    pe_text_classifier, _ = self.get_pe_classifier(dataname)
+                    pe_text_classifier, num_templates = self.get_pe_classifier(dataname)
                     query_names_results = torch.einsum("bnd,cd->bnc", queries_masks_feats, pe_text_classifier) 
                     # Scaling
                     final_logit_scale = self.final_logit_scale.exp()
@@ -1081,7 +1156,7 @@ class SAM3ovs(nn.Module):
             # mask classification target
             if "instances" in batched_inputs[0]:
                 gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-                targets = self.prepare_targets(gt_instances, images)
+                targets = self.prepare_targets(gt_instances, images, batched_inputs)
             else:
                 targets = None
 

@@ -16,7 +16,7 @@ MODEL:
 
 DATASETS:
   # 只保留 COCO Panoptic
-  TRAIN: ("coco_2017_train_panoptic", )
+  TRAIN: ("openvocab_coco_2017_train_stuff_sem_seg",)
   TEST: ("openvocab_ade20k_panoptic_val",) 
 
 SOLVER:
@@ -86,5 +86,5 @@ TEST:
 VERSION: 2
 
 OUTPUT_DIR: ./out/test/
-# OUTPUT_DIR: ./out/MASK/cocopano_3/
+# OUTPUT_DIR: ./out/MASK/coco_stuff/
   
