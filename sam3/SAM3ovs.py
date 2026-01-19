@@ -200,11 +200,11 @@ class SAM3ovs(nn.Module):
             self.use_mask_encoder = True
             self.mask_encoder_requires_grad = cfg.MODEL.SAM3.MASK_ENCODER_REQUIRES_GRAD
 
-            self.tracker = FakeTracker()
+            # self.tracker = FakeTracker()
             self.mask_pooling = MaskPooling()
             # self.mask_feat_proj = MLP(input_dim = 256, hidden_dim = 1024, output_dim = 256)
             
-            self.mask_feat_proj = ResMLPAdapter(input_dim = 1024, hidden_dim = 5096, output_dim = 1024)
+            self.mask_feat_proj = MLP(input_dim = 1024, hidden_dim = 5096, output_dim = 1024)
 
             for m in self.mask_feat_proj.modules():
                 if isinstance(m, nn.Linear):
@@ -248,11 +248,13 @@ class SAM3ovs(nn.Module):
         prior_prob = 0.01
         bias_value = -np.log((1 - prior_prob) / prior_prob)
         self.logit_bias = nn.Parameter(torch.ones([]) * bias_value)
+        self.final_logit_bias = nn.Parameter(torch.ones([]) * bias_value)
 
         target_multiplier = 3
         init_value = math.log(target_multiplier)
         # self.logit_scale = nn.Parameter(torch.ones([]) * init_value)
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07)) # 这是一个经验值
+        self.final_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07)) # 这是一个经验值
 
         self.num_cdt = cfg.MODEL.SAM3.NUM_CDT    
         self.use_cdt = False if cfg.MODEL.SAM3.NUM_CDT == 0 else True
@@ -318,7 +320,7 @@ class SAM3ovs(nn.Module):
         weight_dict.update(criterion_weight_dict)
 
         if self.use_aux:
-            for i in range (5):
+            for i in range (5+1):
                 for k in criterion_weight_dict.keys():
                     # if "focal" in k:
                     #     continue
@@ -387,7 +389,7 @@ class SAM3ovs(nn.Module):
             aux_class_decay = cfg.SOLVER.AUX_CLASS_DECAY
             print(f"Applying Aux Classification Weight Decay: {aux_class_decay}")
             
-            for i in range(5): # 遍历 5 个辅助层
+            for i in range(5+1): # 遍历 5 个辅助层
                 key = f"loss_focal_{i}"
                 if key in self.criterion.weight_dict:
                     original_weight = self.criterion.weight_dict[key]
@@ -1039,17 +1041,23 @@ class SAM3ovs(nn.Module):
                         raise RuntimeError("CDT/PE TEXT和MASK ENCODER暂时不混用")
                     pe_text_classifier, _ = self.get_pe_classifier(dataname)
                     query_names_results = torch.einsum("bnd,cd->bnc", queries_masks_feats, pe_text_classifier) 
-                else:
-                    # 使用 Query (FC-CLIP style)
-                    tp_queries = queries[i,:,:,:].clone() 
-                    if self.use_query_proj:
-                        tp_queries = self.query_proj(tp_queries)
-                    tp_queries = F.normalize(tp_queries, dim=-1, p=2)
+                    # Scaling
+                    final_logit_scale = self.final_logit_scale.exp()
+                    final_logit_scale = torch.clamp(final_logit_scale, max=20.0)
+                    query_names_results = final_logit_scale * query_names_results + self.final_logit_bias
+                    current_query_cls_results = aggregate_name_to_class_logits(query_names_results, num_templates)
+                    query_cls_results_final = current_query_cls_results
+                
+                # 使用 Query (FC-CLIP style)
+                tp_queries = queries[i,:,:,:].clone() 
+                if self.use_query_proj:
+                    tp_queries = self.query_proj(tp_queries)
+                tp_queries = F.normalize(tp_queries, dim=-1, p=2)
 
-                    if self.use_cdt:
-                        query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, text_classifier) 
-                    else:
-                        query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier)
+                if self.use_cdt:
+                    query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, text_classifier) 
+                else:
+                    query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier)
 
                 # Scaling
                 logit_scale = self.logit_scale.exp()
@@ -1060,16 +1068,12 @@ class SAM3ovs(nn.Module):
                 # 使用 Helper Function 替换原有循环
                 current_query_cls_results = aggregate_name_to_class_logits(query_names_results, num_templates)
 
-                # 保存输出
-                if is_final_layer:
-                    query_cls_results_final = current_query_cls_results
-                else:
-                    aux_outputs.append({
-                        'pred_logits': current_query_cls_results, 
-                        'pred_masks': current_pred_masks, 
-                        'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'],
-                        'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"],
-                    })
+                aux_outputs.append({
+                    'pred_logits': current_query_cls_results, 
+                    'pred_masks': current_pred_masks, 
+                    'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'] if i<5 else outputs['pred_boxes'],
+                    'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"]if i<5 else outputs["pred_boxes_xyxy"],
+                })
 
 
 
@@ -1097,6 +1101,8 @@ class SAM3ovs(nn.Module):
                     losses[k] *= self.criterion.weight_dict[k]
                 else:
                     # remove this loss if not specified in `weight_dict`
+                    losses.pop(k)
+                if k in ['loss_mask', 'loss_dice', 'loss_bbox', 'loss_giou']:
                     losses.pop(k)
             
             if self.encoder_loss:

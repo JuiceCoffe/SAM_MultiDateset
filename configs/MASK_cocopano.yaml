@@ -10,8 +10,9 @@ MODEL:
     USE_QUERY_PROJ: FALSE
     USE_PE_TEXT: FALSE
     USE_MASK_ENCODER: TRUE
-  # WEIGHTS: "/data/hmp/sam3.pt"
-  WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
+  WEIGHTS: "/data/hmp/sam3.pt"
+  # WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
+  # WEIGHTS: /data/hmp/TASK/OVS/mysamMultiDateset/out/cocopano_box_1cdt_cliplogit/model_0007499.pth
 
 DATASETS:
   # 只保留 COCO Panoptic
@@ -24,8 +25,8 @@ SOLVER:
   IMS_PER_BATCH: 16
   BASE_LR: 0.00002
   LR_SCHEDULER_NAME: WarmupPolyLR
-  MAX_ITER: 30000
-  CHECKPOINT_PERIOD: 5000
+  MAX_ITER: 15000
+  CHECKPOINT_PERIOD: 2500
   
   CLASS_WEIGHT: 1.0
   MASK_WEIGHT: 5.0
@@ -35,9 +36,9 @@ SOLVER:
   USE_AUX : True
 
   ENCODER_LOSS: FALSE
-  LARGE_MULTIPLIER: 1.0
+  LARGE_MULTIPLIER: 5.0
   LARGE_LR_MODEL: ['mask_feat_proj']
-  AUX_CLASS_DECAY: 0.3
+  AUX_CLASS_DECAY: 2.0
 
 INPUT:
   DATASET_MAPPER_NAME: "coco_combine_lsj"
@@ -76,7 +77,7 @@ DATALOADER:
   USE_DIFF_BS_SIZE: True
 
 TEST:
-  EVAL_PERIOD: 50
+  EVAL_PERIOD: 2500
   INSTANCE_ON: True   
   PANOPTIC_ON: True   
   SEMANTIC_ON: True   
@@ -85,5 +86,5 @@ TEST:
 VERSION: 2
 
 # OUTPUT_DIR: ./out/test/
-OUTPUT_DIR: ./out/MASK/cocopano_2/
+OUTPUT_DIR: ./out/MASK/cocopano_3/
   
