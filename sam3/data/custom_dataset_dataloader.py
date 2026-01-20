@@ -58,6 +58,8 @@ def _custom_train_loader_from_config(cfg, mapper=None, *, dataset=None, sampler=
     elif sampler_name == "MultiDatasetSampler": # True
 
         current_seed = cfg.SEED if hasattr(cfg, 'SEED') and cfg.SEED >= 0 else comm.shared_random_seed()
+        print('current_seed:',current_seed)
+        exit()
         sampler = MultiDatasetSampler(
             dataset_dicts,
             dataset_ratio = cfg.DATALOADER.DATASET_RATIO,

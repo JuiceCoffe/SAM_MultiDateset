@@ -278,7 +278,7 @@ def setup(args):
 
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
-    cfg.merge_from_list(['SEED', 123])
+    # cfg.merge_from_list(['SEED', 123])
 
     cfg.eval_only = args.eval_only
     
