@@ -6,6 +6,8 @@ def add_sam3_config(cfg):
     为 Detectron2 的 cfg 添加 SAM3 专用配置
     """
     cfg = cfg
+
+    cfg.SEED = 33
     
     cfg.MODEL.SAM3 = CN()
     # 对应 build_sam3_image_model 中的参数

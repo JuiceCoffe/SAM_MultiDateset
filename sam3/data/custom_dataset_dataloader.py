@@ -56,12 +56,15 @@ def _custom_train_loader_from_config(cfg, mapper=None, *, dataset=None, sampler=
     elif sampler_name == "TrainingSampler": # False
         sampler = TrainingSampler(len(dataset))
     elif sampler_name == "MultiDatasetSampler": # True
+
+        current_seed = cfg.SEED if hasattr(cfg, 'SEED') and cfg.SEED >= 0 else comm.shared_random_seed()
         sampler = MultiDatasetSampler(
             dataset_dicts,
             dataset_ratio = cfg.DATALOADER.DATASET_RATIO,
             use_rfs = cfg.DATALOADER.USE_RFS,
             dataset_ann = cfg.DATALOADER.DATASET_ANN,
             repeat_threshold = cfg.DATALOADER.REPEAT_THRESHOLD,
+            seed = current_seed  # <<<<< 修改这里：显式传入 seed
         )
     elif sampler_name == "RepeatFactorTrainingSampler": # False
         repeat_factors = RepeatFactorTrainingSampler.repeat_factors_from_category_frequency(
