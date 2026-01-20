@@ -121,17 +121,23 @@ class SAM3MC_o365(nn.Module):
             self.query_proj = None
 
 
-        # 【新增】初始化 logit_bias
-        # 我们希望初始概率 p = 0.01
-        # Sigmoid(x) = 0.01  =>  x = log(0.01 / (1 - 0.01)) ≈ -4.595
+        self.num_decoder_layers = 6 # SAM3/DETR 标准层数
+        
+        # Bias 初始化
         prior_prob = 0.01
         bias_value = -np.log((1 - prior_prob) / prior_prob)
-        self.logit_bias = nn.Parameter(torch.ones([]) * bias_value)
+        self.logit_bias = nn.ParameterList([
+            nn.Parameter(torch.ones([]) * bias_value) 
+            for _ in range(self.num_decoder_layers)
+        ])
 
-        target_multiplier = 3
-        init_value = math.log(target_multiplier)
+        # Scale 初始化
         # self.logit_scale = nn.Parameter(torch.ones([]) * init_value)
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07)) # 这是一个经验值
+        init_scale_value = np.log(1 / 0.07) # 这是一个经验值
+        self.logit_scale = nn.ParameterList([
+            nn.Parameter(torch.ones([]) * init_scale_value) 
+            for _ in range(self.num_decoder_layers)
+        ])
 
         self.num_cdt = cfg.MODEL.SAM3.NUM_CDT    
         self.use_cdt = False if cfg.MODEL.SAM3.NUM_CDT == 0 else True
@@ -896,10 +902,12 @@ class SAM3MC_o365(nn.Module):
                 else:
                     query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier) # bs, N, C
                 
+
+                cur_logit_scale = self.logit_scale[i].exp()
+                cur_logit_scale = torch.clamp(cur_logit_scale, max=100.0)
+                cur_logit_bias = self.logit_bias[i]
                 
-                logit_scale = self.logit_scale.exp()
-                logit_scale = torch.clamp(logit_scale, max=100.0)
-                query_names_results = logit_scale * query_names_results + self.logit_bias
+                query_names_results = cur_logit_scale * query_names_results + cur_logit_bias
 
                 query_cls_results= []
                 cur_idx = 0
