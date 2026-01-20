@@ -33,7 +33,7 @@ from sam3.model_builder import (
 from sam3.model.data_misc import FindStage, interpolate
 
 from maft.utils.text_templetes import VILD_PROMPT
-# VILD_PROMPT = ["{}"]
+
 
 from .loss.matcher import HungarianMatcher
 from .loss.criterion import SetCriterion
@@ -97,7 +97,10 @@ class SAM3MC_o365(nn.Module):
             self.detector.eval()
         print("SAM3创建成功!")
 
-
+        if cfg.MODEL.SAM3.USE_VILD_PROMPT:
+            self.PROMPT = VILD_PROMPT
+        else:
+            self.PROMPT = ["{}"]
         # -------------------------------------------------------
         # 新增模块
         # -------------------------------------------------------
@@ -432,9 +435,9 @@ class SAM3MC_o365(nn.Module):
         def fill_all_templates_ensemble(x_=''):
             res = []
             for x in x_:
-                for template in VILD_PROMPT:
+                for template in self.PROMPT:
                     res.append(template.format(x))
-            return res, len(res) // len(VILD_PROMPT)
+            return res, len(res) // len(self.PROMPT)
        
         num_templates = []
         templated_class_names = []
@@ -493,10 +496,10 @@ class SAM3MC_o365(nn.Module):
                             print(f"[{dataname}] Filtering out {num_things_classes} Thing classes for Stuff training.")
                             
                             # 1. 计算前 80 个类总共占用了多少个文本 Prompt 
-                            # 【关键修正】这里必须乘以每个同义词对应的 Prompt 数量 (len(VILD_PROMPT))
+                            # 【关键修正】这里必须乘以每个同义词对应的 Prompt 数量 (len(self.PROMPT))
                             # train_num_templates 存的是同义词数量，train_class_names 存的是展开后的 Prompt
                             num_synonyms_to_skip = sum(self.train_num_templates[:num_things_classes])
-                            offset_text_idx = num_synonyms_to_skip * len(VILD_PROMPT)
+                            offset_text_idx = num_synonyms_to_skip * len(self.PROMPT)
                             
                             # 2. 截断 class_names (输入给 Text Encoder 的文本列表)
                             self.train_class_names = self.train_class_names[offset_text_idx:]
@@ -549,24 +552,24 @@ class SAM3MC_o365(nn.Module):
                         language_mask.append(mask) # bs, L
                     text_classifier = torch.cat(text_classifier, dim=0)
                     text_feat = torch.cat(text_feat, dim=0)
-                    language_mask = torch.cat(language_mask, dim=0) # (num_names * VILD_PROMPT,  L)
+                    language_mask = torch.cat(language_mask, dim=0) # (num_names * self.PROMPT,  L)
                     # average across templates and normalization.
-                    text_feat = text_feat.reshape(text_feat.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_feat.shape[-2], text_feat.shape[-1]) # num_names, VILD_PROMPT, L, D
+                    text_feat = text_feat.reshape(text_feat.shape[0]//len(self.PROMPT), len(self.PROMPT), text_feat.shape[-2], text_feat.shape[-1]) # num_names, self.PROMPT, L, D
                     text_feat /= (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
-                    text_feat[language_mask.view(text_feat.shape[0],text_feat.shape[1],text_feat.shape[2])] = 0.0 # [num_names, VILD_PROMPT, L, D] 掩码掉 padding 部分
+                    text_feat[language_mask.view(text_feat.shape[0],text_feat.shape[1],text_feat.shape[2])] = 0.0 # [num_names, self.PROMPT, L, D] 掩码掉 padding 部分
                     
                     language_features = text_feat.mean(1) # num_names, L, D
 
-                    text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_classifier.shape[-2], text_classifier.shape[-1]) # num_names, VILD_PROMPT, L, D
+                    text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.PROMPT), len(self.PROMPT), text_classifier.shape[-2], text_classifier.shape[-1]) # num_names, self.PROMPT, L, D
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
-                    text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 # [num_names, VILD_PROMPT, L, D] 掩码掉 padding 部分
+                    text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 # [num_names, self.PROMPT, L, D] 掩码掉 padding 部分
                     text_classifier = text_classifier.mean(-2) 
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                     text_classifier = text_classifier.mean(1)
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                     
                     self.language_features = language_features.detach() # num_names , L, D
-                    self.language_mask = torch.min(language_mask.view(language_features.shape[0],len(VILD_PROMPT),language_features.shape[1]), dim=1).values# [num_names, L]
+                    self.language_mask = torch.min(language_mask.view(language_features.shape[0],len(self.PROMPT),language_features.shape[1]), dim=1).values# [num_names, L]
                     self.train_text_classifier = text_classifier.detach()
                     # --- 原有生成逻辑结束 ---
 
@@ -604,24 +607,24 @@ class SAM3MC_o365(nn.Module):
                     language_mask.append(mask) # bs, L
                 text_classifier = torch.cat(text_classifier, dim=0)
                 text_feat = torch.cat(text_feat, dim=0)
-                language_mask = torch.cat(language_mask, dim=0) # (num_names * VILD_PROMPT,  L)
+                language_mask = torch.cat(language_mask, dim=0) # (num_names * self.PROMPT,  L)
                 # average across templates and normalization.
-                text_feat = text_feat.reshape(text_feat.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_feat.shape[-2], text_feat.shape[-1]) # num_names, VILD_PROMPT, L, D
+                text_feat = text_feat.reshape(text_feat.shape[0]//len(self.PROMPT), len(self.PROMPT), text_feat.shape[-2], text_feat.shape[-1]) # num_names, self.PROMPT, L, D
                 text_feat /= (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
-                text_feat[language_mask.view(text_feat.shape[0],text_feat.shape[1],text_feat.shape[2])] = 0.0 # [num_names, VILD_PROMPT, L, D] 掩码掉 padding 部分
+                text_feat[language_mask.view(text_feat.shape[0],text_feat.shape[1],text_feat.shape[2])] = 0.0 # [num_names, self.PROMPT, L, D] 掩码掉 padding 部分
                 
                 language_features = text_feat.mean(1) # num_names, L, D
 
-                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(VILD_PROMPT), len(VILD_PROMPT), text_classifier.shape[-2], text_classifier.shape[-1]) # num_names, VILD_PROMPT, L, D
+                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.PROMPT), len(self.PROMPT), text_classifier.shape[-2], text_classifier.shape[-1]) # num_names, self.PROMPT, L, D
                 text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
-                text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 # [num_names, VILD_PROMPT, L, D] 掩码掉 padding 部分
+                text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 # [num_names, self.PROMPT, L, D] 掩码掉 padding 部分
                 text_classifier = text_classifier.mean(-2) 
                 text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                 text_classifier = text_classifier.mean(1)
                 text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                 
                 self.language_features = language_features.detach() # num_names , L, D
-                self.language_mask = torch.min(language_mask.view(language_features.shape[0],len(VILD_PROMPT),language_features.shape[1]), dim=1).values# [num_names, L]
+                self.language_mask = torch.min(language_mask.view(language_features.shape[0],len(self.PROMPT),language_features.shape[1]), dim=1).values# [num_names, L]
                 self.test_text_classifier = text_classifier.detach()
                 self.test_dataname = dataname
             return self.test_text_classifier.clone(), self.test_num_templates
