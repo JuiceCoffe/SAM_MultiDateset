@@ -15,7 +15,7 @@ from sam3.model.decoder import (
     TransformerDecoderLayerv2,
     TransformerEncoderCrossAttention,
 )
-from sam3.model.encoder import TransformerEncoderFusion, TransformerEncoderLayer
+from sam3.model.encoder import TransformerEncoderFusion, TransformerEncoderLayer, TransformerEncoderLayerPro
 from sam3.model.geometry_encoders import SequenceGeometryEncoder
 from sam3.model.maskformer_segmentation import PixelDecoder, UniversalSegmentationHead
 from sam3.model.memory import (
@@ -114,30 +114,54 @@ def _create_vl_backbone(vit_neck, text_encoder):
     return SAM3VLBackbone(visual=vit_neck, text=text_encoder, scalp=1)
 
 
-def _create_transformer_encoder() -> TransformerEncoderFusion:
+def _create_transformer_encoder(use_gate) -> TransformerEncoderFusion:
     """Create transformer encoder with its layer."""
-    encoder_layer = TransformerEncoderLayer(
-        activation="relu",
-        d_model=256,
-        dim_feedforward=2048,
-        dropout=0.1,
-        pos_enc_at_attn=True,
-        pos_enc_at_cross_attn_keys=False,
-        pos_enc_at_cross_attn_queries=False,
-        pre_norm=True,
-        self_attention=MultiheadAttention(
-            num_heads=8,
+    if use_gate:
+        encoder_layer = TransformerEncoderLayerPro(
+            activation="relu",
+            d_model=256,
+            dim_feedforward=2048,
             dropout=0.1,
-            embed_dim=256,
-            batch_first=True,
-        ),
-        cross_attention=MultiheadAttention(
-            num_heads=8,
+            pos_enc_at_attn=True,
+            pos_enc_at_cross_attn_keys=False,
+            pos_enc_at_cross_attn_queries=False,
+            pre_norm=True,
+            self_attention=MultiheadAttention(
+                num_heads=8,
+                dropout=0.1,
+                embed_dim=256,
+                batch_first=True,
+            ),
+            cross_attention=MultiheadAttention(
+                num_heads=8,
+                dropout=0.1,
+                embed_dim=256,
+                batch_first=True,
+            ),
+        )
+    else:
+        encoder_layer = TransformerEncoderLayer(
+            activation="relu",
+            d_model=256,
+            dim_feedforward=2048,
             dropout=0.1,
-            embed_dim=256,
-            batch_first=True,
-        ),
-    )
+            pos_enc_at_attn=True,
+            pos_enc_at_cross_attn_keys=False,
+            pos_enc_at_cross_attn_queries=False,
+            pre_norm=True,
+            self_attention=MultiheadAttention(
+                num_heads=8,
+                dropout=0.1,
+                embed_dim=256,
+                batch_first=True,
+            ),
+            cross_attention=MultiheadAttention(
+                num_heads=8,
+                dropout=0.1,
+                embed_dim=256,
+                batch_first=True,
+            ),
+        )
 
     encoder = TransformerEncoderFusion(
         layer=encoder_layer,
@@ -534,9 +558,9 @@ def _create_vision_backbone(
     return vit_neck
 
 
-def _create_sam3_transformer(has_presence_token: bool = True) -> TransformerWrapper:
+def _create_sam3_transformer(has_presence_token: bool = True, use_gate = False) -> TransformerWrapper:
     """Create SAM3 transformer encoder and decoder."""
-    encoder: TransformerEncoderFusion = _create_transformer_encoder()
+    encoder: TransformerEncoderFusion = _create_transformer_encoder(use_gate)
     decoder: TransformerDecoder = _create_transformer_decoder()
 
     return TransformerWrapper(encoder=encoder, decoder=decoder, d_model=256)

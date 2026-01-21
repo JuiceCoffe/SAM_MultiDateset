@@ -66,7 +66,9 @@ class SAM3MC_o365(nn.Module):
         )
         text_encoder = _create_text_encoder(cfg.MODEL.SAM3.BPE_PATH)
         backbone = _create_vl_backbone(vision_encoder, text_encoder)
-        transformer = _create_sam3_transformer()
+        transformer = _create_sam3_transformer(
+            use_gate = cfg.MODEL.SAM3.USE_GATE,
+        )
         dot_prod_scoring = _create_dot_product_scoring()
 
         segmentation_head = (

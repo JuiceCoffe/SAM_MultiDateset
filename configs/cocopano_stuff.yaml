@@ -9,7 +9,9 @@ MODEL:
 
     USE_QUERY_PROJ: False
     USE_PE_TEXT: False
+    USE_GATE: True
   WEIGHTS: "/data/hmp/sam3.pt"
+  # WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
   # WEIGHTS: /data/hmp/TASK/OVS/mysamMultiDateset/out/cocopano/box/model_0003749.pth
 
 DATASETS:
@@ -24,7 +26,7 @@ SOLVER:
   IMS_PER_BATCH: 12
   BASE_LR: 0.00005
   LR_SCHEDULER_NAME: WarmupPolyLR
-  MAX_ITER: 40000
+  MAX_ITER: 30000
   CHECKPOINT_PERIOD: 5000
   
   # Loss 权重保持你原本的设置
@@ -51,7 +53,7 @@ INPUT:
 DATALOADER:
   SAMPLER_TRAIN: "MultiDatasetSampler"
 
-  DATASET_RATIO: [1.0, 1.0]
+  DATASET_RATIO: [2.0, 1.0]
 
   DATASET_BS: [8, 8]
   
@@ -74,6 +76,6 @@ TEST:
   PANOPTIC_ON: True   
   SEMANTIC_ON: True   
 
-# OUTPUT_DIR: ./out/obj1_coco1/
+# OUTPUT_DIR: ./out/copastf/
 OUTPUT_DIR: ./out/test
 VERSION: 2

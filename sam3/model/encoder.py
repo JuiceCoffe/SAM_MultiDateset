@@ -9,6 +9,291 @@ from torch import nn, Tensor
 from .act_ckpt_utils import activation_ckpt_wrapper
 from .model_misc import get_activation_fn, get_clones, get_valid_ratio
 
+class TransformerEncoderLayerPro(nn.Module):
+    """
+    Transformer encoder layer that performs self-attention followed by cross-attention.
+
+    This layer was previously called TransformerDecoderLayer but was renamed to better
+    reflect its role in the architecture. It processes input sequences through self-attention
+    and then cross-attention with another input (typically image features).
+
+    The layer supports both pre-norm and post-norm configurations, as well as
+    positional encoding at different stages of the attention mechanism.
+    """
+
+    def __init__(
+        self,
+        activation: str,
+        cross_attention: nn.Module,
+        d_model: int,
+        dim_feedforward: int,
+        dropout: float,
+        pos_enc_at_attn: bool,
+        pos_enc_at_cross_attn_keys: bool,
+        pos_enc_at_cross_attn_queries: bool,
+        pre_norm: bool,
+        self_attention: nn.Module,
+    ):
+        """
+        Initialize a transformer encoder layer.
+
+        Args:
+            activation: Activation function to use in the feedforward network
+            cross_attention: Cross-attention module for attending to image features
+            d_model: Model dimension/hidden size
+            dim_feedforward: Dimension of the feedforward network
+            dropout: Dropout probability
+            pos_enc_at_attn: Whether to add positional encodings at self-attention
+            pos_enc_at_cross_attn_keys: Whether to add positional encodings to keys in cross-attention
+            pos_enc_at_cross_attn_queries: Whether to add positional encodings to queries in cross-attention
+            pre_norm: Whether to use pre-norm (True) or post-norm (False) architecture
+            self_attention: Self-attention module
+        """
+        super().__init__()
+        self.d_model = d_model
+        self.dim_feedforward = dim_feedforward
+        self.dropout_value = dropout
+        self.self_attn = self_attention
+        self.cross_attn_image = cross_attention
+
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation_str = activation
+        self.activation = get_activation_fn(activation)
+        self.pre_norm = pre_norm
+
+        self.pos_enc_at_attn = pos_enc_at_attn
+        self.pos_enc_at_cross_attn_queries = pos_enc_at_cross_attn_queries
+        self.pos_enc_at_cross_attn_keys = pos_enc_at_cross_attn_keys
+
+        self.layer_idx = None
+
+        self.background_token_key = nn.Parameter(torch.zeros(1, 1, d_model)) 
+        # 添加这一行初始化
+        nn.init.normal_(self.background_token_key, std=0.02) 
+
+    def forward_post(
+        self,
+        tgt: Tensor,
+        memory: Tensor,
+        tgt_mask: Optional[Tensor] = None,
+        memory_mask: Optional[Tensor] = None,
+        tgt_key_padding_mask: Optional[Tensor] = None,
+        memory_key_padding_mask: Optional[Tensor] = None,
+        pos: Optional[Tensor] = None,
+        query_pos: Optional[Tensor] = None,
+        **kwargs,
+    ) -> Tensor:
+        """
+        Forward pass for post-norm architecture.
+
+        In post-norm architecture, normalization is applied after attention and feedforward operations.
+
+        Args:
+            tgt: Input tensor to be processed
+            memory: Memory tensor for cross-attention
+            tgt_mask: Mask for self-attention
+            memory_mask: Mask for cross-attention
+            tgt_key_padding_mask: Key padding mask for self-attention
+            memory_key_padding_mask: Key padding mask for cross-attention
+            pos: Positional encoding for memory
+            query_pos: Positional encoding for query
+            **kwargs: Additional keyword arguments
+
+        Returns:
+            Processed tensor
+        """
+        q = k = tgt + query_pos if self.pos_enc_at_attn else tgt
+
+        # Self attention
+        tgt2 = self.self_attn(
+            q, k, value=tgt, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask
+        )[0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+
+        # Cross attention to image
+        tgt2 = self.cross_attn_image(
+            query=tgt + query_pos if self.pos_enc_at_cross_attn_queries else tgt,
+            key=memory + pos if self.pos_enc_at_cross_attn_keys else memory,
+            value=memory,
+            attn_mask=memory_mask,
+            key_padding_mask=memory_key_padding_mask,
+        )[0]
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+
+        # FFN
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+        return tgt
+
+    def forward_pre(
+        self,
+        tgt: Tensor,
+        memory: Tensor,
+        dac: bool = False,
+        tgt_mask: Optional[Tensor] = None,
+        memory_mask: Optional[Tensor] = None,
+        tgt_key_padding_mask: Optional[Tensor] = None,
+        memory_key_padding_mask: Optional[Tensor] = None,
+        pos: Optional[Tensor] = None,
+        query_pos: Optional[Tensor] = None,
+        # attn_bias: Optional[Tensor] = None,
+        # **kwargs,
+    ) -> Tensor:
+        """
+        Forward pass for pre-norm architecture.
+
+        In pre-norm architecture, normalization is applied before attention and feedforward operations.
+
+        Args:
+            tgt: Input tensor to be processed
+            memory: Memory tensor for cross-attention
+            dac: Whether to use Divide-and-Conquer attention
+            tgt_mask: Mask for self-attention
+            memory_mask: Mask for cross-attention
+            tgt_key_padding_mask: Key padding mask for self-attention
+            memory_key_padding_mask: Key padding mask for cross-attention
+            pos: Positional encoding for memory
+            query_pos: Positional encoding for query
+            attn_bias: Optional attention bias tensor
+            **kwargs: Additional keyword arguments
+
+        Returns:
+            Processed tensor
+        """
+        if dac:
+            # we only apply self attention to the first half of the queries
+            assert tgt.shape[0] % 2 == 0
+            other_tgt = tgt[tgt.shape[0] // 2 :]
+            tgt = tgt[: tgt.shape[0] // 2]
+        tgt2 = self.norm1(tgt)
+        q = k = tgt2 + query_pos if self.pos_enc_at_attn else tgt2
+        tgt2 = self.self_attn(
+            q, k, value=tgt2, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask
+        )[0]
+        tgt = tgt + self.dropout1(tgt2)
+        if dac:
+            # Recombine
+            tgt = torch.cat((tgt, other_tgt), dim=0)
+        tgt2 = self.norm2(tgt)
+
+        query_ca = tgt2 + query_pos if self.pos_enc_at_cross_attn_queries else tgt2
+        key_ca = memory + pos if self.pos_enc_at_cross_attn_keys else memory
+        value_ca = memory
+
+        is_batch_first = getattr(self.cross_attn_image, 'batch_first', False)
+        
+        bs = key_ca.shape[0] if is_batch_first else key_ca.shape[1]
+        
+        # 2. 准备 Background Key 和 Value
+        # 原始形状: (1, 1, C)
+        if is_batch_first:
+            # 目标形状: (B, 1, C)
+            bg_key = self.background_token_key.permute(1, 0, 2).expand(bs, -1, -1)
+            bg_value = torch.zeros_like(bg_key)
+            concat_dim = 1 # 在 dim=1 (Seq) 上拼接
+        else:
+            # 目标形状: (1, B, C)
+            bg_key = self.background_token_key.expand(-1, bs, -1)
+            bg_value = torch.zeros_like(bg_key)
+            concat_dim = 0 # 在 dim=0 (Seq) 上拼接
+
+        # 3. 拼接特征
+        key_gated = torch.cat([key_ca, bg_key], dim=concat_dim)
+        value_gated = torch.cat([value_ca, bg_value], dim=concat_dim)
+
+        # 4. 处理 Mask (Mask 始终是 Batch First: B, S)
+        if memory_key_padding_mask is not None:
+            # memory_key_padding_mask: (B, S_original)
+            # 新建一个全 False 的 mask (B, 1)，表示该 Token 有效
+            bg_mask = torch.zeros((bs, 1), dtype=torch.bool, device=memory_key_padding_mask.device)
+            
+            # 在 dim=1 上拼接
+            memory_key_padding_mask_gated = torch.cat([memory_key_padding_mask, bg_mask], dim=1)
+        else:
+            # 如果原本没有 mask，现在需要为原来的序列造一个全 False 的 mask，或者依然传 None？
+            # PyTorch MHA 允许 mask 为 None，但如果不传 mask，新加的 token 默认也是可见的。
+            # 为了安全起见，通常不需要额外操作，除非你想 mask 掉原有的某些部分。
+            # 但如果你的输入序列长度变了，attn_mask (2D/3D mask) 可能需要调整。
+            # 通常 key_padding_mask 是最常用的，这里设为 None 即可。
+            memory_key_padding_mask_gated = None
+
+        # 5. 调用 Attention
+        tgt2 = self.cross_attn_image(
+            query=query_ca,
+            key=key_gated,
+            value=value_gated,
+            attn_mask=memory_mask, # 注意：如果 memory_mask 是方阵，这里可能会报错，因为 key 变长了
+            key_padding_mask=memory_key_padding_mask_gated,
+        )[0]
+        # print("完成Gate注意力计算")
+
+        tgt = tgt + self.dropout2(tgt2)
+        tgt2 = self.norm3(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
+        tgt = tgt + self.dropout3(tgt2)
+        return tgt
+
+    def forward(
+        self,
+        tgt: Tensor,
+        memory: Tensor,
+        dac: bool = False,
+        tgt_mask: Optional[Tensor] = None,
+        memory_mask: Optional[Tensor] = None,
+        tgt_key_padding_mask: Optional[Tensor] = None,
+        memory_key_padding_mask: Optional[Tensor] = None,
+        pos: Optional[Tensor] = None,
+        query_pos: Optional[Tensor] = None,
+        # attn_bias: Optional[Tensor] = None,
+        # **kwds: Any,
+    ) -> torch.Tensor:
+        """
+        Forward pass for the transformer encoder layer.
+
+        Args:
+            tgt: Input tensor to be processed
+            memory: Memory tensor (e.g., image features) for cross-attention
+            dac: Whether to use Divide-and-Conquer attention (only apply self-attention to first half)
+            tgt_mask: Mask for self-attention
+            memory_mask: Mask for cross-attention
+            tgt_key_padding_mask: Key padding mask for self-attention
+            memory_key_padding_mask: Key padding mask for cross-attention
+            pos: Positional encoding for memory
+            query_pos: Positional encoding for query
+            attn_bias: Optional attention bias tensor
+            **kwds: Additional keyword arguments
+
+        Returns:
+            Processed tensor after self-attention, cross-attention, and feedforward network
+        """
+        fwd_fn = self.forward_pre if self.pre_norm else self.forward_post
+        return fwd_fn(
+            tgt,
+            memory,
+            dac=dac,
+            tgt_mask=tgt_mask,
+            memory_mask=memory_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=memory_key_padding_mask,
+            pos=pos,
+            query_pos=query_pos,
+            # attn_bias=attn_bias,
+            # **kwds,
+        )
 
 class TransformerEncoderLayer(nn.Module):
     """
@@ -429,7 +714,7 @@ class TransformerEncoder(nn.Module):
         for layer in self.layers:
             layer_kwargs = {}
 
-            assert isinstance(layer, TransformerEncoderLayer)
+            # assert isinstance(layer, TransformerEncoderLayer)
             layer_kwargs["memory"] = prompt
             layer_kwargs["memory_key_padding_mask"] = prompt_key_padding_mask
             layer_kwargs["query_pos"] = lvl_pos_embed_flatten
@@ -541,6 +826,7 @@ class TransformerEncoderFusion(TransformerEncoder):
             ), "expected list of (bs, c, h, w) tensors"
 
         if self.add_pooled_text_to_img_feat:
+            print("add_pooled_text_to_img_feat")
             # Fusion: Add mean pooled text to image features
             pooled_text = pool_text_feat(
                 prompt, prompt_key_padding_mask, self.pool_text_with_mask

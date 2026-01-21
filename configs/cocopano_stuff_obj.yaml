@@ -5,12 +5,13 @@ MODEL:
   SAM3:
     BPE_PATH: "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
     ENABLE_SEGMENTATION: True
-    NUM_CDT: 1
+    NUM_CDT: 0
 
     USE_QUERY_PROJ: False
     USE_PE_TEXT: False
-  WEIGHTS: "/data/hmp/sam3.pt"
-  # WEIGHTS: /data/hmp/TASK/OVS/mysamMultiDateset/out/cocopano_box_1cdt_cliplogit/model_0007499.pth
+    USE_GATE: True
+  # WEIGHTS: "/data/hmp/sam3.pt"
+  WEIGHTS: /data/hmp/SAMweights/copa_noCDT_notpl.pth
 
 DATASETS:
   TRAIN: ("coco_2017_train_panoptic", "openvocab_coco_2017_train_stuff_sem_seg","objects365_v1_masktrain",)  
@@ -24,7 +25,7 @@ SOLVER:
   IMS_PER_BATCH: 12
   BASE_LR: 0.00002
   LR_SCHEDULER_NAME: WarmupPolyLR
-  MAX_ITER: 30000
+  MAX_ITER: 60000
   CHECKPOINT_PERIOD: 10000
   
   # Loss 权重保持你原本的设置
@@ -75,6 +76,5 @@ TEST:
   SEMANTIC_ON: True   
 
 # OUTPUT_DIR: ./out/obj1_coco1/
-# OUTPUT_DIR: ./out/copa_objcopastf
-OUTPUT_DIR: ./out/test
+OUTPUT_DIR: ./out/copa_objcopastf_NoCdtTpl_Gate
 VERSION: 2
