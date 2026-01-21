@@ -24,6 +24,8 @@ def add_sam3_config(cfg):
     cfg.MODEL.SAM3.NUM_CDT = 0
     cfg.MODEL.SAM3.USE_QUERY_PROJ = False
     cfg.MODEL.SAM3.USE_GATE = False
+    cfg.MODEL.SAM3.ENCODER_LOSS = False
+    cfg.MODEL.SAM3.DYNAMIC_QUERY = False
 
     cfg.INPUT.DATASET_MAPPER_NAME = "mask_former_semantic"
     cfg.INPUT.IMAGE_SIZE = 1008
@@ -52,7 +54,6 @@ def add_sam3_config(cfg):
     cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO = 0.75
 
     cfg.SOLVER.USE_AUX = True
-    cfg.SOLVER.ENCODER_LOSS = False
 
     cfg.TEST.SEMANTIC_ON = True
     cfg.TEST.INSTANCE_ON = False

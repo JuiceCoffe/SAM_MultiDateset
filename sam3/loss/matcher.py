@@ -73,7 +73,15 @@ class HungarianMatcher(nn.Module):
     while the others are un-matched (and thus treated as non-objects).
     """
 
-    def __init__(self, cost_class: float = 1, cost_mask: float = 1, cost_dice: float = 1, cost_bbox: float = 1.0, cost_giou: float = 1.0,  num_points: int = 0):
+    def __init__(self, 
+        cost_class: float = 1, 
+        cost_mask: float = 1, 
+        cost_dice: float = 1, 
+        cost_bbox: float = 1.0, 
+        cost_giou: float = 1.0,  
+        num_points: int = 0,
+        use_mask: bool = True,
+    ):
         """Creates the matcher
 
         Params:
@@ -91,6 +99,8 @@ class HungarianMatcher(nn.Module):
 
         assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
 
+        self.use_mask = use_mask
+        
         self.num_points = num_points
 
     @torch.no_grad()
@@ -138,36 +148,41 @@ class HungarianMatcher(nn.Module):
                     box_cxcywh_to_xyxy(out_bbox), 
                     box_cxcywh_to_xyxy(tgt_bbox)
                 )
+            
+            cost_mask = 0
+            cost_dice = 0
 
-            out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
-            # gt masks are already padded when preparing target
-            tgt_mask = targets[b]["masks"].to(out_mask)
+            if self.use_mask:
+                out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
+                # gt masks are already padded when preparing target
+                tgt_mask = targets[b]["masks"].to(out_mask)
 
-            out_mask = out_mask[:, None]
-            tgt_mask = tgt_mask[:, None]
-            # all masks share the same set of points for efficient matching!
-            point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
-            # get gt labels
-            tgt_mask = point_sample(
-                tgt_mask,
-                point_coords.repeat(tgt_mask.shape[0], 1, 1),
-                align_corners=False,
-            ).squeeze(1)
+                out_mask = out_mask[:, None]
+                tgt_mask = tgt_mask[:, None]
+                # all masks share the same set of points for efficient matching!
+                point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
+                # get gt labels
+                tgt_mask = point_sample(
+                    tgt_mask,
+                    point_coords.repeat(tgt_mask.shape[0], 1, 1),
+                    align_corners=False,
+                ).squeeze(1)
 
-            out_mask = point_sample(
-                out_mask,
-                point_coords.repeat(out_mask.shape[0], 1, 1),
-                align_corners=False,
-            ).squeeze(1)
+                out_mask = point_sample(
+                    out_mask,
+                    point_coords.repeat(out_mask.shape[0], 1, 1),
+                    align_corners=False,
+                ).squeeze(1)
 
-            with autocast(enabled=False):
-                out_mask = out_mask.float()
-                tgt_mask = tgt_mask.float()
-                # Compute the focal loss between masks
-                cost_mask = batch_sigmoid_ce_loss_jit(out_mask, tgt_mask)
+                with autocast(enabled=False):
+                    out_mask = out_mask.float()
+                    tgt_mask = tgt_mask.float()
+                    # Compute the focal loss between masks
+                    cost_mask = batch_sigmoid_ce_loss_jit(out_mask, tgt_mask)
 
-                # Compute the dice loss betwen masks
-                cost_dice = batch_dice_loss_jit(out_mask, tgt_mask)
+                    # Compute the dice loss betwen masks
+                    cost_dice = batch_dice_loss_jit(out_mask, tgt_mask)
+
             # Final cost matrix
             C = (
                 self.cost_mask * cost_mask

@@ -32,6 +32,14 @@ from sam3.model_builder import (
 )
 from sam3.model.data_misc import FindStage, interpolate
 
+from sam3.model.model_misc import (
+    gen_sineembed_for_position,
+    get_activation_fn,
+    get_clones,
+    inverse_sigmoid,
+    MLP,
+)
+
 from maft.utils.text_templetes import VILD_PROMPT
 
 
@@ -39,6 +47,7 @@ from .loss.matcher import HungarianMatcher
 from .loss.criterion import SetCriterion
 from sam3.model.content_dependent_transfer import ContentDependentTransfer
 from sam3.model.box_ops import masks_to_boxes, box_xyxy_to_cxcywh
+
 
 from maft.modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
 
@@ -154,6 +163,14 @@ class SAM3MC_o365(nn.Module):
         else:
             self.cdt = None
 
+
+        self.DynamicQuery = cfg.MODEL.SAM3.DYNAMIC_QUERY
+        if self.DynamicQuery:
+            self.encoder_box_head = MLP(256, 256, 4, 3)
+            nn.init.constant_(self.encoder_box_head.layers[-1].weight.data, 0)
+            nn.init.constant_(self.encoder_box_head.layers[-1].bias.data, 0)
+
+
         self.text_encoder_cache = {} 
         # -------------------------------------------------------
         # 训练配置
@@ -206,13 +223,13 @@ class SAM3MC_o365(nn.Module):
                 for k in criterion_weight_dict.keys():
                     weight_dict[f"{k}_{i}"] = criterion_weight_dict[k]
         
-        self.encoder_loss = cfg.SOLVER.ENCODER_LOSS
+        self.encoder_loss = cfg.MODEL.SAM3.ENCODER_LOSS or cfg.MODEL.SAM3.DYNAMIC_QUERY
         if self.encoder_loss:
-            encoder_losses = ["labels", "masks",]
+            encoder_losses = ["labels", "boxes",]
             encoder_weight_dict = {
                 "loss_focal": class_weight,  
-                "loss_mask": mask_weight, 
-                "loss_dice": dice_weight,
+                'loss_bbox':bbox_weight, 
+                'loss_giou':giou_weight
             }
 
             encoder_matcher = HungarianMatcher(
@@ -220,13 +237,8 @@ class SAM3MC_o365(nn.Module):
                 cost_mask=mask_weight,
                 cost_dice=dice_weight,
                 num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
+                use_mask = False,
             )
-
-            encoder_weight_dict = {
-                "loss_focal": class_weight * 1.0,  
-                "loss_mask": mask_weight * 0.5, 
-                "loss_dice": dice_weight * 0.2  
-            }
 
             self.encoder_criterion = SetCriterion(
                 matcher=encoder_matcher,
@@ -238,10 +250,8 @@ class SAM3MC_o365(nn.Module):
             )
             prior_prob = 0.01
             bias_value = -np.log((1 - prior_prob) / prior_prob)
-            target_multiplier = 3
-            init_value = math.log(target_multiplier)
             self.encoder_logit_bias = nn.Parameter(torch.ones([]) * bias_value)
-            self.encoder_logit_scale = nn.Parameter(torch.ones([]) * init_value)
+            self.encoder_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
 
         losses = ["labels", "masks", "boxes"]
@@ -780,8 +790,10 @@ class SAM3MC_o365(nn.Module):
         fusion_feat = F.normalize(fusion_feat, dim=-1)
 
         if self.encoder_loss:
-            encoder_logits = torch.einsum("bld,bcd->blc", fusion_feat, text_classifier)
-
+            if self.use_cdt:
+                encoder_logits = torch.einsum("bld,bcd->blc", fusion_feat, text_classifier)
+            else:
+                encoder_logits = torch.einsum("bld,cd->blc", fusion_feat, text_classifier)
             e_logit_scale = self.encoder_logit_scale.exp()
             e_logit_scale = torch.clamp(e_logit_scale, max=100.0)
             encoder_logits = encoder_logits * e_logit_scale + self.encoder_logit_bias
@@ -793,12 +805,6 @@ class SAM3MC_o365(nn.Module):
             topk_values, topk_indices = torch.topk(encoder_score, k_selected, dim=1) # [bs, k]
             topk_indices_unsqueezed = topk_indices.unsqueeze(-1).repeat(1, 1, fusion_feat.shape[-1])
             topK_fusion_feat = torch.gather(fusion_feat, 1, topk_indices_unsqueezed) # [bs, k, D]
-            encoder_mask_logits = torch.einsum("bkd,bld->bkl", topK_fusion_feat, fusion_feat)
-            if self.use_cdt:
-                encoder_mask_logits = torch.einsum("bkd,bld->bkl", topK_fusion_feat, fusion_feat)
-            else:
-                encoder_mask_logits = torch.einsum("bkd,ld->bkl", topK_fusion_feat, fusion_feat)
-            encoder_mask_logits = encoder_mask_logits.view(bs, k_selected, img_feat.shape[-2], img_feat.shape[-1])
             num_classes = encoder_logits.shape[-1]
             encoder_cls_logits = torch.gather(
                 encoder_logits, 
@@ -816,16 +822,113 @@ class SAM3MC_o365(nn.Module):
         }
         # print("keys of out before decoder:", out.keys()) # s(['encoder_hidden_states', 'prev_encoder_out'])
         # Run the decoder
-        with torch.profiler.record_function("SAM3Image._run_decoder"):
-            out, hs = self.detector._run_decoder(
-                memory=out["encoder_hidden_states"],
-                pos_embed=encoder_out["pos_embed"],
-                src_mask=encoder_out["padding_mask"],
-                out=out,
-                prompt=prompt,
-                prompt_mask=prompt_mask,
-                encoder_out=encoder_out,
+        with torch.profiler.record_function("SAM3Image._run_decoder"):            
+            # out, hs = self.detector._run_decoder(
+            #     memory=out["encoder_hidden_states"],
+            #     pos_embed=encoder_out["pos_embed"],
+            #     src_mask=encoder_out["padding_mask"],
+            #     out=out,
+            #     prompt=prompt,
+            #     prompt_mask=prompt_mask,
+            #     encoder_out=encoder_out,
+            # )
+            if self.DynamicQuery:
+                # ---------------- Relative Offset Prediction 修改开始 ----------------
+                
+                # 1. 获取全图的网格锚点 (Grid Anchors)
+                # encoder_out["spatial_shapes"] 包含了特征图的高宽
+                # grid_anchors shape: [1, Total_HW, 2] -> (x, y)
+                grid_anchors = get_grid_reference_points(
+                    encoder_out["spatial_shapes"], 
+                    device=self.device
+                )
+                
+                # 2. 扩展到 Batch 维度
+                # grid_anchors shape: [bs, Total_HW, 2]
+                grid_anchors = grid_anchors.expand(bs, -1, -1)
+                
+                # 3. 根据 TopK 索引提取对应的锚点
+                # topk_indices shape: [bs, k]
+                # 我们需要 gather 最后一个维度 (x, y)，所以要扩展 indices
+                gather_idx = topk_indices.unsqueeze(-1).repeat(1, 1, 2) # [bs, k, 2]
+                
+                # topk_anchors_xy shape: [bs, k, 2]
+                topk_anchors_xy = torch.gather(grid_anchors, 1, gather_idx)
+                
+                # 4. 构建完整的 4D 锚点 (x, y, w, h)
+                # x, y 来自网格，w, h 初始化为一个较小的先验值 (例如 0.05)
+                # 这样 inverse_sigmoid 不会溢出，且符合物体初始尺寸较小的假设
+                anchor_wh_prior = torch.full_like(topk_anchors_xy, 0.05)
+                topk_anchors = torch.cat([topk_anchors_xy, anchor_wh_prior], dim=-1) # [bs, k, 4]
+                
+                # 5. 计算偏移量 (Logit Space)
+                # encoder_box_head 输出的是相对于锚点的偏移修正量
+                delta_box_logits = self.encoder_box_head(topK_fusion_feat)
+                
+                # 6. 核心公式：Box = Sigmoid( Delta + InverseSigmoid(Anchor) )
+                # 将锚点转换到 logit 域，加上偏移量，再转回 [0, 1] 域
+                anchor_logits = inverse_sigmoid(topk_anchors)
+                encoder_box = (delta_box_logits + anchor_logits).sigmoid() # [bs, k, 4]
+                
+                # ---------------- Relative Offset Prediction 修改结束 ----------------
+
+                hs, reference_boxes, dec_presence_out, dec_presence_feats = (
+                    self.detector.transformer.decoder(
+
+                        tgt=topK_fusion_feat.permute(1,0,2), # TopK fusion feat
+
+                        memory=out["encoder_hidden_states"],
+                        memory_key_padding_mask=encoder_out["padding_mask"],
+                        pos=encoder_out["pos_embed"],
+
+                        reference_boxes=encoder_box.permute(1,0,2).detach(),
+
+                        level_start_index=encoder_out["level_start_index"],
+                        spatial_shapes=encoder_out["spatial_shapes"],
+                        valid_ratios=encoder_out["valid_ratios"],
+                        tgt_mask=None,
+                        memory_text=prompt,
+                        text_attention_mask=prompt_mask,
+                        apply_dac=False,
+                    )
+                )
+
+            else:
+                query_embed = self.detector.transformer.decoder.query_embed.weight
+                query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+
+                hs, reference_boxes, dec_presence_out, dec_presence_feats = (
+                    self.detector.transformer.decoder(
+                        tgt=query_embed,
+                        memory=out["encoder_hidden_states"],
+                        memory_key_padding_mask=encoder_out["padding_mask"],
+                        pos=encoder_out["pos_embed"],
+                        reference_boxes=None,
+                        level_start_index=encoder_out["level_start_index"],
+                        spatial_shapes=encoder_out["spatial_shapes"],
+                        valid_ratios=encoder_out["valid_ratios"],
+                        tgt_mask=None,
+                        memory_text=prompt,
+                        text_attention_mask=prompt_mask,
+                        apply_dac=False,
+                    )
+                )
+            hs = hs.transpose(1, 2)  # seq-first to batch-first
+            reference_boxes = reference_boxes.transpose(1, 2)  # seq-first to batch-first
+            if dec_presence_out is not None:
+                # seq-first to batch-first
+                dec_presence_out = dec_presence_out.transpose(1, 2)
+
+            out["presence_feats"] = dec_presence_feats
+            self.detector._update_scores_and_boxes(
+                out,
+                hs,
+                reference_boxes,
+                prompt,
+                prompt_mask,
+                dec_presence_out=dec_presence_out,
             )
+
 
         # print("keys of out after decoder:", out.keys()) # (['encoder_hidden_states', 'prev_encoder_out', 'presence_feats', 'queries', 'presence_logit_dec', 'pred_logits', 'pred_boxes', 'pred_boxes_xyxy'])
         # Run segmentation heads
@@ -959,11 +1062,11 @@ class SAM3MC_o365(nn.Module):
                     losses.pop(k)
             
             if self.encoder_loss:
-                encoder_outputs = {'pred_logits': encoder_cls_logits, 'pred_masks': encoder_mask_logits}
+                encoder_outputs = {'pred_logits': encoder_cls_logits, 'pred_boxes': encoder_box}
                 encoder_losses = self.encoder_criterion(encoder_outputs, targets)
                 for k in list(encoder_losses.keys()):
                     # print("loss:", k, losses[k].item())
-                    if k in self.criterion.weight_dict:
+                    if k in self.encoder_criterion.weight_dict:
                         losses[k + '_encoder'] = encoder_losses[k] * self.encoder_criterion.weight_dict[k]
 
             return losses
@@ -1250,6 +1353,28 @@ def get_gt_labels_from_sem_seg(sem_seg):
     
     return gt_labels.cpu().numpy().tolist()
 
+def get_grid_reference_points(spatial_shapes, device):
+    """
+    根据特征图形状生成归一化的网格坐标。
+    spatial_shapes: tensor or list, shape (N_levels, 2) -> [(H, W), ...]
+    返回: (1, sum(H*W), 2)
+    """
+    reference_points_list = []
+    for lvl, (H, W) in enumerate(spatial_shapes):
+        H, W = int(H), int(W)
+        ref_y, ref_x = torch.meshgrid(
+            torch.linspace(0.5, H - 0.5, H, dtype=torch.float32, device=device),
+            torch.linspace(0.5, W - 0.5, W, dtype=torch.float32, device=device),
+            indexing='ij'
+        )
+        # 归一化到 [0, 1]
+        ref_y = ref_y.reshape(-1)[None] / H
+        ref_x = ref_x.reshape(-1)[None] / W
+        ref = torch.stack((ref_x, ref_y), -1)
+        reference_points_list.append(ref)
+    
+    reference_points = torch.cat(reference_points_list, 1) # (1, total_pixels, 2)
+    return reference_points
 
 def visualize_segmentation(
     pred_result, 
