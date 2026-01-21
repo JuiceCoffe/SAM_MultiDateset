@@ -225,6 +225,7 @@ class SAM3MC_o365(nn.Module):
         
         self.encoder_loss = cfg.MODEL.SAM3.ENCODER_LOSS or cfg.MODEL.SAM3.DYNAMIC_QUERY
         if self.encoder_loss:
+            self.num_encoder_query = cfg.MODEL.SAM3.NUM_ENCODER_QUERY
             encoder_losses = ["labels", "boxes",]
             encoder_weight_dict = {
                 "loss_focal": class_weight,  
@@ -801,7 +802,7 @@ class SAM3MC_o365(nn.Module):
             encoder_logits = aggregate_name_to_class_logits(encoder_logits, num_templates)
 
             encoder_score = encoder_logits.max(-1).values # [bs, HW]
-            k_selected = 200
+            k_selected = self.num_encoder_query
             topk_values, topk_indices = torch.topk(encoder_score, k_selected, dim=1) # [bs, k]
             topk_indices_unsqueezed = topk_indices.unsqueeze(-1).repeat(1, 1, fusion_feat.shape[-1])
             topK_fusion_feat = torch.gather(fusion_feat, 1, topk_indices_unsqueezed) # [bs, k, D]

@@ -26,6 +26,7 @@ def add_sam3_config(cfg):
     cfg.MODEL.SAM3.USE_GATE = False
     cfg.MODEL.SAM3.ENCODER_LOSS = False
     cfg.MODEL.SAM3.DYNAMIC_QUERY = False
+    cfg.MODEL.SAM3.NUM_ENCODER_QUERY = 200
 
     cfg.INPUT.DATASET_MAPPER_NAME = "mask_former_semantic"
     cfg.INPUT.IMAGE_SIZE = 1008
