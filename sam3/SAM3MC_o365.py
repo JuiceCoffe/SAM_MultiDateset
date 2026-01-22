@@ -876,7 +876,7 @@ class SAM3MC_o365(nn.Module):
                 hs, reference_boxes, dec_presence_out, dec_presence_feats = (
                     self.detector.transformer.decoder(
 
-                        tgt=topK_fusion_feat.permute(1,0,2), # TopK fusion feat
+                        tgt=topK_fusion_feat.permute(1,0,2).detach(), # TopK fusion feat
 
                         memory=out["encoder_hidden_states"],
                         memory_key_padding_mask=encoder_out["padding_mask"],
