@@ -116,8 +116,10 @@ class SAM3MC_o365(nn.Module):
         # 新增模块
         # -------------------------------------------------------
         self.use_pe_text = cfg.MODEL.SAM3.USE_PE_TEXT
+        
+        self.use_cos_sim = getattr(cfg.MODEL.SAM3, "COS_SIM", False) # 默认为 False
 
-        # 【新增】Query Projector 配置
+
         # 通过 cfg 控制是否启用，硬编码输入输出维度为 256
         self.use_query_proj = cfg.MODEL.SAM3.USE_QUERY_PROJ
         if self.use_query_proj:
@@ -134,21 +136,20 @@ class SAM3MC_o365(nn.Module):
 
         self.num_decoder_layers = 6 # SAM3/DETR 标准层数
         
-        # Bias 初始化
+
+        
         prior_prob = 0.01
         bias_value = -np.log((1 - prior_prob) / prior_prob)
         self.logit_bias = nn.ParameterList([
             nn.Parameter(torch.ones([]) * bias_value) 
             for _ in range(self.num_decoder_layers)
         ])
-
-        # Scale 初始化
-        # self.logit_scale = nn.Parameter(torch.ones([]) * init_value)
-        init_scale_value = np.log(1 / 0.07) # 这是一个经验值
-        self.logit_scale = nn.ParameterList([
-            nn.Parameter(torch.ones([]) * init_scale_value) 
-            for _ in range(self.num_decoder_layers)
-        ])
+        if self.use_cos_sim:
+            init_scale_value = np.log(1 / 0.07) # 这是一个经验值
+            self.logit_scale = nn.ParameterList([
+                nn.Parameter(torch.ones([]) * init_scale_value) 
+                for _ in range(self.num_decoder_layers)
+            ])
 
         self.num_cdt = cfg.MODEL.SAM3.NUM_CDT    
         self.use_cdt = False if cfg.MODEL.SAM3.NUM_CDT == 0 else True
@@ -249,10 +250,14 @@ class SAM3MC_o365(nn.Module):
                 oversample_ratio=cfg.SOLVER.OVERSAMPLE_RATIO,
                 importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
             )
+
+            
             prior_prob = 0.01
             bias_value = -np.log((1 - prior_prob) / prior_prob)
             self.encoder_logit_bias = nn.Parameter(torch.ones([]) * bias_value)
-            self.encoder_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+            if self.use_cos_sim:
+                self.encoder_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
 
         losses = ["labels", "masks", "boxes"]
@@ -788,16 +793,22 @@ class SAM3MC_o365(nn.Module):
 
         fusion_feat = encoder_out["encoder_hidden_states"] # H'*W', bs, D
         fusion_feat = fusion_feat.permute(1,0,2) # bs, H'*W', D
-        fusion_feat = F.normalize(fusion_feat, dim=-1)
+        if self.use_cos_sim:
+            fusion_feat = F.normalize(fusion_feat, dim=-1)
 
         if self.encoder_loss:
             if self.use_cdt:
                 encoder_logits = torch.einsum("bld,bcd->blc", fusion_feat, text_classifier)
             else:
                 encoder_logits = torch.einsum("bld,cd->blc", fusion_feat, text_classifier)
-            e_logit_scale = self.encoder_logit_scale.exp()
-            e_logit_scale = torch.clamp(e_logit_scale, max=100.0)
-            encoder_logits = encoder_logits * e_logit_scale + self.encoder_logit_bias
+            
+            if self.use_cos_sim:
+                e_logit_scale = self.encoder_logit_scale.exp()
+                e_logit_scale = torch.clamp(e_logit_scale, max=100.0)
+                encoder_logits = encoder_logits * e_logit_scale + self.encoder_logit_bias
+            else:
+                encoder_logits = encoder_logits / (fusion_feat.shape[-1] ** 0.5) + self.encoder_logit_bias
+
 
             encoder_logits = aggregate_name_to_class_logits(encoder_logits, num_templates)
 
@@ -1001,7 +1012,8 @@ class SAM3MC_o365(nn.Module):
                 if self.use_query_proj:
                     tp_queries = self.query_proj(tp_queries)
 
-                tp_queries = F.normalize(tp_queries, dim=-1, p=2)
+                if self.use_cos_sim:
+                    tp_queries = F.normalize(tp_queries, dim=-1, p=2)
 
                 if self.use_cdt:
                     query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, text_classifier) # bs, N, C
@@ -1009,11 +1021,13 @@ class SAM3MC_o365(nn.Module):
                     query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier) # bs, N, C
                 
 
-                cur_logit_scale = self.logit_scale[i].exp()
-                cur_logit_scale = torch.clamp(cur_logit_scale, max=100.0)
-                cur_logit_bias = self.logit_bias[i]
-                
-                query_names_results = cur_logit_scale * query_names_results + cur_logit_bias
+                if self.use_cos_sim:
+                    cur_logit_scale = self.logit_scale[i].exp()
+                    cur_logit_scale = torch.clamp(cur_logit_scale, max=100.0)
+                    cur_logit_bias = self.logit_bias[i]
+                    query_names_results = cur_logit_scale * query_names_results + cur_logit_bias
+                else:
+                    query_names_results = query_names_results + self.logit_bias[i]
 
                 query_cls_results= []
                 cur_idx = 0

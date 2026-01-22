@@ -28,6 +28,8 @@ def add_sam3_config(cfg):
     cfg.MODEL.SAM3.DYNAMIC_QUERY = False
     cfg.MODEL.SAM3.NUM_ENCODER_QUERY = 200
 
+    cfg.MODEL.SAM3.COS_SIM = True
+
     cfg.INPUT.DATASET_MAPPER_NAME = "mask_former_semantic"
     cfg.INPUT.IMAGE_SIZE = 1008
     cfg.INPUT.COLOR_AUG_SSD = False    

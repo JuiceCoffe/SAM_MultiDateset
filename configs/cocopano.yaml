@@ -13,8 +13,9 @@ MODEL:
     DYNAMIC_QUERY: True
     ENCODER_LOSS: True
     NUM_ENCODER_QUERY: 200
-  WEIGHTS: "/data/hmp/sam3.pt"
-  # WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
+    COS_SIM: False
+  # WEIGHTS: "/data/hmp/sam3.pt"
+  WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
   # WEIGHTS: /root/autodl-tmp/sam3.pt
 
 DATASETS:
@@ -81,6 +82,6 @@ TEST:
 # 修改输出目录名称以区分实验
 VERSION: 2
 
-# OUTPUT_DIR: ./out/test/
-OUTPUT_DIR: ./out/copa_detr2_detachQ
+OUTPUT_DIR: ./out/test/
+# OUTPUT_DIR: ./out/copa_detr2_detachQ
   
