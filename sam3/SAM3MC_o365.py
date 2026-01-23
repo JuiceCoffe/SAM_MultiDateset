@@ -173,6 +173,18 @@ class SAM3MC_o365(nn.Module):
 
 
         self.text_encoder_cache = {} 
+
+
+        self.Teacher = cfg.MODEL.TEACHER
+        self.Teacher_MaskPool = cfg.MODEL.TEACHER_MASKPOOL and self.Teacher is not None
+        if self.Teacher_MaskPool:
+            self.mask_pooling = MaskPooling()
+
+        if self.Teacher == "DINOv3TXT":
+            from .dinov3txt import DINOv3TXT
+            self.backbone2 = DINOv3TXT()
+            self.text_classifier2 = None
+        
         # -------------------------------------------------------
         # 训练配置
         # -------------------------------------------------------
@@ -477,6 +489,46 @@ class SAM3MC_o365(nn.Module):
         self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(metadata, self.train_metadata)
         self.test_text_classifier = None
         return
+
+    def get_teacher_text_classifier(self, dataname):
+        if self.training:
+            if self.train_dataname != dataname:
+                text_classifier = []
+                # this is needed to avoid oom, which may happen when num of class is large
+                bs = 128
+                # print("train_class_names len: ",len(self.train_class_names)) 4592
+                # print("train_class_names: ",self.train_class_names) 带模板的类别名
+                # exit()
+                for idx in range(0, len(self.train_class_names), bs):
+                    text_classifier.append(self.backbone2.get_text_classifier(self.train_class_names[idx:idx+bs], self.device).detach())
+                text_classifier = torch.cat(text_classifier, dim=0)
+
+                # average across templates and normalization.
+                text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
+                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.PROMPT), len(self.PROMPT), text_classifier.shape[-1]).mean(1)
+                text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
+                self.text_classifier2 = text_classifier
+                self.train_dataname = dataname
+
+            return self.text_classifier2, self.train_num_templates
+        else:
+            if self.test_dataname != dataname or self.text_classifier2 is None:
+                self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata)
+                text_classifier = []
+                bs = 128
+                print("Generating text classifier for", dataname, "with", len(self.test_class_names), "classes.")
+                for idx in range(0, len(self.test_class_names), bs):
+                    text_classifier.append(self.backbone2.get_text_classifier(self.test_class_names[idx:idx+bs], self.device).detach())
+                text_classifier = torch.cat(text_classifier, dim=0)
+                print("text_classifier shape before normalize:", text_classifier.shape)
+
+                text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
+                print("text_classifier shape before reshape:", text_classifier.shape)
+                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.PROMPT), len(self.PROMPT), text_classifier.shape[-1]).mean(1) 
+                text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
+                self.text_classifier2 = text_classifier
+                self.test_dataname = dataname
+            return self.text_classifier2, self.test_num_templates
 
     def get_text_classifier(self, dataname):
         if self.training:
@@ -1088,6 +1140,42 @@ class SAM3MC_o365(nn.Module):
         
         else:
 
+            if self.Teacher_MaskPool:
+                img_feat_for_pool = self.backbone2.extract_features(images.tensor)["clip_vis_dense"]
+                img_feat_for_pool = F.normalize(img_feat_for_pool, dim=-1, p=2)
+                text_classifier2, _ = self.get_teacher_text_classifier(meta['dataname'])
+
+                mask_for_pool = F.interpolate(queries_masks, size=img_feat_for_pool.shape[-2:], # 对预测掩码进行插值，将其尺寸调整到与 CLIP 特征图相同
+                                                    mode='bilinear', align_corners=False)
+                pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
+                
+                maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier2, pooled_img_feat) 
+                maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
+
+                mask_cls_logits = maskpool_cls_logits
+
+
+
+        # ====================== Oracle 逻辑 ====================== 
+            self.OracleSelect_on = False# 你可以从cfg配置中读取此开关
+
+            if self.OracleSelect_on:
+                # 临时构造 outputs 字典，用于传递给 oracle 函数
+                temp_outputs = {
+                    "pred_masks": outputs["pred_masks"],
+                    # pred_logits 仅用于获取形状，其内容不参与计算
+                    "pred_logits": query_cls_results_final 
+                }
+                
+                # 获取为每个 prediction 分配了最佳 GT 类别的 oracle logits
+                oracle_logits = self.get_oracle_logits_per_prediction(
+                    temp_outputs, 
+                    batched_inputs, 
+                    images
+                )
+                
+                # 直接用 oracle logits 替换模型原来的分类结果
+                query_cls_results_final = oracle_logits
         # =======================================================
         
             mask_cls_logits = query_cls_results_final # 保持 Logits 状态
@@ -1169,7 +1257,7 @@ class SAM3MC_o365(nn.Module):
                     #     gt_result=gt_result_square,           # 本身就是 Square
                     #     class_names=current_class_names + ['background'],
                     #     original_image_tensor=img_tensor_square, # 本身就是 Square
-                    #     save_path=f"./show_semantic/{batched_inputs[i]['file_name'].split('/')[-1].split('.')[0]}.png"
+                    #     save_path=f"./show_{self.Teacher}_semantic/{batched_inputs[i]['file_name'].split('/')[-1].split('.')[0]}.png"
                     # )
                     # # =========== 修改结束 ===========
 
@@ -1195,6 +1283,156 @@ class SAM3MC_o365(nn.Module):
             return results
 
 
+    @torch.no_grad()
+    def get_oracle_logits_per_prediction(self, outputs, batched_inputs, images):
+        """
+        为每一个预测(Prediction)找到最匹配的真值(Ground Truth)，并将GT的类别作为该预测的类别。
+        匹配仅基于 Mask 的相似度 (Dice Score)。
+
+        Args:
+            outputs (dict): 模型输出，包含 'pred_masks'。
+            batched_inputs (list[dict]): 模型输入，用于生成 GT。
+            images (ImageList): 处理后的图像张量，用于获取尺寸。
+
+        Returns:
+            torch.Tensor: "Oracle" Logits, 形状与原始 logits 相同。
+        """
+        # 1. 从 sem_seg 准备 Ground Truth Targets
+        # targets 是一个 list, 每个元素是一个 dict{'labels': [G], 'masks': [G, H, W_in]}
+        targets = self._prepare_targets_from_sem_seg(batched_inputs, images)
+
+        # 2. 准备 Predictions
+        # 将 mask logits 转换为概率 [B, Q, H_pred, W_pred]
+        pred_masks_prob = outputs["pred_masks"].sigmoid()
+        batch_size, num_queries, h_pred, w_pred = pred_masks_prob.shape # <-- 获取预测的 H, W
+
+        # 3. 初始化最终的 Oracle Logits
+        oracle_logits = torch.full_like(outputs["pred_logits"], -100.0)
+
+        # 4. 逐个图像进行处理
+        for i in range(batch_size):
+            gt_masks = targets[i]["masks"]      # [G, H_in, W_in]
+            gt_labels = targets[i]["labels"]    # [G]
+            pred_masks = pred_masks_prob[i]     # [Q, H_pred, W_pred]
+
+            num_gt = gt_masks.shape[0]
+            if num_gt == 0:
+                continue
+
+            # <<< FIX START >>>
+            # 将 GT mask 插值到与 Prediction mask 完全相同的分辨率
+            if gt_masks.shape[-2:] != (h_pred, w_pred):
+                gt_masks_resized = F.interpolate(
+                    gt_masks.unsqueeze(1),       # 添加 channel dim -> [G, 1, H_in, W_in]
+                    size=(h_pred, w_pred),       # 目标尺寸为预测尺寸
+                    mode="nearest"               # 对 mask 使用最近邻插值
+                ).squeeze(1)                     # 移除 channel dim -> [G, H_pred, W_pred]
+            else:
+                gt_masks_resized = gt_masks
+            # <<< FIX END >>>
+
+            # 5. 计算 Dice 相似度矩阵
+            pred_masks_flat = pred_masks.flatten(1)           # [Q, H_pred*W_pred]
+            gt_masks_flat = gt_masks_resized.flatten(1)       # [G, H_pred*W_pred] <- 使用resize后的GT
+
+            intersection = torch.einsum("qh,gh->qg", pred_masks_flat, gt_masks_flat)
+            pred_sum = pred_masks_flat.sum(dim=1)
+            gt_sum = gt_masks_flat.sum(dim=1)
+            
+            dice_scores = (2.0 * intersection) / (pred_sum[:, None] + gt_sum[None, :] + 1e-6)
+
+            # 6. 为每个 Prediction 找到最佳的 Ground Truth
+            best_gt_scores, best_gt_indices = dice_scores.max(dim=1)
+            
+            # 7. 获取对应的 GT 类别
+            assigned_labels = gt_labels[best_gt_indices]
+
+            # 8. 填充 Oracle Logits
+            query_indices = torch.arange(num_queries, device=self.device)
+            oracle_logits[i, query_indices, assigned_labels] = 100.0
+
+        return oracle_logits
+    
+    def _prepare_targets_from_sem_seg(self, batched_inputs, images):
+        """
+        从 sem_seg 生成用于 Matcher 的 targets (labels, masks, boxes)。
+        """
+        h_pad, w_pad = images.tensor.shape[-2:]
+        new_targets = []
+
+        for inp in batched_inputs:
+            if "sem_seg" not in inp:
+                # 如果没有 sem_seg，返回空 target
+                new_targets.append({
+                    "labels": torch.empty(0, dtype=torch.long, device=self.device),
+                    "masks": torch.empty(0, h_pad, w_pad, dtype=torch.bool, device=self.device),
+                    "boxes": torch.empty(0, 4, device=self.device),
+                })
+                continue
+
+            # 读取 sem_seg
+            sem_seg = inp["sem_seg"].to(self.device) # [H_orig, W_orig]
+            
+            # 这里的 sem_seg 可能是原始尺寸，需要注意 mask 的 padding 对应 model 的输入尺寸
+            # 通常 sem_seg_postprocess 是在后处理做的，但为了 matcher 计算 cost，我们需要把 GT mask 处理成和 pred mask (padded) 一致的尺寸
+            # 或者更简单的方式：我们利用 bitmasks 和 boxes 的归一化坐标，matcher 会处理尺寸问题
+            
+            # 获取唯一类别 (排除 255 ignored)
+            classes = torch.unique(sem_seg)
+            classes = classes[classes != 255]
+
+            if len(classes) == 0:
+                new_targets.append({
+                    "labels": torch.empty(0, dtype=torch.long, device=self.device),
+                    "masks": torch.empty(0, h_pad, w_pad, dtype=torch.bool, device=self.device),
+                    "boxes": torch.empty(0, 4, device=self.device),
+                })
+                continue
+
+            gt_masks = []
+            gt_labels = []
+
+            for c in classes:
+                # 生成 binary mask
+                m = (sem_seg == c).float() 
+                gt_masks.append(m)
+                gt_labels.append(c)
+            
+            gt_masks = torch.stack(gt_masks) # [N, H_orig, W_orig]
+            gt_labels = torch.stack(gt_labels).long() # [N]
+
+            # --- 坐标转换与 Padding ---
+            # 为了计算 Loss/Cost，我们需要把 mask 放到 padded 的画布上
+            # 这里简单处理：先将 mask Pad 到 images.tensor 的尺寸
+            padded_masks = torch.zeros((len(gt_masks), h_pad, w_pad), dtype=gt_masks.dtype, device=self.device)
+            # 注意：inp["image"] 经过 mapper 后可能已经 resize 过了，但 sem_seg 通常是原图
+            # 如果 eval 流程中 sem_seg 是原图尺寸，而 prediction 是 padding 后的尺寸，直接 copy 会错位。
+            # 为了严谨，这里需要 resize GT mask 到 input tensor 的尺寸。
+            # 但通常 Detectron2 的 sem_seg 是原图。
+            # 这里假设：为了简单起见，且通常 eval 是单张图，我们直接插值 GT mask 到 padded 尺寸
+            
+            # 使用 interpolate 调整尺寸
+            gt_masks_resized = F.interpolate(
+                gt_masks.unsqueeze(1), 
+                size=(h_pad, w_pad), 
+                mode="nearest"
+            ).squeeze(1)
+            
+            # 计算 Boxes (xyxy)
+            gt_boxes_xyxy = masks_to_boxes(gt_masks_resized)
+            
+            # 归一化 Boxes (cxcywh)
+            scale = torch.tensor([w_pad, h_pad, w_pad, h_pad], dtype=torch.float32, device=self.device)
+            gt_boxes_norm = gt_boxes_xyxy / scale
+            gt_boxes_cxcywh = box_xyxy_to_cxcywh(gt_boxes_norm)
+
+            new_targets.append({
+                "labels": gt_labels,
+                "masks": gt_masks_resized,
+                "boxes": gt_boxes_cxcywh
+            })
+
+        return new_targets
 
     def panoptic_inference(self, mask_cls, mask_pred, dataname):
         # mask_cls: [Q, K] (Logits)

@@ -30,6 +30,9 @@ def add_sam3_config(cfg):
 
     cfg.MODEL.SAM3.COS_SIM = True
 
+    cfg.MODEL.TEACHER = None
+    cfg.MODEL.TEACHER_MASKPOOL = False
+
     cfg.INPUT.DATASET_MAPPER_NAME = "mask_former_semantic"
     cfg.INPUT.IMAGE_SIZE = 1008
     cfg.INPUT.COLOR_AUG_SSD = False    
