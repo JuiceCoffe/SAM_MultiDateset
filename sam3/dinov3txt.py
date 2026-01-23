@@ -19,7 +19,7 @@ import tqdm
 from omegaconf import OmegaConf
 from torch import Tensor, nn
 
-DINOv3_REPO_DIR = "/data/hmp/dinov3" # Please add here the path to your DINOv3 repository
+DINOv3_REPO_DIR = "./dinov3" # Please add here the path to your DINOv3 repository
 import sys
 sys.path.append(DINOv3_REPO_DIR)
 from dinov3.hub.dinotxt import dinov3_vitl16_dinotxt_tet1280d20h24l
