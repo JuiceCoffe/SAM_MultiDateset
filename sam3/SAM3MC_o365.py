@@ -1152,7 +1152,7 @@ class SAM3MC_o365(nn.Module):
                 maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier2, pooled_img_feat) 
                 maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
 
-                mask_cls_logits = maskpool_cls_logits
+                query_cls_results_final = maskpool_cls_logits
 
 
 
