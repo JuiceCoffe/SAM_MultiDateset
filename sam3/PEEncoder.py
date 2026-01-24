@@ -14,11 +14,11 @@ class PEEncoder(Backbone):
     It is designed to be a drop-in replacement for the previous CLIP backbone
     for the MAFT_Plus architecture.
     """
-    def __init__(self, cfg, input_shape):
+    def __init__(self, cfg):
         super().__init__()
 
-        # model_name = "PE-Core-L14-336"
-        model_name = "PE-Core-G14-448"
+        model_name = "PE-Core-L14-336"
+        # model_name = "PE-Core-G14-448"
 
         if comm.get_local_rank() == 0:
             pe.CLIP.from_config(model_name, pretrained=True)

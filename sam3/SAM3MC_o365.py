@@ -180,10 +180,17 @@ class SAM3MC_o365(nn.Module):
         if self.Teacher_MaskPool:
             self.mask_pooling = MaskPooling()
 
+        
+        self.text_classifier2 = None
         if self.Teacher == "DINOv3TXT":
             from .dinov3txt import DINOv3TXT
             self.backbone2 = DINOv3TXT()
-            self.text_classifier2 = None
+        elif self.Teacher == "CONVCLIP":
+            from .clip import CLIP
+            self.backbone2 = CLIP(cfg)
+        elif self.Teacher == "PE":
+            from .PEEncoder import PEEncoder
+            self.backbone2 = PEEncoder(cfg, None)
         
         # -------------------------------------------------------
         # 训练配置
@@ -1141,18 +1148,50 @@ class SAM3MC_o365(nn.Module):
         else:
 
             if self.Teacher_MaskPool:
-                img_feat_for_pool = self.backbone2.extract_features(images.tensor)["clip_vis_dense"]
-                img_feat_for_pool = F.normalize(img_feat_for_pool, dim=-1, p=2)
+                # ==========================================
+                # 1. 图像域转换 (SAM3 -> DINOv3)
+                # ==========================================
+                
+                # A. 还原 SAM3 预处理 (Denormalize) -> 变回 [B, C, H, W] 的原始像素值
+                # 假设 images.tensor 是经过 (x - mean) / std 处理过的
+                # 恢复到 [0, 255] 范围 (注意: Detectron2 输入通常是 0-255)
+                imgs_bb2 = images.tensor * self.pixel_std + self.pixel_mean
+                
+                # C. 应用 ImageNet Normalization (DINOv3 要求)
+                # mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                # 需要手动广播计算，或者使用 torchvision.transforms.Normalize
+                if self.Teacher == "DINOv3TXT":                
+                    imgs_bb2 = imgs_bb2 / 255.0  # 转换到 [0, 1]
+                    mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
+                    std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
+                elif self.Teacher == "CONVCLIP":
+                    mean = torch.tensor([122.7709383, 116.7460125, 104.09373615], device=self.device).view(1, 3, 1, 1)
+                    std =  torch.tensor([68.5005327, 66.6321579, 70.32316305], device=self.device).view(1, 3, 1, 1)
+                imgs_bb2 = (imgs_bb2 - mean) / std
+                
+                # ==========================================
+                # 2. 提取特征
+                # ==========================================
+                # 你的 extract_features 内部已经包含了 resize 到 patch 倍数的逻辑 (encode_image)
+                img_feat_for_pool = self.backbone2.extract_features(imgs_bb2)["clip_vis_dense"]
+                if self.Teacher == "CONVCLIP":
+                    img_feat_for_pool = self.backbone2.visual_prediction_forward_convnext_2d(img_feat_for_pool)
+                img_feat_for_pool = F.normalize(img_feat_for_pool, dim=1, p=2)
                 text_classifier2, _ = self.get_teacher_text_classifier(meta['dataname'])
 
-                mask_for_pool = F.interpolate(queries_masks, size=img_feat_for_pool.shape[-2:], # 对预测掩码进行插值，将其尺寸调整到与 CLIP 特征图相同
+                mask_for_pool = F.interpolate(outputs["pred_masks"], size=img_feat_for_pool.shape[-2:],
                                                     mode='bilinear', align_corners=False)
                 pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
                 
                 maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier2, pooled_img_feat) 
+                maskpool_name_logits = maskpool_name_logits * torch.clamp(self.backbone2.clip_model.logit_scale.exp(), max=100)
                 maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
+                maskpool_cls_probs = maskpool_cls_logits.softmax(-1)
+                sam_probs = query_cls_results_final.sigmoid()
 
-                query_cls_results_final = maskpool_cls_logits
+                query_cls_results_final = query_cls_results_final.sigmoid() * maskpool_cls_probs
+                # query_cls_results_final = maskpool_cls_logits
+                query_cls_results_final = query_cls_results_final.log()
 
 
 
@@ -1213,53 +1252,49 @@ class SAM3MC_o365(nn.Module):
                     semseg = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_prob)
                     res["sem_seg"] = semseg
 
-                    # # =========== 修改开始：为可视化准备 Square 数据 ===========
+                    # =========== 修改开始：为可视化准备 Square 数据 ===========
                     
-                    # # 1. 获取当前输入 Tensor 的尺寸 (即正方形尺寸，例如 1024x1024)
-                    # # batched_inputs[i]["image"] 是经过 mapper 处理后的图
-                    # tensor_h, tensor_w = batched_inputs[i]["image"].shape[-2:]
+                    # 1. 获取当前输入 Tensor 的尺寸 (即正方形尺寸，例如 1024x1024)
+                    # batched_inputs[i]["image"] 是经过 mapper 处理后的图
+                    tensor_h, tensor_w = batched_inputs[i]["image"].shape[-2:]
                     
-                    # # 2. 将 Logits 插值到 Tensor 尺寸 (而不是原图尺寸)
-                    # # 注意：这里要用原始的 mask_pred_logits[i]，不要用已经 resize 过的 mask_pred_i
-                    # mask_pred_i_square = F.interpolate(
-                    #     mask_pred_logits[i].unsqueeze(0), 
-                    #     size=(tensor_h, tensor_w), 
-                    #     mode="bilinear", 
-                    #     align_corners=False
-                    # ).squeeze(0).sigmoid()
+                    # 2. 将 Logits 插值到 Tensor 尺寸 (而不是原图尺寸)
+                    # 注意：这里要用原始的 mask_pred_logits[i]，不要用已经 resize 过的 mask_pred_i
+                    mask_pred_i_square = F.interpolate(
+                        mask_pred_logits[i].unsqueeze(0), 
+                        size=(tensor_h, tensor_w), 
+                        mode="bilinear", 
+                        align_corners=False
+                    ).squeeze(0).sigmoid()
                     
-                    # # 3. 计算 Square 的语义分割结果
-                    # semseg_square = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_i_square)
-                    # pred_result_square = semseg_square.argmax(0).cpu()
+                    # 3. 计算 Square 的语义分割结果
+                    semseg_square = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_i_square)
+                    pred_result_square = semseg_square.argmax(0).cpu()
 
-                    # # 4. 准备 GT (它本身就是 Square 的，只要搬运到 CPU)
-                    # # 如果 mapper 对 GT 做了 padding，这里就是带 padding 的正方形
-                    # gt_result_square = batched_inputs[i]["sem_seg"].to(self.device)
+                    # 5. 准备 Image (它本身就是 Square 的)
+                    img_tensor_square = batched_inputs[i]["image"]
 
-                    # # 5. 准备 Image (它本身就是 Square 的)
-                    # img_tensor_square = batched_inputs[i]["image"]
-
-                    # # 6. 获取类别名称
-                    # current_dataname = batched_inputs[i]["meta"]["dataname"]
-                    # if current_dataname in self.test_metadata:
-                    #     meta = self.test_metadata[current_dataname]
-                    # else:
-                    #     meta = MetadataCatalog.get(current_dataname)
+                    # 6. 获取类别名称
+                    current_dataname = batched_inputs[i]["meta"]["dataname"]
+                    if current_dataname in self.test_metadata:
+                        meta = self.test_metadata[current_dataname]
+                    else:
+                        meta = MetadataCatalog.get(current_dataname)
                     
-                    # try:
-                    #     current_class_names = meta.stuff_classes
-                    # except:
-                    #     current_class_names = meta.thing_classes
+                    try:
+                        current_class_names = meta.stuff_classes
+                    except:
+                        current_class_names = meta.thing_classes
 
-                    # # 7. 绘图 (全部传入 Square 的数据)
+                    # 7. 绘图 (全部传入 Square 的数据)
                     # visualize_segmentation(
                     #     pred_result=pred_result_square,       # 修改点：传入 Square 预测
-                    #     gt_result=gt_result_square,           # 本身就是 Square
+                    #     gt_result= batched_inputs[i]["sem_seg"].to(self.device),           # 本身就是 Square
                     #     class_names=current_class_names + ['background'],
                     #     original_image_tensor=img_tensor_square, # 本身就是 Square
                     #     save_path=f"./show_{self.Teacher}_semantic/{batched_inputs[i]['file_name'].split('/')[-1].split('.')[0]}.png"
                     # )
-                    # # =========== 修改结束 ===========
+                    # =========== 修改结束 ===========
 
                 # --- B. 全景分割 (Panoptic Segmentation) ---
                 if self.panoptic_on:
