@@ -190,7 +190,7 @@ class SAM3MC_o365(nn.Module):
             self.backbone2 = CLIP(cfg)
         elif self.Teacher == "PE":
             from .PEEncoder import PEEncoder
-            self.backbone2 = PEEncoder(cfg, None)
+            self.backbone2 = PEEncoder(cfg)
         
         # -------------------------------------------------------
         # 训练配置
@@ -1167,6 +1167,10 @@ class SAM3MC_o365(nn.Module):
                 elif self.Teacher == "CONVCLIP":
                     mean = torch.tensor([122.7709383, 116.7460125, 104.09373615], device=self.device).view(1, 3, 1, 1)
                     std =  torch.tensor([68.5005327, 66.6321579, 70.32316305], device=self.device).view(1, 3, 1, 1)
+                elif self.Teacher == "PE":
+                    imgs_bb2 = imgs_bb2 / 255.0  # 转换到 [0, 1]
+                    mean = torch.tensor([0.5, 0.5, 0.5], device=self.device).view(1, 3, 1, 1)
+                    std = torch.tensor([0.5, 0.5, 0.5], device=self.device).view(1, 3, 1, 1)
                 imgs_bb2 = (imgs_bb2 - mean) / std
                 
                 # ==========================================
@@ -1189,8 +1193,8 @@ class SAM3MC_o365(nn.Module):
                 maskpool_cls_probs = maskpool_cls_logits.softmax(-1)
                 sam_probs = query_cls_results_final.sigmoid()
 
-                query_cls_results_final = query_cls_results_final.sigmoid() * maskpool_cls_probs
-                # query_cls_results_final = maskpool_cls_logits
+                # query_cls_results_final = query_cls_results_final.sigmoid() * maskpool_cls_probs
+                query_cls_results_final = maskpool_cls_probs
                 query_cls_results_final = query_cls_results_final.log()
 
 
