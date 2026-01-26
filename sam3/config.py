@@ -73,4 +73,4 @@ def add_sam3_config(cfg):
     cfg.DATALOADER.DATASET_ANN = ["box"]
     cfg.DATALOADER.MULTI_DATASET_GROUPING = True
 
-    cfg.DATASETS.ONLY_INSTANCE = True
+    cfg.DATASETS.ONLY_INSTANCE = False

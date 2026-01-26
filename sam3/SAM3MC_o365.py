@@ -41,6 +41,7 @@ from sam3.model.model_misc import (
 )
 
 from maft.utils.text_templetes import VILD_PROMPT
+from .dinov3txt import DINO_PROMPT_TEMPLATES
 
 
 from .loss.matcher import HungarianMatcher
@@ -441,7 +442,7 @@ class SAM3MC_o365(nn.Module):
             )
         return new_targets
 
-    def prepare_class_names_from_metadata(self, metadata, train_metadata):
+    def prepare_class_names_from_metadata(self, metadata, train_metadata, prompt_list):
         def split_labels(x):
             res = []
             for x_ in x:
@@ -478,9 +479,9 @@ class SAM3MC_o365(nn.Module):
         def fill_all_templates_ensemble(x_=''):
             res = []
             for x in x_:
-                for template in self.PROMPT:
+                for template in prompt_list:
                     res.append(template.format(x))
-            return res, len(res) // len(self.PROMPT)
+            return res, len(res) // len(prompt_list)
        
         num_templates = []
         templated_class_names = []
@@ -491,13 +492,13 @@ class SAM3MC_o365(nn.Module):
         class_names = templated_class_names
         return category_overlapping_mask, num_templates, class_names
 
-    def set_metadata(self, metadata):
-        self.test_metadata = metadata
-        self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(metadata, self.train_metadata)
-        self.test_text_classifier = None
-        return
+    # def set_metadata(self, metadata):
+    #     self.test_metadata = metadata
+    #     self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(metadata, self.train_metadata)
+    #     self.test_text_classifier = None
+    #     return
 
-    def get_teacher_text_classifier(self, dataname):
+    def get_teacher_text_classifier(self, dataname, prompt_teacher):
         if self.training:
             if self.train_dataname != dataname:
                 text_classifier = []
@@ -520,22 +521,23 @@ class SAM3MC_o365(nn.Module):
             return self.text_classifier2, self.train_num_templates
         else:
             if self.test_dataname != dataname or self.text_classifier2 is None:
-                self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata)
+                self.category_overlapping_mask_teacher, self.test_num_templates_teacher, self.test_class_names_teacher = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata, prompt_teacher)
                 text_classifier = []
                 bs = 128
                 print("Generating text classifier for", dataname, "with", len(self.test_class_names), "classes.")
-                for idx in range(0, len(self.test_class_names), bs):
-                    text_classifier.append(self.backbone2.get_text_classifier(self.test_class_names[idx:idx+bs], self.device).detach())
+                for idx in range(0, len(self.test_class_names_teacher), bs):
+                    text_classifier.append(self.backbone2.get_text_classifier(self.test_class_names_teacher[idx:idx+bs], self.device).detach())
                 text_classifier = torch.cat(text_classifier, dim=0)
                 print("text_classifier shape before normalize:", text_classifier.shape)
 
                 text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
                 print("text_classifier shape before reshape:", text_classifier.shape)
-                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.PROMPT), len(self.PROMPT), text_classifier.shape[-1]).mean(1) 
+                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(prompt_teacher), len(prompt_teacher), text_classifier.shape[-1]).mean(1) 
                 text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
                 self.text_classifier2 = text_classifier
                 self.test_dataname = dataname
-            return self.text_classifier2, self.test_num_templates
+            return self.text_classifier2, self.test_num_templates_teacher
+
 
     def get_text_classifier(self, dataname):
         if self.training:
@@ -563,7 +565,7 @@ class SAM3MC_o365(nn.Module):
                     # 【注意】这里不要用 self.train_num_templates[dataname]，因为它不是字典
                     # 直接覆盖 self.train_num_templates 为当前数据集的 List
                     _, self.train_num_templates, self.train_class_names = self.prepare_class_names_from_metadata(
-                        current_metadata, current_metadata
+                        current_metadata, current_metadata, self.PROMPT
                     )
                     # ============== 关键修改结束 ==============
 
@@ -669,7 +671,7 @@ class SAM3MC_o365(nn.Module):
             return self.train_text_classifier.clone(), self.train_num_templates
         else:
             if self.test_dataname != dataname:
-                self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata)
+                self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata, self.PROMPT)
                 text_classifier = []
                 text_feat = []
                 language_mask = []
@@ -1181,7 +1183,7 @@ class SAM3MC_o365(nn.Module):
                 if self.Teacher == "CONVCLIP":
                     img_feat_for_pool = self.backbone2.visual_prediction_forward_convnext_2d(img_feat_for_pool)
                 img_feat_for_pool = F.normalize(img_feat_for_pool, dim=1, p=2)
-                text_classifier2, _ = self.get_teacher_text_classifier(meta['dataname'])
+                text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], DINO_PROMPT_TEMPLATES)
 
                 mask_for_pool = F.interpolate(outputs["pred_masks"], size=img_feat_for_pool.shape[-2:],
                                                     mode='bilinear', align_corners=False)
@@ -1189,13 +1191,18 @@ class SAM3MC_o365(nn.Module):
                 
                 maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier2, pooled_img_feat) 
                 maskpool_name_logits = maskpool_name_logits * torch.clamp(self.backbone2.clip_model.logit_scale.exp(), max=100)
-                maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
+                maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates_teacher)
                 maskpool_cls_probs = maskpool_cls_logits.softmax(-1)
                 sam_probs = query_cls_results_final.sigmoid()
 
-                # query_cls_results_final = query_cls_results_final.sigmoid() * maskpool_cls_probs
                 query_cls_results_final = maskpool_cls_probs
+                query_cls_results_final = sam_probs * query_cls_results_final
+                
+                keep = query_cls_results_final > 0.0
+                query_cls_results_final = query_cls_results_final * keep
+                
                 query_cls_results_final = query_cls_results_final.log()
+
 
 
 
@@ -1246,7 +1253,6 @@ class SAM3MC_o365(nn.Module):
                 ).squeeze(0)
 
                 res = {}
-                # dataname = batched_inputs[i]["meta"]["dataname"]
 
                 # --- A. 语义分割 (Semantic Segmentation) ---
                 if self.semantic_on:
@@ -1291,14 +1297,18 @@ class SAM3MC_o365(nn.Module):
                         current_class_names = meta.thing_classes
 
                     # 7. 绘图 (全部传入 Square 的数据)
-                    # visualize_segmentation(
-                    #     pred_result=pred_result_square,       # 修改点：传入 Square 预测
-                    #     gt_result= batched_inputs[i]["sem_seg"].to(self.device),           # 本身就是 Square
-                    #     class_names=current_class_names + ['background'],
-                    #     original_image_tensor=img_tensor_square, # 本身就是 Square
-                    #     save_path=f"./show_{self.Teacher}_semantic/{batched_inputs[i]['file_name'].split('/')[-1].split('.')[0]}.png"
-                    # )
-                    # =========== 修改结束 ===========
+                    visualize_semantic = False
+                    # visualize_semantic = True
+
+                    if visualize_semantic:
+                        visualize_segmentation(
+                            pred_result=pred_result_square,       # 修改点：传入 Square 预测
+                            gt_result= batched_inputs[i]["sem_seg"].to(self.device),           # 本身就是 Square
+                            class_names=current_class_names + ['background'],
+                            original_image_tensor=img_tensor_square, # 本身就是 Square
+                            save_path=f"./show_{self.Teacher}_semantic/{batched_inputs[i]['file_name'].split('/')[-1].split('.')[0]}.png"
+                        )
+                #     # =========== 修改结束 ===========
 
                 # --- B. 全景分割 (Panoptic Segmentation) ---
                 if self.panoptic_on:
