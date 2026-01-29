@@ -28,10 +28,14 @@ def add_sam3_config(cfg):
     cfg.MODEL.SAM3.DYNAMIC_QUERY = False
     cfg.MODEL.SAM3.NUM_ENCODER_QUERY = 200
 
+    cfg.MODEL.SAM3.NEW_SCORE_HEAD = False
+
     cfg.MODEL.SAM3.COS_SIM = True
 
     cfg.MODEL.TEACHER = None
     cfg.MODEL.TEACHER_MASKPOOL = False
+
+    cfg.MODEL.USE_MASKADAPTER = False
 
     cfg.INPUT.DATASET_MAPPER_NAME = "mask_former_semantic"
     cfg.INPUT.IMAGE_SIZE = 1008
@@ -49,12 +53,14 @@ def add_sam3_config(cfg):
     # optimizer
     cfg.SOLVER.OPTIMIZER = "ADAMW"
     cfg.SOLVER.BACKBONE_MULTIPLIER = 0.0
-    cfg.SOLVER.NO_OBJECT_WEIGHT = 0.1
+
+    cfg.SOLVER.OBJECT_WEIGHT = 2.0
     cfg.SOLVER.CLASS_WEIGHT = 2.0
     cfg.SOLVER.MASK_WEIGHT = 5.0
     cfg.SOLVER.DICE_WEIGHT = 5.0
     cfg.SOLVER.BBOX_WEIGHT = 5.0
     cfg.SOLVER.GIOU_WEIGHT = 2.0
+    
     cfg.SOLVER.TRAIN_NUM_POINTS = 12544
     cfg.SOLVER.OVERSAMPLE_RATIO = 3.0
     cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO = 0.75

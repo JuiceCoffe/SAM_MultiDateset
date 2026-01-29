@@ -44,7 +44,7 @@ class DotProductScoring(torch.nn.Module):
         clamp_max_val=12.0,
     ):
         super().__init__()
-        self.d_proj = d_proj
+        self.d_proj = d_proj # 256
         assert isinstance(prompt_mlp, torch.nn.Module) or prompt_mlp is None
         self.prompt_mlp = prompt_mlp  # an optional MLP projection for prompt
         self.prompt_proj = torch.nn.Linear(d_model, d_proj)
