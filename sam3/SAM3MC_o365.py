@@ -181,6 +181,20 @@ class SAM3MC_o365(nn.Module):
         if self.Teacher_MaskPool:
             self.mask_pooling = MaskPooling()
 
+        self.use_MaskAdapter = cfg.MODEL.USE_MASKADAPTER
+        if self.use_MaskAdapter:
+            from .mask_adapter_head import load_mask_adapter_standalone
+            self.mask_adapter = load_mask_adapter_standalone(
+                weight_path="/data/hmp/MaskAdapter/adapter_stage1.pth",
+                clip_model_name="fcclip_convnext_large", # 只要包含 '_large' 即可
+                num_channels=768,              
+                num_output_maps=16,           
+                mask_in_chans=16,           
+                use_checkpoint=False         
+            )
+            self.mask_adapter.eval()
+            self.num_output_maps = 16
+
         
         self.text_classifier2 = None
         if self.Teacher == "DINOv3TXT":
@@ -1150,18 +1164,9 @@ class SAM3MC_o365(nn.Module):
         else:
 
             if self.Teacher_MaskPool:
-                # ==========================================
-                # 1. 图像域转换 (SAM3 -> DINOv3)
-                # ==========================================
-                
-                # A. 还原 SAM3 预处理 (Denormalize) -> 变回 [B, C, H, W] 的原始像素值
-                # 假设 images.tensor 是经过 (x - mean) / std 处理过的
-                # 恢复到 [0, 255] 范围 (注意: Detectron2 输入通常是 0-255)
                 imgs_bb2 = images.tensor * self.pixel_std + self.pixel_mean
-                
-                # C. 应用 ImageNet Normalization (DINOv3 要求)
-                # mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-                # 需要手动广播计算，或者使用 torchvision.transforms.Normalize
+                mean = None
+                std = None
                 if self.Teacher == "DINOv3TXT":                
                     imgs_bb2 = imgs_bb2 / 255.0  # 转换到 [0, 1]
                     mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
@@ -1173,35 +1178,73 @@ class SAM3MC_o365(nn.Module):
                     imgs_bb2 = imgs_bb2 / 255.0  # 转换到 [0, 1]
                     mean = torch.tensor([0.5, 0.5, 0.5], device=self.device).view(1, 3, 1, 1)
                     std = torch.tensor([0.5, 0.5, 0.5], device=self.device).view(1, 3, 1, 1)
-                imgs_bb2 = (imgs_bb2 - mean) / std
+                
+                if mean is not None and std is not None:
+                    imgs_bb2 = (imgs_bb2 - mean) / std
                 
                 # ==========================================
                 # 2. 提取特征
                 # ==========================================
                 # 你的 extract_features 内部已经包含了 resize 到 patch 倍数的逻辑 (encode_image)
-                img_feat_for_pool = self.backbone2.extract_features(imgs_bb2)["clip_vis_dense"]
+                clip_feature = self.backbone2.extract_features(imgs_bb2)["clip_vis_dense"]
                 if self.Teacher == "CONVCLIP":
-                    img_feat_for_pool = self.backbone2.visual_prediction_forward_convnext_2d(img_feat_for_pool)
-                img_feat_for_pool = F.normalize(img_feat_for_pool, dim=1, p=2)
+                    clip_vis_dense = self.backbone2.visual_prediction_forward_convnext_2d(clip_feature)
+                
                 text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], DINO_PROMPT_TEMPLATES)
 
-                mask_for_pool = F.interpolate(outputs["pred_masks"], size=img_feat_for_pool.shape[-2:],
-                                                    mode='bilinear', align_corners=False)
-                pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
+                if self.use_MaskAdapter:
+                    binary_masks = outputs["pred_masks"] > 0
+                    maps_for_pooling = self.mask_adapter(clip_vis_dense, binary_masks)
+                    maps_for_pooling = F.interpolate(maps_for_pooling, size=clip_vis_dense.shape[-2:],
+                                                mode='bilinear', align_corners=False)
+                    N_maps = maps_for_pooling.size(1)
+                    num_instances = N_maps // self.num_output_maps
+                    maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N_maps,-1), dim=-1)
+                    pooled_clip_feature = torch.bmm(maps_for_pooling, clip_feature.view(bs, clip_feature.size(1), -1).permute(0, 2, 1))
+                    pooled_clip_feature = self.backbone2.visual_prediction_forward(pooled_clip_feature)
+                    pooled_clip_feature = (pooled_clip_feature.reshape(bs,num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
+                    pooled_img_feat = F.normalize(pooled_clip_feature, dim=1, p=2)
+                else:
+                    img_feat_for_pool = F.normalize(clip_vis_dense, dim=1, p=2)
+                    mask_for_pool = F.interpolate(outputs["pred_masks"], size=img_feat_for_pool.shape[-2:],
+                                                        mode='bilinear', align_corners=False)
+                    pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
                 
                 maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier2, pooled_img_feat) 
-                maskpool_name_logits = maskpool_name_logits * torch.clamp(self.backbone2.clip_model.logit_scale.exp(), max=100)
-                maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates_teacher)
-                maskpool_cls_probs = maskpool_cls_logits.softmax(-1)
-                sam_probs = query_cls_results_final.sigmoid()
 
-                query_cls_results_final = maskpool_cls_probs
-                query_cls_results_final = sam_probs * query_cls_results_final
+                maskpool_name_logits = maskpool_name_logits * torch.clamp(self.backbone2.clip_model.logit_scale.exp(), max=100)
                 
-                keep = query_cls_results_final > 0.0
-                query_cls_results_final = query_cls_results_final * keep
+                maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates_teacher)
+                out_vocab_cls_probs = F.softmax(maskpool_cls_logits, dim=-1)
+
+                in_vocab_cls_probs = query_cls_results_final.sigmoid()
+                category_overlapping_mask = self.category_overlapping_mask.to(self.device)
+                alpha = 1.0
+                beta = 1.0
+                # 为了数值稳定性，加一个小 epsilon
+                eps = 1e-7 
+
+                # 计算 Seen 类的加权几何平均概率
+                probs_seen = (
+                    (in_vocab_cls_probs + eps) ** (1 - alpha) * 
+                    (out_vocab_cls_probs + eps) #** alpha
+                )
                 
-                query_cls_results_final = query_cls_results_final.log()
+                # 计算 Unseen 类的加权几何平均概率
+                probs_unseen = (
+                    (in_vocab_cls_probs + eps) ** (1 - beta) * 
+                    (out_vocab_cls_probs + eps) #** beta
+                )
+
+                # 组合概率 (注意这里不是加 log，而是选通概率)
+                final_probs = (
+                    probs_seen * category_overlapping_mask + 
+                    probs_unseen * (1 - category_overlapping_mask)
+                )
+                
+                # 钳位数值防止 logit 计算出现 inf/-inf
+                final_probs = torch.clamp(final_probs, min=eps, max=1-eps)
+                query_cls_results_final = torch.logit(final_probs)
 
 
 
