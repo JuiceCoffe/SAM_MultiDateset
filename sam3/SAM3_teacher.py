@@ -42,6 +42,7 @@ from sam3.model.model_misc import (
 
 from maft.utils.text_templetes import VILD_PROMPT
 from .dinov3txt import DINO_PROMPT_TEMPLATES
+SIMPLE_TEMPLATES = ["{}"]
 
 
 from .loss.matcher import HungarianMatcher
@@ -56,6 +57,51 @@ import random
 
 import math
 
+def init_score_head(mlp_module, prior_prob=0.01):
+    # 1. 遍历 MLP 的所有层
+    for i, layer in enumerate(mlp_module.layers):
+        if isinstance(layer, nn.Linear):
+            # 对于隐藏层，使用 Kaiming 初始化（因为你用了 ReLU）
+            if i < len(mlp_module.layers) - 1:
+                nn.init.kaiming_normal_(layer.weight, a=0, mode='fan_out', nonlinearity='relu')
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0)
+            else:
+                # 2. 关键点：对最后一层（输出层）进行特殊处理
+                # 将权重初始化为非常小的值，让 bias 起主导作用
+                nn.init.normal_(layer.weight, std=0.01)
+                
+                # 设置先验偏置
+                bias_value = -math.log((1 - prior_prob) / prior_prob)
+                nn.init.constant_(layer.bias, bias_value)
+
+def init_query_proj(mlp_module):
+    """
+    针对 Open-Vocabulary 适配器的初始化策略：
+    1. 隐藏层使用 Kaiming 初始化，配合 ReLU。
+    2. 最后一层（输出层）使用极小值初始化。
+    3. 配合 Residual=True，使得 MLP 在初始阶段输出接近 x + 0，即保留 SAM3 原始特征。
+    """
+    for i, layer in enumerate(mlp_module.layers):
+        if isinstance(layer, nn.Linear):
+            # 判断是否为隐藏层 (i < num_layers - 1)
+            if i < mlp_module.num_layers - 1:
+                # 隐藏层使用 Kaiming Normal，因为后面接了 ReLU
+                nn.init.kaiming_normal_(layer.weight, a=0, mode='fan_out', nonlinearity='relu')
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0)
+            else:
+                # 最后一层（输出层）：非常关键
+                # 将权重初始化为极小分布（或全0），使得初始状态下 MLP 的增量几乎为 0
+                # 这样：Output = x (原始特征) + MLP(x) (几乎为0) ≈ x
+                nn.init.normal_(layer.weight, std=0.0001)
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0)
+
+    # 如果存在 LayerNorm，初始化为标准状态
+    if hasattr(mlp_module, "out_norm") and isinstance(mlp_module.out_norm, nn.LayerNorm):
+        nn.init.constant_(mlp_module.out_norm.weight, 1.0)
+        nn.init.constant_(mlp_module.out_norm.bias, 0)
 
 @META_ARCH_REGISTRY.register()
 class SAM3MC_o365(nn.Module):
@@ -116,6 +162,11 @@ class SAM3MC_o365(nn.Module):
         # -------------------------------------------------------
         # 新增模块
         # -------------------------------------------------------
+        self.new_score_head = cfg.MODEL.SAM3.NEW_SCORE_HEAD
+        if self.new_score_head:
+            self.score_head = MLP(256, 256, 1, 3)
+            init_score_head(self.score_head)
+
         self.use_pe_text = cfg.MODEL.SAM3.USE_PE_TEXT
         
         self.use_cos_sim = getattr(cfg.MODEL.SAM3, "COS_SIM", False) # 默认为 False
@@ -127,24 +178,32 @@ class SAM3MC_o365(nn.Module):
             if self.use_pe_text:
                 self.query_proj = nn.Linear(256, 1024, bias=False)
             else:
-                self.query_proj = nn.Linear(256, 256, bias=False)
-            # 【关键】初始化策略：建议初始化为 Identity (单位矩阵)
-            # 这样在训练开始时，特征保持原样，随着训练进行逐渐学习对齐，比随机初始化更稳
-            nn.init.eye_(self.query_proj.weight)
+                self.query_proj = MLP(
+                    input_dim=256,
+                    hidden_dim=2048,
+                    output_dim=256,
+                    num_layers=2,
+                    dropout=0.1,
+                    residual=True,
+                    out_norm=nn.LayerNorm(256),
+                )
+                init_query_proj(self.query_proj)
         else:
             self.query_proj = None
 
 
         self.num_decoder_layers = 6 # SAM3/DETR 标准层数
         
+        self.logit_bias = None
 
-        
-        prior_prob = 0.01
-        bias_value = -np.log((1 - prior_prob) / prior_prob)
-        self.logit_bias = nn.ParameterList([
-            nn.Parameter(torch.ones([]) * bias_value) 
-            for _ in range(self.num_decoder_layers)
-        ])
+        if not self.new_score_head:
+            prior_prob = 0.01
+            bias_value = -np.log((1 - prior_prob) / prior_prob)
+            self.logit_bias = nn.ParameterList([
+                nn.Parameter(torch.ones([]) * bias_value) 
+                for _ in range(self.num_decoder_layers)
+            ])
+
         if self.use_cos_sim:
             init_scale_value = np.log(1 / 0.07) # 这是一个经验值
             self.logit_scale = nn.ParameterList([
@@ -185,7 +244,7 @@ class SAM3MC_o365(nn.Module):
         if self.use_MaskAdapter:
             from .mask_adapter_head import load_mask_adapter_standalone
             self.mask_adapter = load_mask_adapter_standalone(
-                weight_path="/data/hmp/MaskAdapter/adapter_stage1.pth",
+                weight_path="/data/hmp/MaskAdapterWeight/adapter_stage1.pth",
                 clip_model_name="fcclip_convnext_large", # 只要包含 '_large' 即可
                 num_channels=768,              
                 num_output_maps=16,           
@@ -205,7 +264,11 @@ class SAM3MC_o365(nn.Module):
             self.backbone2 = CLIP(cfg)
         elif self.Teacher == "PE":
             from .PEEncoder import PEEncoder
-            self.backbone2 = PEEncoder(cfg)        
+            self.backbone2 = PEEncoder(cfg)
+        elif self.Teacher == "SigLIP2":
+            from .SigLIP2 import SigLIP2Backbone
+            self.backbone2 = SigLIP2Backbone()
+        
         # -------------------------------------------------------
         # 训练配置
         # -------------------------------------------------------
@@ -241,15 +304,22 @@ class SAM3MC_o365(nn.Module):
         bbox_weight = cfg.SOLVER.BBOX_WEIGHT
         giou_weight = cfg.SOLVER.GIOU_WEIGHT
 
+        objectness_weight = cfg.SOLVER.OBJECT_WEIGHT
+
 
         weight_dict = {}
         criterion_weight_dict = {
-            "loss_focal": class_weight, 
             "loss_mask": mask_weight, 
             "loss_dice": dice_weight,
             'loss_bbox':bbox_weight, 
             'loss_giou':giou_weight
         }
+        if self.new_score_head:
+            criterion_weight_dict["loss_objectness"] = objectness_weight
+            criterion_weight_dict["loss_focal"] = class_weight
+        else:
+            criterion_weight_dict["loss_focal"] = class_weight
+
         weight_dict.update(criterion_weight_dict)
 
         if self.use_aux:
@@ -776,8 +846,7 @@ class SAM3MC_o365(nn.Module):
             img_feat = backbone_out_vision["vision_features"].detach() # bs, D, H', W'
             backbone_fpn = backbone_out_vision["backbone_fpn"]
             for k in range(len(backbone_fpn)):
-                backbone_fpn[k] = backbone_fpn[k].detach()
-
+                backbone_fpn[k] = backbone_fpn[k].detach() # 72, 144, 288
 
             # 语言特征
             # text_classifier:[num_names, dim] 
@@ -1077,11 +1146,17 @@ class SAM3MC_o365(nn.Module):
         use_aux = self.use_aux and self.training
         aux_outputs = []
 
+        obj_logits = None
+        if self.new_score_head:
+            obj_logits = self.score_head(queries).squeeze(-1)
+
         for i in range(6):
             assert queries.shape[0] == 6
             assert queries.shape[2] == N
             if use_aux or i == 5 :
                 tp_queries = queries[i,:,:,:].clone() 
+
+                cur_obj_logits = obj_logits[i] if obj_logits is not None else None
 
                 if self.use_query_proj:
                     tp_queries = self.query_proj(tp_queries)
@@ -1098,9 +1173,9 @@ class SAM3MC_o365(nn.Module):
                 if self.use_cos_sim:
                     cur_logit_scale = self.logit_scale[i].exp()
                     cur_logit_scale = torch.clamp(cur_logit_scale, max=100.0)
-                    cur_logit_bias = self.logit_bias[i]
-                    query_names_results = cur_logit_scale * query_names_results + cur_logit_bias
-                else:
+                    query_names_results = cur_logit_scale * query_names_results
+
+                if self.logit_bias is not None:
                     query_names_results = query_names_results + self.logit_bias[i]
 
                 query_cls_results= []
@@ -1113,15 +1188,19 @@ class SAM3MC_o365(nn.Module):
                     
 
                 if i<5:
-                    aux_outputs.append({
+                    aux_out = {
                         'pred_logits': query_cls_results, 
                         'pred_masks': outputs['aux_outputs'][i]["pred_masks"], 
                         'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'],
                         'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"],
-                    })
+                    }
+                    if cur_obj_logits is not None:
+                        aux_out['pred_objectness_logits'] = cur_obj_logits
+                    
+                    aux_outputs.append(aux_out)
                 else:
                     query_cls_results_final = query_cls_results
-
+                    obj_logits_final = cur_obj_logits
 
 
         if self.training:
@@ -1139,6 +1218,8 @@ class SAM3MC_o365(nn.Module):
                 'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
                 'aux_outputs': aux_outputs if use_aux is True else None,
             }
+            if obj_logits_final is not None:
+                criterion_pred['pred_objectness_logits'] = obj_logits_final
 
             losses = self.criterion(criterion_pred, targets)
 
@@ -1163,7 +1244,15 @@ class SAM3MC_o365(nn.Module):
         else:
 
             if self.Teacher_MaskPool:
+                # ==========================================
+                # 1. 图像域转换 (SAM3 -> DINOv3)
+                # ==========================================
+
                 imgs_bb2 = images.tensor * self.pixel_std + self.pixel_mean
+                h_orig = batched_inputs[0]["height"]
+                w_orig = batched_inputs[0]["width"]
+                aligned_masks = None
+
                 mean = None
                 std = None
                 if self.Teacher == "DINOv3TXT":                
@@ -1173,6 +1262,16 @@ class SAM3MC_o365(nn.Module):
                 elif self.Teacher == "CONVCLIP":
                     mean = torch.tensor([122.7709383, 116.7460125, 104.09373615], device=self.device).view(1, 3, 1, 1)
                     std =  torch.tensor([68.5005327, 66.6321579, 70.32316305], device=self.device).view(1, 3, 1, 1)
+                    target_l = 896
+                    if h_orig > w_orig:
+                        new_h, new_w = target_l, int(target_l * w_orig / h_orig + 0.5)
+                    else:
+                        new_h, new_w = int(target_l * h_orig / w_orig + 0.5), target_l
+
+                    imgs_bb2 = F.interpolate(imgs_bb2, size=(new_h, new_w), mode='bilinear', align_corners=False)
+
+                    aligned_masks = F.interpolate(outputs["pred_masks"], size=(new_h//4, new_w//4), mode='bilinear', align_corners=False)
+
                 elif self.Teacher == "PE":
                     imgs_bb2 = imgs_bb2 / 255.0  # 转换到 [0, 1]
                     mean = torch.tensor([0.5, 0.5, 0.5], device=self.device).view(1, 3, 1, 1)
@@ -1189,10 +1288,13 @@ class SAM3MC_o365(nn.Module):
                 if self.Teacher == "CONVCLIP":
                     clip_vis_dense = self.backbone2.visual_prediction_forward_convnext_2d(clip_feature)
                 
-                text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], DINO_PROMPT_TEMPLATES)
+                text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], VILD_PROMPT)
 
                 if self.use_MaskAdapter:
-                    binary_masks = outputs["pred_masks"] > 0
+                    if aligned_masks is not None:
+                        binary_masks = aligned_masks > 0
+                    else:
+                        binary_masks = outputs["pred_masks"] > 0
                     maps_for_pooling = self.mask_adapter(clip_vis_dense, binary_masks)
                     maps_for_pooling = F.interpolate(maps_for_pooling, size=clip_vis_dense.shape[-2:],
                                                 mode='bilinear', align_corners=False)
@@ -1213,30 +1315,33 @@ class SAM3MC_o365(nn.Module):
 
                 
                 maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier2, pooled_img_feat) 
+                if self.Teacher == "SigLIP2":
+                    maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates_teacher)
+                    out_vocab_cls_probs =  torch.sigmoid(maskpool_cls_logits)
+                else:
+                    maskpool_name_logits = maskpool_name_logits * torch.clamp(self.backbone2.clip_model.logit_scale.exp(), max=100)
+                    
+                    maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates_teacher)
+                    out_vocab_cls_probs = F.softmax(maskpool_cls_logits, dim=-1)
 
-                maskpool_name_logits = maskpool_name_logits * torch.clamp(self.backbone2.clip_model.logit_scale.exp(), max=100)
-                
-                maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates_teacher)
-                                
-                out_vocab_cls_probs = F.softmax(maskpool_cls_logits, dim=-1)
 
-                in_vocab_cls_probs = query_cls_results_final.sigmoid()
+                in_vocab_cls_probs = query_cls_results_final.softmax(dim=-1)
                 category_overlapping_mask = self.category_overlapping_mask.to(self.device)
-                alpha = 0.5
-                beta = 0.8
+                alpha = 1.0
+                beta = 1.0
                 # 为了数值稳定性，加一个小 epsilon
                 eps = 1e-7 
 
                 # 计算 Seen 类的加权几何平均概率
                 probs_seen = (
                     (in_vocab_cls_probs + eps) ** (1 - alpha) * 
-                    (out_vocab_cls_probs + eps) #** alpha
+                    (out_vocab_cls_probs + eps) ** alpha
                 )
                 
                 # 计算 Unseen 类的加权几何平均概率
                 probs_unseen = (
                     (in_vocab_cls_probs + eps) ** (1 - beta) * 
-                    (out_vocab_cls_probs + eps) #** beta
+                    (out_vocab_cls_probs + eps) ** beta
                 )
 
                 # 组合概率 (注意这里不是加 log，而是选通概率)
@@ -1253,7 +1358,7 @@ class SAM3MC_o365(nn.Module):
 
 
         # ====================== Oracle 逻辑 ====================== 
-            self.OracleSelect_on = False# 你可以从cfg配置中读取此开关
+            self.OracleSelect_on = False
 
             if self.OracleSelect_on:
                 # 临时构造 outputs 字典，用于传递给 oracle 函数
@@ -1274,9 +1379,16 @@ class SAM3MC_o365(nn.Module):
                 query_cls_results_final = oracle_logits
         # =======================================================
         
-            mask_cls_logits = query_cls_results_final # 保持 Logits 状态
+            
             mask_pred_logits = outputs["pred_masks"]  # 保持 Logits 状态
+            if obj_logits_final is not None:
+                obj_scores = obj_logits_final.sigmoid().unsqueeze(-1) # [B, N, 1]
+                cls_probs = query_cls_results_final.sigmoid() # [B, N, C]
+                final_scores = cls_probs * obj_scores 
+                mask_cls_logits = torch.logit(torch.clamp(final_scores, min=1e-6, max=1-1e-6))
 
+            else:
+                mask_cls_logits = query_cls_results_final # 保持 Logits 状态
 
             results = []
             
@@ -1306,12 +1418,12 @@ class SAM3MC_o365(nn.Module):
                     mask_cls_prob = mask_cls_i.sigmoid()
                     mask_pred_prob = mask_pred_i.sigmoid()
                     semseg = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_prob)
+                    # mask_pred_binary = (mask_pred_i.sigmoid() > 0.5).float() 
+                    # semseg = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_binary)
                     res["sem_seg"] = semseg
 
                     # =========== 修改开始：为可视化准备 Square 数据 ===========
                     
-                    # 1. 获取当前输入 Tensor 的尺寸 (即正方形尺寸，例如 1024x1024)
-                    # batched_inputs[i]["image"] 是经过 mapper 处理后的图
                     tensor_h, tensor_w = batched_inputs[i]["image"].shape[-2:]
                     
                     # 2. 将 Logits 插值到 Tensor 尺寸 (而不是原图尺寸)
