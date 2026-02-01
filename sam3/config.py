@@ -29,6 +29,7 @@ def add_sam3_config(cfg):
     cfg.MODEL.SAM3.NUM_ENCODER_QUERY = 200
 
     cfg.MODEL.SAM3.COS_SIM = True
+    cfg.MODEL.SAM3.NEW_SCORE_HEAD = False
 
     cfg.MODEL.TEACHER = None
     cfg.MODEL.TEACHER_MASKPOOL = False
@@ -53,6 +54,7 @@ def add_sam3_config(cfg):
     cfg.SOLVER.BACKBONE_MULTIPLIER = 0.0
     cfg.SOLVER.NO_OBJECT_WEIGHT = 0.1
     cfg.SOLVER.CLASS_WEIGHT = 2.0
+    cfg.SOLVER.OBJECT_WEIGHT = 2.0
     cfg.SOLVER.MASK_WEIGHT = 5.0
     cfg.SOLVER.DICE_WEIGHT = 5.0
     cfg.SOLVER.BBOX_WEIGHT = 5.0
@@ -62,6 +64,7 @@ def add_sam3_config(cfg):
     cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO = 0.75
 
     cfg.SOLVER.USE_AUX = True
+    cfg.SOLVER.CLIP_DISTILL = False
 
     cfg.TEST.SEMANTIC_ON = True
     cfg.TEST.INSTANCE_ON = False

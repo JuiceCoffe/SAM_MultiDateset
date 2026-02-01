@@ -64,7 +64,6 @@ from sam3.config import add_sam3_config
 from sam3.modeling_d2 import SAM3Wrapper # 导入这个类就会自动触发 REGISTER
 # from sam3.SAM3MC import SAM3MC
 from sam3.SAM3MC_ora import SAM3MC_ora
-from sam3.SAM3MC_DINO import SAM3MC_DINO
 from sam3.SAM3MC_o365 import SAM3MC_o365
 
 

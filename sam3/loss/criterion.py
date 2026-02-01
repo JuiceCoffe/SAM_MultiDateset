@@ -153,41 +153,55 @@ class SetCriterion(nn.Module):
         self.importance_sample_ratio = importance_sample_ratio
 
     def loss_labels(self, outputs, targets, indices, num_masks):
-            """
-            Grounding DINO style Classification Loss (Sigmoid Focal Loss)
-            """
-            assert "pred_logits" in outputs
-            src_logits = outputs["pred_logits"].float()
+        """
+        Grounding DINO style Classification Loss (Sigmoid Focal Loss)
+        """
+        assert "pred_logits" in outputs
+        src_logits = outputs["pred_logits"].float()
 
-            # 1. 准备 Target 容器，初始化为全 0
-            # src_logits shape: [Batch, Num_Queries, Num_Classes]
-            # 注意：这里的 Num_Classes 不应该包含背景类，纯粹是文本的类别数
-            target_classes_onehot = torch.zeros_like(src_logits)
+        # 1. 准备 Target 容器，初始化为全 0
+        # src_logits shape: [Batch, Num_Queries, Num_Classes]
+        # 注意：这里的 Num_Classes 不应该包含背景类，纯粹是文本的类别数
+        target_classes_onehot = torch.zeros_like(src_logits)
 
-            # 2. 获取匹配的索引 (Batch ID, Query ID)
-            idx = self._get_src_permutation_idx(indices)
+        # 2. 获取匹配的索引 (Batch ID, Query ID)
+        idx = self._get_src_permutation_idx(indices)
+
+        losses = {}
+
+        # ================= 1. Objectness Loss (Focal) =================
+        if "pred_objectness_logits" in outputs:
+            src_obj_logits = outputs["pred_objectness_logits"]
+            target_obj = torch.zeros_like(src_obj_logits)
+            target_obj[idx] = 1.0
             
-            # 3. 获取匹配到的 GT 对应的类别 ID
-            target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-            
-            # 4. 在匹配的位置填 1 (正样本)
-            # 没匹配上的位置保持 0 (负样本)
-            target_classes_onehot[idx[0], idx[1], target_classes_o] = 1.0
+            # 使用标准的 Focal Loss 监督 Objectness
+            losses['loss_objectness'] = sigmoid_focal_loss(
+                src_obj_logits, target_obj, num_masks, 
+                alpha=0.25, gamma=2.0
+            ).sum() / num_masks
 
-            # 5. 计算 Sigmoid Focal Loss
-            # 注意：这里调用你上面定义的 sigmoid_focal_loss
-            # num_masks 通常建议替换为 num_boxes 或者匹配到的正样本总数，用于归一化
-            loss_focal = sigmoid_focal_loss(
-                src_logits, 
-                target_classes_onehot, 
-                num_masks, 
-                alpha=0.25, 
-                gamma=2.0, 
-                no_reduction=False
-            )
 
-            losses = {"loss_focal": loss_focal}
-            return losses
+        # 3. 获取匹配到的 GT 对应的类别 ID
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        
+        # 4. 在匹配的位置填 1 (正样本)
+        # 没匹配上的位置保持 0 (负样本)
+        target_classes_onehot[idx[0], idx[1], target_classes_o] = 1.0
+
+        # 5. 计算 Sigmoid Focal Loss
+        # 注意：这里调用你上面定义的 sigmoid_focal_loss
+        # num_masks 通常建议替换为 num_boxes 或者匹配到的正样本总数，用于归一化
+        losses['loss_focal'] = sigmoid_focal_loss(
+            src_logits, 
+            target_classes_onehot, 
+            num_masks, 
+            alpha=0.25, 
+            gamma=2.0, 
+            no_reduction=False
+        )
+
+        return losses
     
     def loss_masks(self, outputs, targets, indices, num_masks):
         """Compute the losses related to the masks: the focal loss and the dice loss.

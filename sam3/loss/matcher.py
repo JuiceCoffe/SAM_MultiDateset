@@ -77,8 +77,8 @@ class HungarianMatcher(nn.Module):
         cost_class: float = 1, 
         cost_mask: float = 1, 
         cost_dice: float = 1, 
-        cost_bbox: float = 1.0, 
-        cost_giou: float = 1.0,  
+        cost_bbox: float = 0.0, 
+        cost_giou: float = 0.0,  
         num_points: int = 0,
         use_mask: bool = True,
     ):

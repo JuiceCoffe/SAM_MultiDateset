@@ -50,7 +50,7 @@ from sam3.model.content_dependent_transfer import ContentDependentTransfer
 from sam3.model.box_ops import masks_to_boxes, box_xyxy_to_cxcywh
 
 
-from maft.modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling, get_classification_logits
+from maft.modeling.transformer_decoder.fcclip_transformer_decoder import MaskPooling
 
 import random
 
@@ -206,12 +206,46 @@ class SAM3MC_o365(nn.Module):
         elif self.Teacher == "PE":
             from .PEEncoder import PEEncoder
             self.backbone2 = PEEncoder(cfg)        
+
+        self.clip_distill = cfg.SOLVER.CLIP_DISTILL
+        if self.clip_distill:
+            from .clip import CLIP
+            self.backbone2 = CLIP(cfg)
+            self.sam2Clip = MLP(
+                        input_dim=256,
+                        hidden_dim=2048,
+                        output_dim=768,
+                        num_layers=2,
+                        dropout=0.1,
+                        residual=False,
+                        out_norm=nn.LayerNorm(768),
+                    )
+            self.clipV2T = MLP(
+                        input_dim=768,
+                        hidden_dim=2048,
+                        output_dim=768,
+                        num_layers=2,
+                        dropout=0.1,
+                        residual=True,
+                    )
+            self.mask_pooling = MaskPooling()
+            # self.distill_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+            # prior_prob = 0.01
+            # bias_value = -np.log((1 - prior_prob) / prior_prob)
+            # self.distill_logit_bias = nn.Parameter(torch.ones([]) * bias_value)
+
+        self.new_score_head = cfg.MODEL.SAM3.NEW_SCORE_HEAD
+        if self.new_score_head:
+            self.score_head = MLP(256, 256, 1, 3)
+            init_score_head(self.score_head)
         # -------------------------------------------------------
         # 训练配置
         # -------------------------------------------------------
         # 你需要检查 sam3_loss 的初始化参数
         self.train_dataname = None
         self.test_dataname = None
+        self.train_dataname_teacher = None
+        self.test_dataname_teacher = None
         self.test_metadata = {i: MetadataCatalog.get(i) for i in cfg.DATASETS.TEST}
         # 【修改】建立 Metadata 字典，方便后续查找
         self.train_metadata_dict = {name: MetadataCatalog.get(name) for name in cfg.DATASETS.TRAIN}
@@ -241,6 +275,8 @@ class SAM3MC_o365(nn.Module):
         bbox_weight = cfg.SOLVER.BBOX_WEIGHT
         giou_weight = cfg.SOLVER.GIOU_WEIGHT
 
+        objectness_weight = cfg.SOLVER.OBJECT_WEIGHT
+
 
         weight_dict = {}
         criterion_weight_dict = {
@@ -250,6 +286,9 @@ class SAM3MC_o365(nn.Module):
             'loss_bbox':bbox_weight, 
             'loss_giou':giou_weight
         }
+        if self.new_score_head:
+            criterion_weight_dict["loss_objectness"] = objectness_weight
+
         weight_dict.update(criterion_weight_dict)
 
         if self.use_aux:
@@ -299,8 +338,8 @@ class SAM3MC_o365(nn.Module):
             cost_class=class_weight,
             cost_mask=mask_weight,
             cost_dice=dice_weight,
-            cost_bbox=bbox_weight, # 新增：用于匹配计算
-            cost_giou=giou_weight, # 新增：用于匹配计算
+            # cost_bbox=bbox_weight, # 新增：用于匹配计算
+            # cost_giou=giou_weight, # 新增：用于匹配计算
             num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
         )
         
@@ -511,29 +550,33 @@ class SAM3MC_o365(nn.Module):
     #     self.test_text_classifier = None
     #     return
 
+    @torch.no_grad()
     def get_teacher_text_classifier(self, dataname, prompt_teacher):
         if self.training:
-            if self.train_dataname != dataname:
+            if self.train_dataname_teacher != dataname or self.text_classifier2 is None:
+                self.category_overlapping_mask_teacher, self.train_num_templates_teacher, self.train_class_names_teacher = self.prepare_class_names_from_metadata(
+                    self.train_metadata_dict.get(dataname, MetadataCatalog.get(dataname)), 
+                    self.train_metadata, 
+                    prompt_teacher
+                    )
                 text_classifier = []
-                # this is needed to avoid oom, which may happen when num of class is large
                 bs = 128
-                # print("train_class_names len: ",len(self.train_class_names)) 4592
-                # print("train_class_names: ",self.train_class_names) 带模板的类别名
-                # exit()
-                for idx in range(0, len(self.train_class_names), bs):
-                    text_classifier.append(self.backbone2.get_text_classifier(self.train_class_names[idx:idx+bs], self.device).detach())
+                print("Generating text classifier for", dataname, "with", len(self.train_class_names), "classes.")
+                for idx in range(0, len(self.train_class_names_teacher), bs):
+                    text_classifier.append(self.backbone2.get_text_classifier(self.train_class_names_teacher[idx:idx+bs], self.device).detach())
                 text_classifier = torch.cat(text_classifier, dim=0)
+                print("text_classifier shape before normalize:", text_classifier.shape)
 
-                # average across templates and normalization.
                 text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
-                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.PROMPT), len(self.PROMPT), text_classifier.shape[-1]).mean(1)
+                print("text_classifier shape before reshape:", text_classifier.shape)
+                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(prompt_teacher), len(prompt_teacher), text_classifier.shape[-1]).mean(1) 
                 text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
                 self.text_classifier2 = text_classifier
-                self.train_dataname = dataname
+                self.train_dataname_teacher = dataname
+            return self.text_classifier2, self.train_num_templates_teacher
 
-            return self.text_classifier2, self.train_num_templates
         else:
-            if self.test_dataname != dataname or self.text_classifier2 is None:
+            if self.test_dataname_teacher != dataname or self.text_classifier2 is None:
                 self.category_overlapping_mask_teacher, self.test_num_templates_teacher, self.test_class_names_teacher = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata, prompt_teacher)
                 text_classifier = []
                 bs = 128
@@ -548,7 +591,7 @@ class SAM3MC_o365(nn.Module):
                 text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(prompt_teacher), len(prompt_teacher), text_classifier.shape[-1]).mean(1) 
                 text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
                 self.text_classifier2 = text_classifier
-                self.test_dataname = dataname
+                self.test_dataname_teacher = dataname
             return self.text_classifier2, self.test_num_templates_teacher
 
 
@@ -1077,11 +1120,17 @@ class SAM3MC_o365(nn.Module):
         use_aux = self.use_aux and self.training
         aux_outputs = []
 
+        obj_logits = None
+        if self.new_score_head:
+            obj_logits = self.score_head(queries).squeeze(-1)
+
         for i in range(6):
             assert queries.shape[0] == 6
             assert queries.shape[2] == N
             if use_aux or i == 5 :
                 tp_queries = queries[i,:,:,:].clone() 
+
+                cur_obj_logits = obj_logits[i] if obj_logits is not None else None
 
                 if self.use_query_proj:
                     tp_queries = self.query_proj(tp_queries)
@@ -1111,18 +1160,21 @@ class SAM3MC_o365(nn.Module):
                 query_cls_results = torch.stack(query_cls_results, dim=-1) # bs, N, num_classes
                 # print(f"aux query_cls_results[{i}] shape:", query_cls_results.shape)
                     
-
                 if i<5:
-                    aux_outputs.append({
+                    aux_out = {
                         'pred_logits': query_cls_results, 
                         'pred_masks': outputs['aux_outputs'][i]["pred_masks"], 
                         'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'],
                         'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"],
-                    })
+                    }
+                    if cur_obj_logits is not None:
+                        aux_out['pred_objectness_logits'] = cur_obj_logits
+                    
+                    aux_outputs.append(aux_out)
                 else:
                     query_cls_results_final = query_cls_results
-
-
+                    obj_logits_final = cur_obj_logits
+        
 
         if self.training:
             # mask classification target
@@ -1139,8 +1191,106 @@ class SAM3MC_o365(nn.Module):
                 'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
                 'aux_outputs': aux_outputs if use_aux is True else None,
             }
+            if obj_logits_final is not None:
+                criterion_pred['pred_objectness_logits'] = obj_logits_final
 
             losses = self.criterion(criterion_pred, targets)
+
+            clip_distill_losses = {}
+            if self.clip_distill:
+                mean = torch.tensor([122.7709383, 116.7460125, 104.09373615], device=self.device).view(1, 3, 1, 1)
+                std =  torch.tensor([68.5005327, 66.6321579, 70.32316305], device=self.device).view(1, 3, 1, 1)
+                with torch.no_grad():
+                    imgs_bb2 = images.tensor * self.pixel_std + self.pixel_mean
+                    imgs_bb2 = (imgs_bb2 - mean) / std
+                    clip_feature = self.backbone2.extract_features(imgs_bb2)["clip_vis_dense"]
+
+                    
+
+                    # mask_for_pool = F.interpolate(outputs["pred_masks"], size=clip_feature.shape[-2:],
+                    #                                     mode='bilinear', align_corners=False)
+                    # pooled_img_feat = self.mask_pooling(clip_feature, mask_for_pool) 
+                    # pooled_img_feat = self.backbone2.visual_prediction_forward(pooled_img_feat)
+                    # pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)  
+                    
+                    gt_clip_features_list = []
+                    for t_idx, t in enumerate(targets):
+                        gt_masks = t["masks"] # [N_gt, H, W]
+                        if gt_masks.shape[0] > 0:
+                            # 插值 GT Mask 到 CLIP 特征图大小
+                            gt_masks_down = F.interpolate(
+                                gt_masks.unsqueeze(1).float(), 
+                                size=clip_feature.shape[-2:], 
+                                mode='bilinear', align_corners=False
+                            ).squeeze(1)
+                            
+                            # 提取该 Batch 当前图片的 CLIP 特征
+                            curr_img_feat = clip_feature[t_idx].unsqueeze(0) # [1, C, H, W]
+                            
+                            # Mask Pooling (使用你的 mask_pooling 模块)
+                            # 注意 mask_pooling通常输入 [B, C, H, W] 和 [B, N, H, W]
+                            # 这里我们需要手动处理 batch 维度或循环
+                            # 假设 self.mask_pooling 支持单张处理
+                            pooled_feat = self.mask_pooling(curr_img_feat, gt_masks_down.unsqueeze(0)) # [1, N_gt, C]
+                            pooled_feat = self.backbone2.visual_prediction_forward(pooled_feat)
+                            pooled_feat = F.normalize(pooled_feat, dim=-1, p=2)
+                            gt_clip_features_list.append(pooled_feat.squeeze(0))
+                        else:
+                            gt_clip_features_list.append(torch.empty(0, 768, device=self.device)) 
+
+                extra_pred_info = {
+                    "query": outputs["obj_queries"][5,:,:,:],
+                }
+                extra_target_info = {
+                    "pooled_img_feat": gt_clip_features_list,
+                }
+
+                src_masks, tgt_masks, matched_labels, matched_preds, matched_gts = self.match_via_iou(
+                    outputs["pred_masks"], 
+                    targets, 
+                    extra_pred_info=extra_pred_info,
+                    extra_gt_info=extra_target_info,
+                    iou_threshold=0.7, 
+                    max_matches=8
+                )
+
+                binary_src_masks = src_masks > 0
+                binary_src_masks = binary_src_masks.float()
+
+                valid_indices = matched_labels != -1 # [B, 8]
+
+                src_queries = matched_preds["query"]
+                src_clipV = self.sam2Clip(src_queries) 
+                tgt_clipV = matched_gts["pooled_img_feat"]
+
+                # 只对成功匹配到的对计算 Loss
+                if valid_indices.any():
+                    src_clipV_filtered = src_clipV[valid_indices]
+                    tgt_clipV_filtered = tgt_clipV[valid_indices]
+                    ClipV_distill_loss = self.cosine_similarity_loss(src_clipV_filtered, tgt_clipV_filtered)
+                else:
+                    ClipV_distill_loss = src_clipV.sum() * 0 # 防止无匹配时报错
+
+                clip_distill_losses.update(ClipV_distill_loss)
+                
+                src_clipT = self.clipV2T(src_clipV)
+
+                text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], VILD_PROMPT)
+                mask_cls_results = get_classification_logits(src_clipT, text_classifier2, self.backbone2.clip_model.logit_scale, num_templates_teacher)
+                ClipT_cls_loss = self.cross_entropy_loss(mask_cls_results, matched_labels)
+
+                # mask_names_logits = torch.einsum("bnd,cd->bnc", src_clipT, text_classifier2)
+                # mask_cls_logits =  aggregate_name_to_class_logits(mask_names_logits, num_templates_teacher)       
+                # distill_logit_scale = torch.clamp(self.distill_logit_scale, max=100.0)
+                # mask_cls_logits = mask_cls_logits * distill_logit_scale + self.distill_logit_bias
+                # ClipT_cls_loss = self.instance_wise_ckd_loss(mask_cls_logits, matched_labels, alpha=0.25, gamma=2.0)
+
+
+
+                clip_distill_losses.update(ClipT_cls_loss)
+
+                
+                                                
 
             for k in list(losses.keys()):
                 # print("loss:", k, losses[k].item())
@@ -1158,9 +1308,49 @@ class SAM3MC_o365(nn.Module):
                     if k in self.encoder_criterion.weight_dict:
                         losses[k + '_encoder'] = encoder_losses[k] * self.encoder_criterion.weight_dict[k]
 
+            if self.clip_distill:
+                for k in clip_distill_losses:
+                    losses["clip_distill_"+k] = clip_distill_losses[k]
             return losses
         
         else:
+            if self.clip_distill:
+                queries = outputs["obj_queries"][5,:,:,:]
+                queries_clipV = self.sam2Clip(queries) 
+                queries_clipT = self.clipV2T(queries_clipV)
+
+                text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], VILD_PROMPT)
+                clip_cls_results = get_classification_logits(queries_clipT, text_classifier2, self.backbone2.clip_model.logit_scale, num_templates_teacher) # bs, N, C_teacher
+
+                category_overlapping_mask = self.category_overlapping_mask.to(self.device)
+                in_vocab_cls_probs = query_cls_results_final.sigmoid()
+                out_vocab_cls_probs = clip_cls_results.softmax(-1)
+
+                alpha = 0.5
+                beta = 0.8
+                # 为了数值稳定性，加一个小 epsilon
+                eps = 1e-7 
+                probs_seen = (
+                    (in_vocab_cls_probs + eps) ** (1 - alpha) * 
+                    (out_vocab_cls_probs + eps) ** alpha
+                )
+                
+                # 计算 Unseen 类的加权几何平均概率
+                probs_unseen = (
+                    (in_vocab_cls_probs + eps) ** (1 - beta) * 
+                    (out_vocab_cls_probs + eps) ** beta
+                )
+
+                # 组合概率 (注意这里不是加 log，而是选通概率)
+                final_probs = (
+                    probs_seen * category_overlapping_mask + 
+                    probs_unseen * (1 - category_overlapping_mask)
+                )
+                
+                # 钳位数值防止 logit 计算出现 inf/-inf
+                final_probs = torch.clamp(final_probs, min=eps, max=1-eps)
+                query_cls_results_final = torch.logit(final_probs)
+
 
             if self.Teacher_MaskPool:
                 imgs_bb2 = images.tensor * self.pixel_std + self.pixel_mean
@@ -1230,13 +1420,13 @@ class SAM3MC_o365(nn.Module):
                 # 计算 Seen 类的加权几何平均概率
                 probs_seen = (
                     (in_vocab_cls_probs + eps) ** (1 - alpha) * 
-                    (out_vocab_cls_probs + eps) #** alpha
+                    (out_vocab_cls_probs + eps) ** alpha
                 )
                 
                 # 计算 Unseen 类的加权几何平均概率
                 probs_unseen = (
                     (in_vocab_cls_probs + eps) ** (1 - beta) * 
-                    (out_vocab_cls_probs + eps) #** beta
+                    (out_vocab_cls_probs + eps) ** beta
                 )
 
                 # 组合概率 (注意这里不是加 log，而是选通概率)
@@ -1659,6 +1849,155 @@ class SAM3MC_o365(nn.Module):
             
         return result
 
+
+    @torch.no_grad()
+    def match_via_iou(self, mask_pred_results, targets, extra_pred_info=None, extra_gt_info=None, iou_threshold=0.7, max_matches=8):
+        """
+        Args:
+            mask_pred_results: [B, Q, H, W] 预测的掩码
+            targets: List[Dict], 包含 'labels', 'masks'
+            
+            extra_pred_info: Dict[str, Tensor]
+                             Tensor 形状为 [B, Q, ...] (例如 Query Embeddings)
+                             
+            extra_gt_info:   Dict[str, List[Tensor]]
+                             List 长度为 B。每个元素是 Tensor，形状为 [Num_GTs_in_image, ...]
+                             (例如 GT 的 CLIP 特征，或 OCR 文本特征)
+            
+            iou_threshold:   IoU 阈值
+            max_matches:     每张图保留的最大匹配对数
+        """
+        batch_size = mask_pred_results.shape[0]
+        
+        # --- 初始化输出容器 ---
+        matched_src_masks = []
+        matched_target_masks = []
+        matched_labels = []
+        
+        # 初始化额外信息的输出字典
+        # 结构: {"key": [Tensor_B1, Tensor_B2, ...]} -> 最后 stack
+        matched_pred_out = {}
+        if extra_pred_info is not None:
+            for k in extra_pred_info.keys():
+                matched_pred_out[k] = []
+
+        matched_gt_out = {}
+        if extra_gt_info is not None:
+            for k in extra_gt_info.keys():
+                matched_gt_out[k] = []
+
+        for b in range(batch_size):
+            # --- 1. 获取当前 Batch 的基础数据 ---
+            tgt_label = targets[b]["labels"]
+            tgt_mask = targets[b]["masks"].to(mask_pred_results.device)
+            num_tgt_masks = tgt_mask.shape[0]
+
+            pred_mask = mask_pred_results[b]  # [Q, H, W]
+            
+            # --- 2. 计算 IoU ---
+            # 对齐尺寸
+            tgt_mask_interp = F.interpolate(tgt_mask[:, None].float(), size=pred_mask.shape[-2:], mode='bilinear', align_corners=False).squeeze(1)
+            
+            pred_mask_flat = pred_mask.flatten(1)
+            tgt_mask_flat = tgt_mask_interp.flatten(1)
+
+            with torch.no_grad():
+                ious = compute_mask_iou(pred_mask_flat, tgt_mask_flat)
+
+            # --- 3. 筛选与匹配逻辑 ---
+            matched_pred_idx = [] 
+            matched_tgt_idx = []
+            
+            for j in range(num_tgt_masks):
+                valid_pred_idx = (ious[:, j] > iou_threshold).nonzero(as_tuple=True)[0]
+                if len(valid_pred_idx) > 0:
+                    random_idx = torch.randint(0, len(valid_pred_idx), (1,)).item()
+                    best_pred_idx = valid_pred_idx[random_idx]
+                    matched_pred_idx.append(best_pred_idx.item())
+                    matched_tgt_idx.append(j)
+
+            # --- 4. 截断逻辑 (不能超过 max_matches) ---
+            if len(matched_pred_idx) > max_matches:
+                selected_indices = torch.randperm(len(matched_pred_idx))[:max_matches]
+                matched_pred_idx = [matched_pred_idx[i] for i in selected_indices]
+                matched_tgt_idx = [matched_tgt_idx[i] for i in selected_indices]
+
+            # 准备 Tensor 类型的索引，用于切片
+            idx_p = torch.as_tensor(matched_pred_idx, dtype=torch.long, device=pred_mask.device)
+            idx_t = torch.as_tensor(matched_tgt_idx, dtype=torch.long, device=tgt_mask.device)
+            
+            num_current = len(matched_pred_idx)
+            num_to_add = max_matches - num_current
+
+            # --- 5. 填充与组合 (Padding & Concatenation) ---
+            
+            # Helper: 如果不够 max_matches，生成 padding 并拼接；否则直接切片
+            def process_tensor(tensor_data, indices, pad_value=0):
+                # tensor_data: [N, ...]
+                selected = tensor_data[indices] # [K, ...]
+                if num_to_add > 0:
+                    pad_shape = (num_to_add, *tensor_data.shape[1:])
+                    # 处理 padding 值 (通常是0，label是-1)
+                    if pad_value == 0:
+                        padding = torch.zeros(pad_shape, dtype=tensor_data.dtype, device=tensor_data.device)
+                    else:
+                        padding = torch.full(pad_shape, pad_value, dtype=tensor_data.dtype, device=tensor_data.device)
+                    return torch.cat([selected, padding], dim=0)
+                return selected
+
+            # A. 基础 mask 和 label
+            matched_src_masks.append(process_tensor(pred_mask, idx_p, pad_value=0))
+            matched_target_masks.append(process_tensor(tgt_mask, idx_t, pad_value=0))
+            matched_labels.append(process_tensor(tgt_label, idx_t, pad_value=-1))
+
+            # B. 处理 Pred Info (形状 [Q, ...])
+            if extra_pred_info is not None:
+                for k, v in extra_pred_info.items():
+                    # v[b] 是当前图片的 Pred 特征
+                    matched_pred_out[k].append(process_tensor(v[b], idx_p, pad_value=0))
+            
+            # C. 处理 GT Info (形状 [Num_GT, ...])
+            if extra_gt_info is not None:
+                for k, v_list in extra_gt_info.items():
+                    # v_list[b] 是当前图片的 GT 特征
+                    curr_gt_feat = v_list[b].to(mask_pred_results.device) # 确保设备一致
+                    matched_gt_out[k].append(process_tensor(curr_gt_feat, idx_t, pad_value=0))
+
+        # --- 6. 堆叠 (Stacking) ---
+        matched_src_masks = torch.stack(matched_src_masks, dim=0) 
+        matched_target_masks = torch.stack(matched_target_masks, dim=0)
+        matched_labels = torch.stack(matched_labels, dim=0)
+        
+        final_pred_dict = {}
+        if extra_pred_info is not None:
+            for k, v_list in matched_pred_out.items():
+                final_pred_dict[k] = torch.stack(v_list, dim=0)
+
+        final_gt_dict = {}
+        if extra_gt_info is not None:
+            for k, v_list in matched_gt_out.items():
+                final_gt_dict[k] = torch.stack(v_list, dim=0)
+
+        return matched_src_masks, matched_target_masks, matched_labels, final_pred_dict, final_gt_dict
+
+    def cosine_similarity_loss(self, pred_features, gt_features):
+    
+        cosine_similarity_loss = {}
+        
+        cosine_sim = F.cosine_similarity(pred_features, gt_features, dim=-1)
+        cosine_similarity_loss[f"loss_cosine"] = 1 - cosine_sim.mean()
+        return cosine_similarity_loss
+
+    def cross_entropy_loss(self, mask_cls_results, labels):
+        
+        if torch.all(labels == -1):
+            loss_ce = mask_cls_results.sum() * 0.0 
+        else:
+            loss_ce = F.cross_entropy(mask_cls_results.transpose(1, 2), labels.to(torch.int64), ignore_index=-1)  #remove celoss weight because of multiple datasets training
+
+        losses = {"loss_ce": loss_ce}
+        return losses
+
 def aggregate_name_to_class_logits(query_names_results, num_templates):
     """
     将包含同义词/模板的 name logits 转化为唯一类别的 class logits。
@@ -1863,3 +2202,89 @@ def get_dataname(batched_input):
     # 如果都匹配不上，返回一个默认值或抛出警告
     print(f"Warning: Could not infer dataname from {file_name}, using default 'lvis_v1_val'")
     return "lvis_v1_val"
+
+def compute_mask_iou(pred_masks, tgt_masks):
+    
+    pred_masks = pred_masks.sigmoid()
+    
+    binarized_pred_masks = (pred_masks >= 0.4).float()
+    binarized_tgt_masks = (tgt_masks > 0.5).float()
+
+    intersection = torch.einsum('nc,mc->nm', binarized_pred_masks, binarized_tgt_masks)
+    
+    pred_area = binarized_pred_masks.sum(dim=-1)  
+    tgt_area = binarized_tgt_masks.sum(dim=-1)    
+    
+    union = pred_area[:, None] + tgt_area[None, :] - intersection
+    
+    iou_matrix = intersection / (union + 1e-6)
+    
+    return iou_matrix
+
+def init_query_proj(mlp_module):
+    """
+    针对 Open-Vocabulary 适配器的初始化策略：
+    1. 隐藏层使用 Kaiming 初始化，配合 ReLU。
+    2. 最后一层（输出层）使用极小值初始化。
+    3. 配合 Residual=True，使得 MLP 在初始阶段输出接近 x + 0，即保留 SAM3 原始特征。
+    """
+    for i, layer in enumerate(mlp_module.layers):
+        if isinstance(layer, nn.Linear):
+            # 判断是否为隐藏层 (i < num_layers - 1)
+            if i < mlp_module.num_layers - 1:
+                # 隐藏层使用 Kaiming Normal，因为后面接了 ReLU
+                nn.init.kaiming_normal_(layer.weight, a=0, mode='fan_out', nonlinearity='relu')
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0)
+            else:
+                # 最后一层（输出层）：非常关键
+                # 将权重初始化为极小分布（或全0），使得初始状态下 MLP 的增量几乎为 0
+                # 这样：Output = x (原始特征) + MLP(x) (几乎为0) ≈ x
+                nn.init.normal_(layer.weight, std=0.0001)
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0)
+
+    # 如果存在 LayerNorm，初始化为标准状态
+    if hasattr(mlp_module, "out_norm") and isinstance(mlp_module.out_norm, nn.LayerNorm):
+        nn.init.constant_(mlp_module.out_norm.weight, 1.0)
+        nn.init.constant_(mlp_module.out_norm.bias, 0)
+
+def init_score_head(mlp_module, prior_prob=0.01):
+    # 1. 遍历 MLP 的所有层
+    for i, layer in enumerate(mlp_module.layers):
+        if isinstance(layer, nn.Linear):
+            # 对于隐藏层，使用 Kaiming 初始化（因为你用了 ReLU）
+            if i < len(mlp_module.layers) - 1:
+                nn.init.kaiming_normal_(layer.weight, a=0, mode='fan_out', nonlinearity='relu')
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0)
+            else:
+                # 2. 关键点：对最后一层（输出层）进行特殊处理
+                # 将权重初始化为非常小的值，让 bias 起主导作用
+                nn.init.normal_(layer.weight, std=0.01)
+                
+                # 设置先验偏置
+                bias_value = -math.log((1 - prior_prob) / prior_prob)
+                nn.init.constant_(layer.bias, bias_value)
+
+def get_classification_logits(x, text_classifier, logit_scale, num_templates=None):
+    # x in shape of [B, *, C]
+    # text_classifier in shape of [num_classes, C]
+    # logit_scale is a learnable scalar https://github.com/mlfoundations/open_clip/blob/main/src/open_clip/model.py#L201
+    # return: [B, *, num_classes]
+    x = F.normalize(x, dim=-1)
+    logit_scale = torch.clamp(logit_scale.exp(), max=100)
+    if len(text_classifier.shape) == 2:
+        pred_logits = logit_scale * x @ text_classifier.T # B, *, N + 1
+    else:
+        pred_logits = logit_scale * x @ text_classifier.permute(0,2,1) # B, *, N + 1
+        
+    # max ensembel as in OpenSeg/ODISE
+    final_pred_logits = []
+    cur_idx = 0
+    for num_t in num_templates: 
+        final_pred_logits.append(pred_logits[:, :, cur_idx: cur_idx + num_t].max(-1).values)
+        cur_idx += num_t
+    # final_pred_logits.append(pred_logits[:, :, -1]) # the last classifier is for void
+    final_pred_logits = torch.stack(final_pred_logits, dim=-1)
+    return final_pred_logits
