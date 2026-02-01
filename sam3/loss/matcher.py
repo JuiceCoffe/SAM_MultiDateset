@@ -113,25 +113,15 @@ class HungarianMatcher(nn.Module):
         # Iterate through batch size
         for b in range(bs):
 
-            # =========== 修改开始 ===========
-            # 1. 强制转换为 float (FP32) 防止 FP16 下的数值不稳定
-            out_logits = outputs["pred_logits"][b].float()  # [num_queries, num_classes]
-            out_prob = out_logits.sigmoid()
-            
+            out_prob = outputs["pred_logits"][b].float().softmax(-1)
+
             tgt_ids = targets[b]["labels"]
 
-            # 2. Focal Loss Cost 计算 (保持 FP32)
-            alpha = 0.25
-            gamma = 2.0
-            
-            # 使用更安全的 log 计算方式，防止 log(0)
-            # 1e-8 在 FP32 下是安全的，但在 FP16 下可能不够
-            neg_cost_class = (1 - alpha) * (out_prob ** gamma) * (-(1 - out_prob + 1e-8).log())
-            pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-(out_prob + 1e-8).log())
-            
-            # 提取对应的 cost
-            cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
-            # =========== 修改结束 ===========
+            # 3. 计算分类 Cost
+            # 在 Softmax 下，Cost 直接取负概率即可。
+            # 这种方式简单直接，且与 Cross Entropy 的优化目标（极大似然）一致。
+            cost_class = -out_prob[:, tgt_ids]
+
 
             # --- 2. Box Cost (修改点：加入健壮性检查) ---
             cost_bbox = 0

@@ -8,7 +8,7 @@ MODEL:
     BPE_PATH: "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
     ENABLE_SEGMENTATION: True
     NUM_CDT: 0
-    USE_QUERY_PROJ: False
+    # USE_QUERY_PROJ: True
     USE_PE_TEXT: False
     # DYNAMIC_QUERY: True
     # ENCODER_LOSS: True
@@ -31,8 +31,8 @@ SOLVER:
   IMS_PER_BATCH: 48
   BASE_LR: 0.00002
   LR_SCHEDULER_NAME: WarmupPolyLR
-  MAX_ITER: 30000
-  CHECKPOINT_PERIOD: 5000
+  MAX_ITER: 45000
+  CHECKPOINT_PERIOD: 7500
   
   CLASS_WEIGHT: 2.0
   MASK_WEIGHT: 5.0
@@ -76,7 +76,7 @@ DATALOADER:
   USE_DIFF_BS_SIZE: True
 
 TEST:
-  EVAL_PERIOD: 5000
+  EVAL_PERIOD: 7500
   INSTANCE_ON: True   
   PANOPTIC_ON: True   
   SEMANTIC_ON: True   
@@ -85,5 +85,5 @@ TEST:
 VERSION: 2
 
 # OUTPUT_DIR: ./out/test/
-OUTPUT_DIR: ./out/copa_objHead
+OUTPUT_DIR: ./out/copa_objHead_ce
   
