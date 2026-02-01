@@ -1273,7 +1273,7 @@ class SAM3MC_o365(nn.Module):
 
                 clip_distill_losses.update(ClipV_distill_loss)
                 
-                src_clipT = self.clipV2T(src_clipV)
+                src_clipT = self.clipV2T(src_clipV.detach())
 
                 text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], VILD_PROMPT)
                 mask_cls_results = get_classification_logits(src_clipT, text_classifier2, self.backbone2.clip_model.logit_scale, num_templates_teacher)
