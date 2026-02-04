@@ -141,17 +141,10 @@ class SAM3MC_o365(nn.Module):
         
         prior_prob = 0.01
         bias_value = -np.log((1 - prior_prob) / prior_prob)
-        self.logit_bias = nn.ParameterList([
-            nn.Parameter(torch.ones([]) * bias_value) 
-            for _ in range(self.num_decoder_layers)
-        ])
-        if self.use_cos_sim:
-            init_scale_value = np.log(1 / 0.07) # 这是一个经验值
-            self.logit_scale = nn.ParameterList([
-                nn.Parameter(torch.ones([]) * init_scale_value) 
-                for _ in range(self.num_decoder_layers)
-            ])
+        self.logit_bias = nn.Parameter(torch.ones([]) * bias_value) 
 
+        if self.use_cos_sim:
+            self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         self.num_cdt = cfg.MODEL.SAM3.NUM_CDT    
         self.use_cdt = False if cfg.MODEL.SAM3.NUM_CDT == 0 else True
         if self.use_cdt:
@@ -229,10 +222,6 @@ class SAM3MC_o365(nn.Module):
             #             residual=True,
             #         )
             self.mask_pooling = MaskPooling()
-            # self.distill_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-            # prior_prob = 0.01
-            # bias_value = -np.log((1 - prior_prob) / prior_prob)
-            # self.distill_logit_bias = nn.Parameter(torch.ones([]) * bias_value)
 
         self.new_score_head = cfg.MODEL.SAM3.NEW_SCORE_HEAD
         if self.new_score_head:
@@ -274,6 +263,7 @@ class SAM3MC_o365(nn.Module):
         mask_weight = cfg.SOLVER.MASK_WEIGHT
         bbox_weight = cfg.SOLVER.BBOX_WEIGHT
         giou_weight = cfg.SOLVER.GIOU_WEIGHT
+        contrast_weight = cfg.SOLVER.CONTRAST_WEIGHT
 
         objectness_weight = cfg.SOLVER.OBJECT_WEIGHT
 
@@ -285,7 +275,7 @@ class SAM3MC_o365(nn.Module):
             "loss_dice": dice_weight,
             'loss_bbox':bbox_weight, 
             'loss_giou':giou_weight,
-            'loss_contrast': class_weight*0.5,
+            'loss_contrast': contrast_weight,
         }
         if self.new_score_head:
             criterion_weight_dict["loss_objectness"] = objectness_weight
@@ -1203,12 +1193,12 @@ class SAM3MC_o365(nn.Module):
                 
 
                 if self.use_cos_sim:
-                    cur_logit_scale = self.logit_scale[i].exp()
+                    cur_logit_scale = self.logit_scale.exp()
                     cur_logit_scale = torch.clamp(cur_logit_scale, max=100.0)
-                    cur_logit_bias = self.logit_bias[i]
+                    cur_logit_bias = self.logit_bias
                     query_names_results = cur_logit_scale * query_names_results + cur_logit_bias
                 else:
-                    query_names_results = query_names_results + self.logit_bias[i]
+                    query_names_results = query_names_results + self.logit_bias
 
                 query_cls_results= []
                 cur_idx = 0
