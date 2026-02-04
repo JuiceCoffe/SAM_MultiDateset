@@ -16,8 +16,8 @@ MODEL:
     # COS_SIM: False
     NEW_SCORE_HEAD: True
 
-  WEIGHTS: "/data/hmp/sam3.pt"
-  # WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
+  # WEIGHTS: "/data/hmp/sam3.pt"
+  WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
   # WEIGHTS: /data/hmp/SAM_MultiDateset/out/cocopano/model_0007499.pth
 
 DATASETS:
@@ -79,7 +79,7 @@ DATALOADER:
   USE_DIFF_BS_SIZE: True
 
 TEST:
-  EVAL_PERIOD: 7500
+  EVAL_PERIOD: 41
   INSTANCE_ON: True   
   PANOPTIC_ON: True   
   SEMANTIC_ON: True   
@@ -87,6 +87,6 @@ TEST:
 # 修改输出目录名称以区分实验
 VERSION: 2
 
-# OUTPUT_DIR: ./out/test/
-OUTPUT_DIR: ./out/copa_distill_detachT
+OUTPUT_DIR: ./out/test/
+# OUTPUT_DIR: ./out/copa_distill
   

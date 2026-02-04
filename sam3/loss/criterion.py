@@ -134,7 +134,9 @@ class SetCriterion(nn.Module):
     """
 
     def __init__(self,  matcher, weight_dict,  losses,
-                 num_points, oversample_ratio, importance_sample_ratio):
+                 num_points, oversample_ratio, importance_sample_ratio,
+                 tau=0.07
+                 ):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -151,6 +153,77 @@ class SetCriterion(nn.Module):
         self.num_points = num_points
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
+
+        self.tau = tau
+
+    def loss_contrast(self, outputs, targets, indices, num_masks):
+        """
+        Regional Contrastive Distillation Loss (Eq. 5 & 6 in CCKT-Det)
+        
+        Args:
+            outputs: 必须包含 key 'pred_region_features' (Student features), shape [B, N, D]
+            targets: 每个 dict 必须包含 key 'teacher_features' (Teacher/CLIP features), shape [M, D]
+            indices: Hungarian matching 的结果
+        """
+        assert 'pred_region_features' in outputs
+        
+        # 获取 Student 特征: [Batch, Num_Queries, Dim]
+        student_feats = outputs['pred_region_features']
+        
+        loss_contrast = 0.0
+        n_batches = len(targets)
+
+        device = student_feats.device
+        
+        # 对比损失通常在单张图片内部计算，逐个 Batch 循环处理
+        for batch_i, (src_idx, tgt_idx) in enumerate(indices):
+            if len(tgt_idx) == 0:
+                continue
+                
+            src_idx = src_idx.to(device)
+            tgt_idx = tgt_idx.to(device)
+
+            # 1. 取出当前图片的特征
+            # student_e: [N, D] (所有 Queries)
+            student_e = student_feats[batch_i]
+            # teacher_r: [M, D] (所有 GTs)
+            teacher_r = targets[batch_i]['teacher_features']
+
+            # 2. 归一化 (Cosine Similarity 前置步骤)
+            student_e = F.normalize(student_e, p=2, dim=-1)
+            teacher_r = F.normalize(teacher_r, p=2, dim=-1)
+
+            # ================= Equation 5: Teacher -> Student =================
+            # 语义: 对于第 i 个 Teacher GT (r_i)，谁是它对应的 Student Query (e_j)?
+            # 这是一个分类问题：类别数 = Num_Queries (N)
+            
+            # 计算相似度矩阵 [M, N] -> (Teacher, Student)
+            # logits_t2s[i, j] 表示第 i 个 GT 和第 j 个 Query 的相似度
+            logits_t2s = torch.matmul(teacher_r, student_e.t()) / self.tau
+            
+            # 我们只关心匹配上的那些 GT (tgt_idx)
+            # 对于 tgt_idx 中的每一个 GT，其 Label 就是 src_idx 中的对应索引
+            matched_logits_t2s = logits_t2s[tgt_idx] # Shape: [Num_Matched, N]
+            loss_t2s = F.cross_entropy(matched_logits_t2s, src_idx)
+
+            # ================= Equation 6: Student -> Teacher =================
+            # 语义: 对于第 i 个 Student Query (e_i)，谁是它对应的 Teacher GT (r_j)?
+            # 这是一个分类问题：类别数 = Num_GTs (M)
+            # 注意：这里我们只计算"匹配上的" Student Query，未匹配的作为负样本在分母中体现比较困难，
+            # CCKT-Det 的实现通常是将所有 GT 视为候选类别。
+
+            # 计算相似度矩阵 [N, M] -> (Student, Teacher)
+            logits_s2t = torch.matmul(student_e, teacher_r.t()) / self.tau
+            
+            # 我们只关心匹配上的那些 Query (src_idx)
+            matched_logits_s2t = logits_s2t[src_idx] # Shape: [Num_Matched, M]
+            loss_s2t = F.cross_entropy(matched_logits_s2t, tgt_idx)
+
+            # 平均两个方向的损失
+            loss_contrast += (loss_t2s + loss_s2t) / 2.0
+
+        # 对 Batch 取平均
+        return {'loss_contrast': loss_contrast / n_batches}
 
     def loss_labels(self, outputs, targets, indices, num_masks):
         """
@@ -255,7 +328,6 @@ class SetCriterion(nn.Module):
         del target_masks
         return losses
 
-    # ---------------- 修改开始：新增 loss_boxes 函数 ----------------
     def loss_boxes(self, outputs, targets, indices, num_masks):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
@@ -297,7 +369,8 @@ class SetCriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels,
             'masks': self.loss_masks,
-            'boxes': self.loss_boxes, # <--- 务必在这里注册 'boxes'
+            'boxes': self.loss_boxes, 
+            'contrast': self.loss_contrast,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)

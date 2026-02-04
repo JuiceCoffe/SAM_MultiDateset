@@ -220,14 +220,14 @@ class SAM3MC_o365(nn.Module):
                         residual=False,
                         out_norm=nn.LayerNorm(768),
                     )
-            self.clipV2T = MLP(
-                        input_dim=768,
-                        hidden_dim=2048,
-                        output_dim=768,
-                        num_layers=2,
-                        dropout=0.1,
-                        residual=True,
-                    )
+            # self.clipV2T = MLP(
+            #             input_dim=768,
+            #             hidden_dim=2048,
+            #             output_dim=768,
+            #             num_layers=2,
+            #             dropout=0.1,
+            #             residual=True,
+            #         )
             self.mask_pooling = MaskPooling()
             # self.distill_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
             # prior_prob = 0.01
@@ -284,7 +284,8 @@ class SAM3MC_o365(nn.Module):
             "loss_mask": mask_weight, 
             "loss_dice": dice_weight,
             'loss_bbox':bbox_weight, 
-            'loss_giou':giou_weight
+            'loss_giou':giou_weight,
+            'loss_contrast': class_weight*0.5,
         }
         if self.new_score_head:
             criterion_weight_dict["loss_objectness"] = objectness_weight
@@ -332,7 +333,7 @@ class SAM3MC_o365(nn.Module):
                 self.encoder_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
 
-        losses = ["labels", "masks", "boxes"]
+        losses = ["labels", "masks", "boxes", 'contrast']
         # building criterion
         matcher = HungarianMatcher(
             cost_class=class_weight,
@@ -800,7 +801,6 @@ class SAM3MC_o365(nn.Module):
             input_points=None,
             input_points_mask=None,
         )
-
         with torch.no_grad():
 
             file_names = [x["file_name"] for x in batched_inputs]
@@ -1084,6 +1084,13 @@ class SAM3MC_o365(nn.Module):
         # print('aux box:',outputs['aux_outputs'][0]['pred_boxes'].shape)
         # print('aux pred_boxes_xyxy:',outputs['aux_outputs'][0]['pred_boxes_xyxy'].shape)
 
+        if self.training:
+            # mask classification target
+            if "instances" in batched_inputs[0]:
+                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                targets = self.prepare_targets(gt_instances, images, batched_inputs)
+            else:
+                targets = None
 
         out_masks = outputs["pred_masks"].clone()
 
@@ -1124,95 +1131,21 @@ class SAM3MC_o365(nn.Module):
         if self.new_score_head:
             obj_logits = self.score_head(queries).squeeze(-1)
 
-        for i in range(6):
-            assert queries.shape[0] == 6
-            assert queries.shape[2] == N
-            if use_aux or i == 5 :
-                tp_queries = queries[i,:,:,:].clone() 
-
-                cur_obj_logits = obj_logits[i] if obj_logits is not None else None
-
-                if self.use_query_proj:
-                    tp_queries = self.query_proj(tp_queries)
-
-                if self.use_cos_sim:
-                    tp_queries = F.normalize(tp_queries, dim=-1, p=2)
-
-                if self.use_cdt:
-                    query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, text_classifier) # bs, N, C
-                else:
-                    query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier) # bs, N, C
-                
-
-                if self.use_cos_sim:
-                    cur_logit_scale = self.logit_scale[i].exp()
-                    cur_logit_scale = torch.clamp(cur_logit_scale, max=100.0)
-                    cur_logit_bias = self.logit_bias[i]
-                    query_names_results = cur_logit_scale * query_names_results + cur_logit_bias
-                else:
-                    query_names_results = query_names_results + self.logit_bias[i]
-
-                query_cls_results= []
-                cur_idx = 0
-                for num_t in num_templates: 
-                    query_cls_results.append(query_names_results[:,:, cur_idx: cur_idx + num_t].max(-1).values)
-                    cur_idx += num_t
-                query_cls_results = torch.stack(query_cls_results, dim=-1) # bs, N, num_classes
-                # print(f"aux query_cls_results[{i}] shape:", query_cls_results.shape)
-                    
-                if i<5:
-                    aux_out = {
-                        'pred_logits': query_cls_results, 
-                        'pred_masks': outputs['aux_outputs'][i]["pred_masks"], 
-                        'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'],
-                        'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"],
-                    }
-                    if cur_obj_logits is not None:
-                        aux_out['pred_objectness_logits'] = cur_obj_logits
-                    
-                    aux_outputs.append(aux_out)
-                else:
-                    query_cls_results_final = query_cls_results
-                    obj_logits_final = cur_obj_logits
-        
-
-        if self.training:
-            # mask classification target
-            if "instances" in batched_inputs[0]:
-                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-                targets = self.prepare_targets(gt_instances, images, batched_inputs)
-            else:
-                targets = None
-
-            criterion_pred = {
-                'pred_logits': query_cls_results_final,
-                'pred_masks': outputs["pred_masks"],
-                'pred_boxes': outputs['pred_boxes'],
-                'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
-                'aux_outputs': aux_outputs if use_aux is True else None,
-            }
-            if obj_logits_final is not None:
-                criterion_pred['pred_objectness_logits'] = obj_logits_final
-
-            losses = self.criterion(criterion_pred, targets)
-
-            clip_distill_losses = {}
-            if self.clip_distill:
+        if self.clip_distill:
+            text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], VILD_PROMPT)
+            if self.training:
                 mean = torch.tensor([122.7709383, 116.7460125, 104.09373615], device=self.device).view(1, 3, 1, 1)
                 std =  torch.tensor([68.5005327, 66.6321579, 70.32316305], device=self.device).view(1, 3, 1, 1)
                 with torch.no_grad():
                     imgs_bb2 = images.tensor * self.pixel_std + self.pixel_mean
+                    imgs_bb2 = F.interpolate(
+                        imgs_bb2,
+                        size = (1024,1024),
+                        mode='bilinear', align_corners=False,
+                    )
                     imgs_bb2 = (imgs_bb2 - mean) / std
                     clip_feature = self.backbone2.extract_features(imgs_bb2)["clip_vis_dense"]
 
-                    
-
-                    # mask_for_pool = F.interpolate(outputs["pred_masks"], size=clip_feature.shape[-2:],
-                    #                                     mode='bilinear', align_corners=False)
-                    # pooled_img_feat = self.mask_pooling(clip_feature, mask_for_pool) 
-                    # pooled_img_feat = self.backbone2.visual_prediction_forward(pooled_img_feat)
-                    # pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)  
-                    
                     gt_clip_features_list = []
                     for t_idx, t in enumerate(targets):
                         gt_masks = t["masks"] # [N_gt, H, W]
@@ -1237,57 +1170,97 @@ class SAM3MC_o365(nn.Module):
                             gt_clip_features_list.append(pooled_feat.squeeze(0))
                         else:
                             gt_clip_features_list.append(torch.empty(0, 768, device=self.device)) 
+    
 
-                extra_pred_info = {
-                    "query": outputs["obj_queries"][5,:,:,:],
-                }
-                extra_target_info = {
-                    "pooled_img_feat": gt_clip_features_list,
-                }
+        for i in range(6):
+            assert queries.shape[0] == 6
+            assert queries.shape[2] == N
+            if use_aux or i == 5 :
+                tp_queries = queries[i,:,:,:].clone() 
 
-                src_masks, tgt_masks, matched_labels, matched_preds, matched_gts = self.match_via_iou(
-                    outputs["pred_masks"], 
-                    targets, 
-                    extra_pred_info=extra_pred_info,
-                    extra_gt_info=extra_target_info,
-                    iou_threshold=0.7, 
-                    max_matches=8
-                )
+                cur_obj_logits = obj_logits[i] if obj_logits is not None else None
 
-                binary_src_masks = src_masks > 0
-                binary_src_masks = binary_src_masks.float()
+                if self.use_query_proj:
+                    tp_queries = self.query_proj(tp_queries)
 
-                valid_indices = matched_labels != -1 # [B, 8]
+                if self.clip_distill:
+                    tp_queries_clip = self.sam2Clip(tp_queries)
+                    if self.use_cos_sim:
+                        tp_queries = F.normalize(tp_queries, dim=-1, p=2)
+                        tp_queries_clip = F.normalize(tp_queries_clip, dim=-1, p=2)
+                    if self.use_cdt:
+                        raise NotImplementedError
+                    query_names_results = torch.einsum("bnd,cd->bnc", tp_queries_clip, text_classifier2)
 
-                src_queries = matched_preds["query"]
-                src_clipV = self.sam2Clip(src_queries) 
-                tgt_clipV = matched_gts["pooled_img_feat"]
-
-                # 只对成功匹配到的对计算 Loss
-                if valid_indices.any():
-                    src_clipV_filtered = src_clipV[valid_indices]
-                    tgt_clipV_filtered = tgt_clipV[valid_indices]
-                    ClipV_distill_loss = self.cosine_similarity_loss(src_clipV_filtered, tgt_clipV_filtered)
                 else:
-                    ClipV_distill_loss = src_clipV.sum() * 0 # 防止无匹配时报错
+                    if self.use_cos_sim:
+                        tp_queries = F.normalize(tp_queries, dim=-1, p=2)
 
-                clip_distill_losses.update(ClipV_distill_loss)
+                    if self.use_cdt:
+                        query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, text_classifier) # bs, N, C
+                    else:
+                        query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier) # bs, N, C
                 
-                src_clipT = self.clipV2T(src_clipV.detach())
 
-                text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], VILD_PROMPT)
-                mask_cls_results = get_classification_logits(src_clipT, text_classifier2, self.backbone2.clip_model.logit_scale, num_templates_teacher)
-                ClipT_cls_loss = self.cross_entropy_loss(mask_cls_results, matched_labels)
+                if self.use_cos_sim:
+                    cur_logit_scale = self.logit_scale[i].exp()
+                    cur_logit_scale = torch.clamp(cur_logit_scale, max=100.0)
+                    cur_logit_bias = self.logit_bias[i]
+                    query_names_results = cur_logit_scale * query_names_results + cur_logit_bias
+                else:
+                    query_names_results = query_names_results + self.logit_bias[i]
 
-                # mask_names_logits = torch.einsum("bnd,cd->bnc", src_clipT, text_classifier2)
-                # mask_cls_logits =  aggregate_name_to_class_logits(mask_names_logits, num_templates_teacher)       
-                # distill_logit_scale = torch.clamp(self.distill_logit_scale, max=100.0)
-                # mask_cls_logits = mask_cls_logits * distill_logit_scale + self.distill_logit_bias
-                # ClipT_cls_loss = self.instance_wise_ckd_loss(mask_cls_logits, matched_labels, alpha=0.25, gamma=2.0)
+                query_cls_results= []
+                cur_idx = 0
+                if self.clip_distill:
+                    tp_num_templates = num_templates_teacher
+                else:
+                    tp_num_templates = num_templates
 
+                for num_t in tp_num_templates: 
+                    query_cls_results.append(query_names_results[:,:, cur_idx: cur_idx + num_t].max(-1).values)
+                    cur_idx += num_t
+                query_cls_results = torch.stack(query_cls_results, dim=-1) # bs, N, num_classes
+                # print(f"aux query_cls_results[{i}] shape:", query_cls_results.shape)
+                    
+                if i<5:
+                    aux_out = {
+                        'pred_logits': query_cls_results, 
+                        'pred_masks': outputs['aux_outputs'][i]["pred_masks"], 
+                        'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'],
+                        'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"],
+                    }
+                    if cur_obj_logits is not None:
+                        aux_out['pred_objectness_logits'] = cur_obj_logits
+                    if self.clip_distill:
+                        aux_out['pred_region_features'] =  tp_queries_clip
+                    
+                    aux_outputs.append(aux_out)
+                else:
+                    query_cls_results_final = query_cls_results
+                    obj_logits_final = cur_obj_logits
+                    if self.clip_distill:
+                        final_queries_clip =  tp_queries_clip
+        
 
+        if self.training:
 
-                clip_distill_losses.update(ClipT_cls_loss)
+            criterion_pred = {
+                'pred_logits': query_cls_results_final,
+                'pred_masks': outputs["pred_masks"],
+                'pred_boxes': outputs['pred_boxes'],
+                'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
+                'aux_outputs': aux_outputs if use_aux is True else None,
+            }
+            if obj_logits_final is not None:
+                criterion_pred['pred_objectness_logits'] = obj_logits_final
+
+            if self.clip_distill:
+                criterion_pred['pred_region_features'] = final_queries_clip
+                for i in range(len(targets)):
+                    targets[i]['teacher_features'] = gt_clip_features_list[i]
+
+            losses = self.criterion(criterion_pred, targets)
 
                 
                                                 
@@ -1308,49 +1281,9 @@ class SAM3MC_o365(nn.Module):
                     if k in self.encoder_criterion.weight_dict:
                         losses[k + '_encoder'] = encoder_losses[k] * self.encoder_criterion.weight_dict[k]
 
-            if self.clip_distill:
-                for k in clip_distill_losses:
-                    losses["clip_distill_"+k] = clip_distill_losses[k]
             return losses
         
         else:
-            if self.clip_distill:
-                queries = outputs["obj_queries"][5,:,:,:]
-                queries_clipV = self.sam2Clip(queries) 
-                queries_clipT = self.clipV2T(queries_clipV)
-
-                text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], VILD_PROMPT)
-                clip_cls_results = get_classification_logits(queries_clipT, text_classifier2, self.backbone2.clip_model.logit_scale, num_templates_teacher) # bs, N, C_teacher
-
-                category_overlapping_mask = self.category_overlapping_mask.to(self.device)
-                in_vocab_cls_probs = query_cls_results_final.sigmoid()
-                out_vocab_cls_probs = clip_cls_results.softmax(-1)
-
-                alpha = 0.5
-                beta = 0.8
-                # 为了数值稳定性，加一个小 epsilon
-                eps = 1e-7 
-                probs_seen = (
-                    (in_vocab_cls_probs + eps) ** (1 - alpha) * 
-                    (out_vocab_cls_probs + eps) ** alpha
-                )
-                
-                # 计算 Unseen 类的加权几何平均概率
-                probs_unseen = (
-                    (in_vocab_cls_probs + eps) ** (1 - beta) * 
-                    (out_vocab_cls_probs + eps) ** beta
-                )
-
-                # 组合概率 (注意这里不是加 log，而是选通概率)
-                final_probs = (
-                    probs_seen * category_overlapping_mask + 
-                    probs_unseen * (1 - category_overlapping_mask)
-                )
-                
-                # 钳位数值防止 logit 计算出现 inf/-inf
-                final_probs = torch.clamp(final_probs, min=eps, max=1-eps)
-                query_cls_results_final = torch.logit(final_probs)
-
 
             if self.Teacher_MaskPool:
                 imgs_bb2 = images.tensor * self.pixel_std + self.pixel_mean
