@@ -342,6 +342,7 @@ class SAM3MC_o365(nn.Module):
             num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
             oversample_ratio=cfg.SOLVER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
+            tau=cfg.SOLVER.CONTRAST_TEMPERATURE,
         )
 
         # -------------------------------------------------------

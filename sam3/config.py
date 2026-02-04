@@ -54,7 +54,7 @@ def add_sam3_config(cfg):
     cfg.SOLVER.BACKBONE_MULTIPLIER = 0.0
     cfg.SOLVER.NO_OBJECT_WEIGHT = 0.1
     cfg.SOLVER.CLASS_WEIGHT = 2.0
-    cfg.SOLVER.CONTRAST_WEIGHT = 2.0
+    cfg.SOLVER.CONTRAST_WEIGHT = 1.0
     cfg.SOLVER.OBJECT_WEIGHT = 2.0
     cfg.SOLVER.MASK_WEIGHT = 5.0
     cfg.SOLVER.DICE_WEIGHT = 5.0
@@ -66,6 +66,7 @@ def add_sam3_config(cfg):
 
     cfg.SOLVER.USE_AUX = True
     cfg.SOLVER.CLIP_DISTILL = False
+    cfg.SOLVER.CONTRAST_TEMPERATURE = 0.07
 
     cfg.TEST.SEMANTIC_ON = True
     cfg.TEST.INSTANCE_ON = False
