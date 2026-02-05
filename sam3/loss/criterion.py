@@ -158,72 +158,56 @@ class SetCriterion(nn.Module):
 
     def loss_contrast(self, outputs, targets, indices, num_masks):
         """
-        Regional Contrastive Distillation Loss (Eq. 5 & 6 in CCKT-Det)
-        
-        Args:
-            outputs: 必须包含 key 'pred_region_features' (Student features), shape [B, N, D]
-            targets: 每个 dict 必须包含 key 'teacher_features' (Teacher/CLIP features), shape [M, D]
-            indices: Hungarian matching 的结果
+        Pull-Only Contrastive Distillation with Consistency Filtering
         """
         assert 'pred_region_features' in outputs
-        
-        # 获取 Student 特征: [Batch, Num_Queries, Dim]
-        student_feats = outputs['pred_region_features']
+        student_feats = outputs['pred_region_features'] # [B, N, D]
         
         loss_contrast = 0.0
-        n_batches = len(targets)
-
-        device = student_feats.device
+        total_valid_pairs = 0
         
-        # 对比损失通常在单张图片内部计算，逐个 Batch 循环处理
+        device = student_feats.device
+
         for batch_i, (src_idx, tgt_idx) in enumerate(indices):
             if len(tgt_idx) == 0:
                 continue
-                
-            src_idx = src_idx.to(device)
-            tgt_idx = tgt_idx.to(device)
-
-            # 1. 取出当前图片的特征
-            # student_e: [N, D] (所有 Queries)
-            student_e = student_feats[batch_i]
-            # teacher_r: [M, D] (所有 GTs)
-            teacher_r = targets[batch_i]['teacher_features']
-
-            # 2. 归一化 (Cosine Similarity 前置步骤)
-            student_e = F.normalize(student_e, p=2, dim=-1)
-            teacher_r = F.normalize(teacher_r, p=2, dim=-1)
-
-            # ================= Equation 5: Teacher -> Student =================
-            # 语义: 对于第 i 个 Teacher GT (r_i)，谁是它对应的 Student Query (e_j)?
-            # 这是一个分类问题：类别数 = Num_Queries (N)
             
-            # 计算相似度矩阵 [M, N] -> (Teacher, Student)
-            # logits_t2s[i, j] 表示第 i 个 GT 和第 j 个 Query 的相似度
-            logits_t2s = torch.matmul(teacher_r, student_e.t()) / self.tau
+            # 1. 获取基础数据
+            # Student: [M, D]
+            e_matched = student_feats[batch_i][src_idx] 
+            # Teacher: [M, D]
+            r_matched = targets[batch_i]['teacher_features'][tgt_idx]
             
-            # 我们只关心匹配上的那些 GT (tgt_idx)
-            # 对于 tgt_idx 中的每一个 GT，其 Label 就是 src_idx 中的对应索引
-            matched_logits_t2s = logits_t2s[tgt_idx] # Shape: [Num_Matched, N]
-            loss_t2s = F.cross_entropy(matched_logits_t2s, src_idx)
+            # [新增] 获取 Teacher 的有效性 Mask
+            # targets[batch_i]['teacher_valid_mask'] 是 [Num_GT]
+            # 我们只取匹配到的那些 GT 的 valid 状态 -> [M]
+            is_teacher_correct = targets[batch_i]['teacher_valid_mask'][tgt_idx]
 
-            # ================= Equation 6: Student -> Teacher =================
-            # 语义: 对于第 i 个 Student Query (e_i)，谁是它对应的 Teacher GT (r_j)?
-            # 这是一个分类问题：类别数 = Num_GTs (M)
-            # 注意：这里我们只计算"匹配上的" Student Query，未匹配的作为负样本在分母中体现比较困难，
-            # CCKT-Det 的实现通常是将所有 GT 视为候选类别。
+            # 如果当前图片匹配到的 GT 全都被 Teacher 认错了，跳过
+            if not is_teacher_correct.any():
+                continue
 
-            # 计算相似度矩阵 [N, M] -> (Student, Teacher)
-            logits_s2t = torch.matmul(student_e, teacher_r.t()) / self.tau
+            # 2. 归一化
+            e_matched = F.normalize(e_matched, p=2, dim=-1)
+            r_matched = F.normalize(r_matched, p=2, dim=-1)
             
-            # 我们只关心匹配上的那些 Query (src_idx)
-            matched_logits_s2t = logits_s2t[src_idx] # Shape: [Num_Matched, M]
-            loss_s2t = F.cross_entropy(matched_logits_s2t, tgt_idx)
+            # 3. 计算距离 (1 - Cosine Similarity)
+            # dist: [M]
+            dist = 1.0 - (e_matched * r_matched).sum(dim=-1)
+            
+            # 4. [关键] 应用过滤
+            # 只保留 Teacher 预测正确的那些样本的 Loss
+            valid_loss = dist * is_teacher_correct.float()
+            
+            loss_contrast += valid_loss.sum()
+            
+            # 分母只统计有效的对数
+            total_valid_pairs += is_teacher_correct.sum().item()
 
-            # 平均两个方向的损失
-            loss_contrast += (loss_t2s + loss_s2t) / 2.0
-
-        # 对 Batch 取平均
-        return {'loss_contrast': loss_contrast / n_batches}
+        if total_valid_pairs > 0:
+            return {'loss_contrast': loss_contrast / total_valid_pairs}
+        else:
+            return {'loss_contrast': student_feats.sum() * 0.0}
 
     def loss_labels(self, outputs, targets, indices, num_masks):
         """

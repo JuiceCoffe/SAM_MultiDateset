@@ -1143,29 +1143,57 @@ class SAM3MC_o365(nn.Module):
                     clip_feature = self.backbone2.extract_features(imgs_bb2)["clip_vis_dense"]
 
                     gt_clip_features_list = []
+                    gt_valid_mask_list = [] 
+
                     for t_idx, t in enumerate(targets):
-                        gt_masks = t["masks"] # [N_gt, H, W]
+                        gt_masks = t["masks"]      # [N_gt, H_pad, W_pad]
+                        gt_classes = t["labels"]   # [N_gt]
+                        curr_img_feat = clip_feature[t_idx] # [C, H', W']
+
                         if gt_masks.shape[0] > 0:
                             # 插值 GT Mask 到 CLIP 特征图大小
                             gt_masks_down = F.interpolate(
                                 gt_masks.unsqueeze(1).float(), 
-                                size=clip_feature.shape[-2:], 
+                                size=curr_img_feat.shape[-2:], 
                                 mode='bilinear', align_corners=False
-                            ).squeeze(1)
+                            ).squeeze(1) # [N_gt, H', W']
                             
-                            # 提取该 Batch 当前图片的 CLIP 特征
-                            curr_img_feat = clip_feature[t_idx].unsqueeze(0) # [1, C, H, W]
+                            # Mask Pooling
+                            # 输入 curr_img_feat: [C, H', W'] -> unsqueeze(0) -> [1, C, H', W']
+                            # 输入 gt_masks_down: [N_gt, H', W'] -> unsqueeze(0) -> [1, N_gt, H', W']
+                            pooled_feat = self.mask_pooling(
+                                curr_img_feat.unsqueeze(0), 
+                                gt_masks_down.unsqueeze(0)
+                            ) # 输出形状: [1, N_gt, C]
                             
-                            # Mask Pooling (使用你的 mask_pooling 模块)
-                            # 注意 mask_pooling通常输入 [B, C, H, W] 和 [B, N, H, W]
-                            # 这里我们需要手动处理 batch 维度或循环
-                            # 假设 self.mask_pooling 支持单张处理
-                            pooled_feat = self.mask_pooling(curr_img_feat, gt_masks_down.unsqueeze(0)) # [1, N_gt, C]
-                            pooled_feat = self.backbone2.visual_prediction_forward(pooled_feat)
-                            pooled_feat = F.normalize(pooled_feat, dim=-1, p=2)
-                            gt_clip_features_list.append(pooled_feat.squeeze(0))
+                            pooled_feat = self.backbone2.visual_prediction_forward(pooled_feat).squeeze(0)
+                            pooled_feat = F.normalize(pooled_feat, p=2, dim=-1)
+                            
+                            # ================= 修正后的过滤逻辑 =================
+                            # 1. 计算视觉特征与所有模板的相似度
+                            # pooled_feat: [N_gt, C], text_names: [Total_Templates, C]
+                            # sim_name_logits: [N_gt, Total_Templates]
+                            sim_name_logits = torch.einsum("nc,kc->nk", pooled_feat, text_classifier2)
+                            
+                            # 2. 对模板相似度进行聚合
+                            # sim_cls_logits: [N_gt, Num_Classes]
+                            sim_cls_logits = aggregate_name_to_class_logits(
+                                sim_name_logits, # 直接传入无 batch 维的张量
+                                num_templates_teacher
+                            )
+                            
+                            # 3. 获取 Teacher 预测的类别 ID
+                            teacher_preds = sim_cls_logits.argmax(dim=-1) # [N_gt]
+                            
+                            # 4. 比较 Teacher 预测与 GT Label
+                            is_consistent = (teacher_preds == gt_classes)
+                            
+                            gt_clip_features_list.append(pooled_feat) # 存入 [N_gt, C]
+                            gt_valid_mask_list.append(is_consistent)
+
                         else:
                             gt_clip_features_list.append(torch.empty(0, 768, device=self.device)) 
+                            gt_valid_mask_list.append(torch.empty(0, dtype=torch.bool, device=self.device)) # 存空
     
 
         for i in range(6):
@@ -1255,6 +1283,7 @@ class SAM3MC_o365(nn.Module):
                 criterion_pred['pred_region_features'] = final_queries_clip
                 for i in range(len(targets)):
                     targets[i]['teacher_features'] = gt_clip_features_list[i]
+                    targets[i]['teacher_valid_mask'] = gt_valid_mask_list[i]
 
             losses = self.criterion(criterion_pred, targets)
 
