@@ -58,7 +58,7 @@ import math
 
 
 @META_ARCH_REGISTRY.register()
-class SAM3_TEACHER(nn.Module):
+class SAM3CLIP(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.device_type = cfg.MODEL.DEVICE
@@ -68,46 +68,46 @@ class SAM3_TEACHER(nn.Module):
         # -------------------------------------------------------
         # 2. 实例化 SAM3 Model
         # -------------------------------------------------------       
-        # compile_mode = "default" if cfg.MODEL.SAM3.COMPILE else None
+        compile_mode = "default" if cfg.MODEL.SAM3.COMPILE else None
         
-        # vision_encoder = _create_vision_backbone(
-        #     compile_mode=compile_mode, 
-        #     enable_inst_interactivity=cfg.MODEL.SAM3.ENABLE_INST_INTERACTIVITY
-        # )
-        # text_encoder = _create_text_encoder(cfg.MODEL.SAM3.BPE_PATH)
-        # backbone = _create_vl_backbone(vision_encoder, text_encoder)
-        # transformer = _create_sam3_transformer(
-        #     use_gate = cfg.MODEL.SAM3.USE_GATE,
-        # )
-        # dot_prod_scoring = _create_dot_product_scoring()
+        vision_encoder = _create_vision_backbone(
+            compile_mode=compile_mode, 
+            enable_inst_interactivity=cfg.MODEL.SAM3.ENABLE_INST_INTERACTIVITY
+        )
+        text_encoder = _create_text_encoder(cfg.MODEL.SAM3.BPE_PATH)
+        backbone = _create_vl_backbone(vision_encoder, text_encoder)
+        transformer = _create_sam3_transformer(
+            use_gate = cfg.MODEL.SAM3.USE_GATE,
+        )
+        dot_prod_scoring = _create_dot_product_scoring()
 
-        # segmentation_head = (
-        #     _create_segmentation_head(compile_mode=compile_mode)
-        #     if cfg.MODEL.SAM3.ENABLE_SEGMENTATION
-        #     else None
-        # )
+        segmentation_head = (
+            _create_segmentation_head(compile_mode=compile_mode)
+            if cfg.MODEL.SAM3.ENABLE_SEGMENTATION
+            else None
+        )
             
-        # input_geometry_encoder = _create_geometry_encoder()
+        input_geometry_encoder = _create_geometry_encoder()
 
-        # enable_inst_interactivity = False # 遵照sam3设置
-        # if enable_inst_interactivity:
-        #     sam3_pvs_base = build_tracker(apply_temporal_disambiguation=False)
-        #     inst_predictor = SAM3InteractiveImagePredictor(sam3_pvs_base)
-        # else:
-        #     inst_predictor = None
+        enable_inst_interactivity = False # 遵照sam3设置
+        if enable_inst_interactivity:
+            sam3_pvs_base = build_tracker(apply_temporal_disambiguation=False)
+            inst_predictor = SAM3InteractiveImagePredictor(sam3_pvs_base)
+        else:
+            inst_predictor = None
 
-        # self.detector = _create_sam3_model(
-        #     backbone,
-        #     transformer,
-        #     input_geometry_encoder,
-        #     segmentation_head,
-        #     dot_prod_scoring,
-        #     inst_predictor,
-        #     cfg.eval_only,
-        # )
-        # if cfg.eval_only:
-        #     self.detector.eval()
-        # print("SAM3创建成功!")
+        self.detector = _create_sam3_model(
+            backbone,
+            transformer,
+            input_geometry_encoder,
+            segmentation_head,
+            dot_prod_scoring,
+            inst_predictor,
+            cfg.eval_only,
+        )
+        if cfg.eval_only:
+            self.detector.eval()
+        print("SAM3创建成功!")
 
         if cfg.MODEL.SAM3.USE_VILD_PROMPT:
             self.PROMPT = VILD_PROMPT
@@ -136,15 +136,7 @@ class SAM3_TEACHER(nn.Module):
 
 
         self.num_decoder_layers = 6 # SAM3/DETR 标准层数
-        
-
-        
-        prior_prob = 0.01
-        bias_value = -np.log((1 - prior_prob) / prior_prob)
-        self.logit_bias = nn.Parameter(torch.ones([]) * bias_value) 
-
-        if self.use_cos_sim:
-            self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+    
         self.num_cdt = cfg.MODEL.SAM3.NUM_CDT    
         self.use_cdt = False if cfg.MODEL.SAM3.NUM_CDT == 0 else True
         if self.use_cdt:
@@ -227,6 +219,7 @@ class SAM3_TEACHER(nn.Module):
         if self.new_score_head:
             self.score_head = MLP(256, 256, 1, 3)
             init_score_head(self.score_head)
+
         # -------------------------------------------------------
         # 训练配置
         # -------------------------------------------------------
@@ -254,8 +247,7 @@ class SAM3_TEACHER(nn.Module):
         # -------------------------------------------------------
         # criterion损失函数
         # -------------------------------------------------------
-
-        
+        losses = ["labels", "masks", "boxes"]
 
         # loss weights
         class_weight = cfg.SOLVER.CLASS_WEIGHT
@@ -267,10 +259,24 @@ class SAM3_TEACHER(nn.Module):
 
         objectness_weight = cfg.SOLVER.OBJECT_WEIGHT
 
+        self.use_softmax = cfg.MODEL.SAM3.USE_SOFTMAX
+        self.void_embedding = None
+        if self.use_softmax:
+            self.void_embedding = nn.Embedding(1, 256)
+
+
+        self.logit_bias = None
+        if not self.use_softmax:
+            prior_prob = 0.01
+            bias_value = -np.log((1 - prior_prob) / prior_prob)
+            self.logit_bias = nn.Parameter(torch.ones([]) * bias_value) 
+
+        if self.use_cos_sim:
+            self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
         weight_dict = {}
         criterion_weight_dict = {
-            "loss_focal": class_weight, 
+            "loss_cls": class_weight, 
             "loss_mask": mask_weight, 
             "loss_dice": dice_weight,
             'loss_bbox':bbox_weight, 
@@ -323,32 +329,54 @@ class SAM3_TEACHER(nn.Module):
                 self.encoder_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
 
-        losses = ["labels", "masks", "boxes"]
+        
         self.contrast_on = False
         if contrast_weight > 0 and self.clip_distill:
             losses.append("contrast")
             self.contrast_on = True
 
         # building criterion
-        matcher = HungarianMatcher(
-            cost_class=class_weight,
-            cost_mask=mask_weight,
-            cost_dice=dice_weight,
-            # cost_bbox=bbox_weight, # 新增：用于匹配计算
-            # cost_giou=giou_weight, # 新增：用于匹配计算
-            num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
-        )
+        if self.use_softmax:
+            from .loss.fcclip_criterion import FcclipSetCriterion
+            from .loss.fcclip_matcher import FcclipHungarianMatcher
+
+            no_object_weight = 0.1
+
+            matcher = FcclipHungarianMatcher(
+                cost_class=class_weight,
+                cost_mask=mask_weight,
+                cost_dice=dice_weight,
+                num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
+            )
+            self.criterion = FcclipSetCriterion(
+                num_classes = 133,
+                matcher=matcher,
+                weight_dict=weight_dict,
+                eos_coef=no_object_weight,
+                losses=losses,
+                num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
+                oversample_ratio=cfg.SOLVER.OVERSAMPLE_RATIO,
+                importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
+            )
+
+        else:
+            matcher = HungarianMatcher(
+                cost_class=class_weight,
+                cost_mask=mask_weight,
+                cost_dice=dice_weight,
+                num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
+            )
         
 
-        self.criterion = SetCriterion(
-            matcher=matcher,
-            weight_dict=weight_dict,
-            losses=losses,
-            num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
-            oversample_ratio=cfg.SOLVER.OVERSAMPLE_RATIO,
-            importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
-            tau=cfg.SOLVER.CONTRAST_TEMPERATURE,
-        )
+            self.criterion = SetCriterion(
+                matcher=matcher,
+                weight_dict=weight_dict,
+                losses=losses,
+                num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
+                oversample_ratio=cfg.SOLVER.OVERSAMPLE_RATIO,
+                importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
+                tau=cfg.SOLVER.CONTRAST_TEMPERATURE,
+            )
 
         # -------------------------------------------------------
         # 【新增】Inference 参数配置
@@ -558,7 +586,7 @@ class SAM3_TEACHER(nn.Module):
                     )
                 text_classifier = []
                 bs = 128
-                print("Generating text classifier for", dataname, "with", len(self.train_class_names_teacher ), "classes.")
+                print("Generating text classifier for", dataname, "with", len(self.train_class_names), "classes.")
                 for idx in range(0, len(self.train_class_names_teacher), bs):
                     text_classifier.append(self.backbone2.get_text_classifier(self.train_class_names_teacher[idx:idx+bs], self.device).detach())
                 text_classifier = torch.cat(text_classifier, dim=0)
@@ -787,7 +815,16 @@ class SAM3_TEACHER(nn.Module):
         img_h, img_w = images.tensor.shape[-2:]
 
         bs = images.tensor.shape[0]
-
+        
+        self.find_stage = FindStage(
+            img_ids=torch.arange(bs, device=self.device, dtype=torch.long),
+            text_ids=torch.arange(bs, device=self.device, dtype=torch.long),
+            input_boxes=None,
+            input_boxes_mask=None,
+            input_boxes_label=None,
+            input_points=None,
+            input_points_mask=None,
+        )
         with torch.no_grad():
 
             file_names = [x["file_name"] for x in batched_inputs]
@@ -800,6 +837,277 @@ class SAM3_TEACHER(nn.Module):
             
             # print("keys of meta:", meta.keys())
             dataname = get_dataname(batched_inputs[0])
+            
+            # 图形特征
+            backbone_out_vision = self.detector.backbone.forward_image(images.tensor)
+            img_feat = backbone_out_vision["vision_features"].detach() # bs, D, H', W'
+            backbone_fpn = backbone_out_vision["backbone_fpn"]
+            for k in range(len(backbone_fpn)):
+                backbone_fpn[k] = backbone_fpn[k].detach()
+
+
+            # 语言特征
+            # text_classifier:[num_names, dim] 
+            # language_features:[num_names, num_templates, L, dim] language_mask:[num_names, num_templates, L]
+            
+            # text_classifier, num_templates = self.get_text_classifier(meta['dataname'])
+            text_classifier, num_templates = self.get_text_classifier(dataname)
+            if self.void_embedding is not None:
+                text_classifier = torch.cat([text_classifier, F.normalize(self.void_embedding.weight, dim=-1)], dim=0)
+
+            # others
+            geometric_prompt = self.detector._get_dummy_prompt(bs)
+        
+        if self.use_cdt:
+            # text_classifier = self.cdt(img_feat,text_classifier)
+            for layer in self.cdt:
+                text_classifier = layer(img_feat,text_classifier) # 逐层通过
+
+        batch_gt_names_idx = []
+        for i in range(bs):
+            # gt_classes = get_gt_labels_from_sem_seg(batched_inputs[i]["sem_seg"].to(self.device))
+
+            # === 修改开始：适配 Objects365 的 Instances 格式 ===
+            gt_classes = []
+            if "instances" in batched_inputs[i]:
+                # 从实例中提取去重后的类别 ID
+                if len(batched_inputs[i]["instances"]) > 0:
+                    gt_classes = batched_inputs[i]["instances"].gt_classes.unique().cpu().tolist()
+            elif "sem_seg" in batched_inputs[i]:
+                # 兼容旧的 COCO Stuff 逻辑
+                gt_classes = get_gt_labels_from_sem_seg(batched_inputs[i]["sem_seg"].to(self.device))
+            # === 修改结束 ===
+
+            gt_names_idx = []
+            cur_idx = 0
+            for i,num_t in enumerate(num_templates): 
+                if i in gt_classes:
+                    gt_names_idx += list(range(cur_idx, cur_idx + num_t))
+                cur_idx += num_t
+            batch_gt_names_idx.append(gt_names_idx)
+
+        # =======================================================
+        
+        language_features_input = []
+
+        # USE_GT_NAMES_ONLY = True
+        USE_GT_NAMES_ONLY = False
+        
+        if USE_GT_NAMES_ONLY:
+            language_features_input = [self.language_features[batch_gt_names_idx[i],:,:] for i in range(bs)]
+            language_features_input = torch.cat(language_features_input, dim=0) # (bs, num_names * L, dim)
+            language_mask_input = [self.language_mask[batch_gt_names_idx[i],:] for i in range(bs)]
+            language_mask_input = torch.cat(language_mask_input, dim=0) # (bs, num_names * L)
+            if bs == 1:
+                language_features_input = language_features_input.unsqueeze(0)
+                language_mask_input = language_mask_input.unsqueeze(0)
+
+        else:
+            language_features_input = self.language_features.expand(bs, -1, -1, -1) # (bs, num_names, L, dim)
+            language_mask_input = self.language_mask.expand(bs, -1, -1) # (bs, num_names, L)
+
+        # print("shape of input:",language_features_input.shape, language_mask_input.shape)
+        language_features_input = language_features_input.reshape(bs, -1, language_features_input.shape[-1]) # (bs, num_names * L, dim)
+        language_mask_input = language_mask_input.reshape(bs, -1) # (bs, num_names * L)
+        # print("shape of input after reshape:",language_features_input.shape, language_mask_input.shape)
+        
+
+        backbone_out={
+            "img_batch_all_stages": img_feat,
+            "vision_pos_enc": backbone_out_vision["vision_pos_enc"],
+            "backbone_fpn": backbone_fpn,
+            "language_features": language_features_input.permute(1, 0, 2), # (num_names * L, bs, dim)
+            "language_mask": language_mask_input, # bs, (num_names * L)
+        }
+
+        #=================================
+        find_input = self.find_stage
+
+        with torch.profiler.record_function("SAM3Image._encode_prompt"):
+            prompt, prompt_mask, backbone_out = self.detector._encode_prompt(
+                backbone_out, find_input, geometric_prompt
+            )
+        # Run the encoder
+        with torch.profiler.record_function("SAM3Image._run_encoder"):
+            backbone_out, encoder_out, _ = self.detector._run_encoder(
+                backbone_out, find_input, prompt, prompt_mask
+            )
+
+        fusion_feat = encoder_out["encoder_hidden_states"] # H'*W', bs, D
+        fusion_feat = fusion_feat.permute(1,0,2) # bs, H'*W', D
+        if self.use_cos_sim:
+            fusion_feat = F.normalize(fusion_feat, dim=-1)
+
+        if self.encoder_loss:
+            if self.use_cdt:
+                encoder_logits = torch.einsum("bld,bcd->blc", fusion_feat, text_classifier)
+            else:
+                encoder_logits = torch.einsum("bld,cd->blc", fusion_feat, text_classifier)
+            
+            if self.use_cos_sim:
+                e_logit_scale = self.encoder_logit_scale.exp()
+                e_logit_scale = torch.clamp(e_logit_scale, max=100.0)
+                encoder_logits = encoder_logits * e_logit_scale + self.encoder_logit_bias
+            else:
+                encoder_logits = encoder_logits / (fusion_feat.shape[-1] ** 0.5) + self.encoder_logit_bias
+
+
+            encoder_logits = aggregate_name_to_class_logits(encoder_logits, num_templates)
+
+            encoder_score = encoder_logits.max(-1).values # [bs, HW]
+            k_selected = self.num_encoder_query
+            topk_values, topk_indices = torch.topk(encoder_score, k_selected, dim=1) # [bs, k]
+            topk_indices_unsqueezed = topk_indices.unsqueeze(-1).repeat(1, 1, fusion_feat.shape[-1])
+            topK_fusion_feat = torch.gather(fusion_feat, 1, topk_indices_unsqueezed) # [bs, k, D]
+            num_classes = encoder_logits.shape[-1]
+            encoder_cls_logits = torch.gather(
+                encoder_logits, 
+                1, 
+                topk_indices.unsqueeze(-1).expand(-1, -1, num_classes)
+            )
+
+
+        out = {
+            "encoder_hidden_states": encoder_out["encoder_hidden_states"],
+            "prev_encoder_out": {
+                "encoder_out": encoder_out,
+                "backbone_out": backbone_out,
+            },
+        }
+        # print("keys of out before decoder:", out.keys()) # s(['encoder_hidden_states', 'prev_encoder_out'])
+        # Run the decoder
+        with torch.profiler.record_function("SAM3Image._run_decoder"):            
+            # out, hs = self.detector._run_decoder(
+            #     memory=out["encoder_hidden_states"],
+            #     pos_embed=encoder_out["pos_embed"],
+            #     src_mask=encoder_out["padding_mask"],
+            #     out=out,
+            #     prompt=prompt,
+            #     prompt_mask=prompt_mask,
+            #     encoder_out=encoder_out,
+            # )
+            if self.DynamicQuery:
+                # ---------------- Relative Offset Prediction 修改开始 ----------------
+                
+                # 1. 获取全图的网格锚点 (Grid Anchors)
+                # encoder_out["spatial_shapes"] 包含了特征图的高宽
+                # grid_anchors shape: [1, Total_HW, 2] -> (x, y)
+                grid_anchors = get_grid_reference_points(
+                    encoder_out["spatial_shapes"], 
+                    device=self.device
+                )
+                
+                # 2. 扩展到 Batch 维度
+                # grid_anchors shape: [bs, Total_HW, 2]
+                grid_anchors = grid_anchors.expand(bs, -1, -1)
+                
+                # 3. 根据 TopK 索引提取对应的锚点
+                # topk_indices shape: [bs, k]
+                # 我们需要 gather 最后一个维度 (x, y)，所以要扩展 indices
+                gather_idx = topk_indices.unsqueeze(-1).repeat(1, 1, 2) # [bs, k, 2]
+                
+                # topk_anchors_xy shape: [bs, k, 2]
+                topk_anchors_xy = torch.gather(grid_anchors, 1, gather_idx)
+                
+                # 4. 构建完整的 4D 锚点 (x, y, w, h)
+                # x, y 来自网格，w, h 初始化为一个较小的先验值 (例如 0.05)
+                # 这样 inverse_sigmoid 不会溢出，且符合物体初始尺寸较小的假设
+                anchor_wh_prior = torch.full_like(topk_anchors_xy, 0.05)
+                topk_anchors = torch.cat([topk_anchors_xy, anchor_wh_prior], dim=-1) # [bs, k, 4]
+                
+                # 5. 计算偏移量 (Logit Space)
+                # encoder_box_head 输出的是相对于锚点的偏移修正量
+                delta_box_logits = self.encoder_box_head(topK_fusion_feat)
+                
+                # 6. 核心公式：Box = Sigmoid( Delta + InverseSigmoid(Anchor) )
+                # 将锚点转换到 logit 域，加上偏移量，再转回 [0, 1] 域
+                anchor_logits = inverse_sigmoid(topk_anchors)
+                encoder_box = (delta_box_logits + anchor_logits).sigmoid() # [bs, k, 4]
+                
+                # ---------------- Relative Offset Prediction 修改结束 ----------------
+
+                hs, reference_boxes, dec_presence_out, dec_presence_feats = (
+                    self.detector.transformer.decoder(
+
+                        tgt=topK_fusion_feat.permute(1,0,2).detach(), # TopK fusion feat
+
+                        memory=out["encoder_hidden_states"],
+                        memory_key_padding_mask=encoder_out["padding_mask"],
+                        pos=encoder_out["pos_embed"],
+
+                        reference_boxes=encoder_box.permute(1,0,2).detach(),
+
+                        level_start_index=encoder_out["level_start_index"],
+                        spatial_shapes=encoder_out["spatial_shapes"],
+                        valid_ratios=encoder_out["valid_ratios"],
+                        tgt_mask=None,
+                        memory_text=prompt,
+                        text_attention_mask=prompt_mask,
+                        apply_dac=False,
+                    )
+                )
+
+            else:
+                query_embed = self.detector.transformer.decoder.query_embed.weight
+                query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+
+                hs, reference_boxes, dec_presence_out, dec_presence_feats = (
+                    self.detector.transformer.decoder(
+                        tgt=query_embed,
+                        memory=out["encoder_hidden_states"],
+                        memory_key_padding_mask=encoder_out["padding_mask"],
+                        pos=encoder_out["pos_embed"],
+                        reference_boxes=None,
+                        level_start_index=encoder_out["level_start_index"],
+                        spatial_shapes=encoder_out["spatial_shapes"],
+                        valid_ratios=encoder_out["valid_ratios"],
+                        tgt_mask=None,
+                        memory_text=prompt,
+                        text_attention_mask=prompt_mask,
+                        apply_dac=False,
+                    )
+                )
+            hs = hs.transpose(1, 2)  # seq-first to batch-first
+            reference_boxes = reference_boxes.transpose(1, 2)  # seq-first to batch-first
+            if dec_presence_out is not None:
+                # seq-first to batch-first
+                dec_presence_out = dec_presence_out.transpose(1, 2)
+
+            out["presence_feats"] = dec_presence_feats
+            self.detector._update_scores_and_boxes(
+                out,
+                hs,
+                reference_boxes,
+                prompt,
+                prompt_mask,
+                dec_presence_out=dec_presence_out,
+            )
+
+
+        # print("keys of out after decoder:", out.keys()) # (['encoder_hidden_states', 'prev_encoder_out', 'presence_feats', 'queries', 'presence_logit_dec', 'pred_logits', 'pred_boxes', 'pred_boxes_xyxy'])
+        # Run segmentation heads
+        with torch.profiler.record_function("SAM3Image._run_segmentation_heads"):
+            self.detector._run_segmentation_heads(
+                out=out,
+                backbone_out=backbone_out,
+                img_ids=find_input.img_ids,
+                vis_feat_sizes=encoder_out["vis_feat_sizes"],
+                encoder_hidden_states=out["encoder_hidden_states"],
+                prompt=prompt,
+                prompt_mask=prompt_mask,
+                hs=hs,
+                aux_masks=True,
+            )
+        
+        # if self.detector.training or self.detector.num_interactive_steps_val > 0:
+        #     self.detector._compute_matching(out, self.detector.back_convert(find_target))
+
+        #========================================
+        outputs = out
+        # print("outputs keys:", outputs.keys())
+        # print('aux:',outputs['aux_outputs'][0].keys())
+        # print('aux box:',outputs['aux_outputs'][0]['pred_boxes'].shape)
+        # print('aux pred_boxes_xyxy:',outputs['aux_outputs'][0]['pred_boxes_xyxy'].shape)
 
         if self.training:
             # mask classification target
@@ -808,6 +1116,45 @@ class SAM3_TEACHER(nn.Module):
                 targets = self.prepare_targets(gt_instances, images, batched_inputs)
             else:
                 targets = None
+
+        out_masks = outputs["pred_masks"].clone()
+
+        out_masks = out_masks.sigmoid()
+
+        # presence_score = outputs["presence_logit_dec"].sigmoid().unsqueeze(1) # 在多类别情况下认为失效
+
+        # out_semseg = outputs["semantic_seg"] # 原语义分割头输出，舍去
+        # out_semseg = F.interpolate(
+        #     out_semseg,
+        #     size=(img_h, img_w),
+        #     mode="bilinear",
+        #     align_corners=False,
+        # ).sigmoid()
+
+
+        # print("out_masks shape:", out_masks.shape, "out_probs shape:", out_probs.shape, "out_semseg shape:", out_semseg.shape, "presence_score shape:", presence_score.shape)
+        # out_masks shape: torch.Size([1, 200, 1008, 1008]) out_probs shape: torch.Size([1, 200]) out_semseg shape: torch.Size([1, 1, 1008, 1008]) presence_score shape: torch.Size([1, 1, 1])
+        pred_boxes = outputs['pred_boxes']
+        pred_boxes_xyxy = outputs['pred_boxes_xyxy']
+        # print("pred_boxes:",pred_boxes.shape)
+        # print("pred_boxes_xyxy:",pred_boxes_xyxy.shape)
+        
+
+        bs, N, H, W = out_masks.shape
+        C_ = text_classifier.shape[0] # num_names 
+
+        queries_masks = out_masks # out_probs是通过与池化prompt投影卷积实现的，多类别下失效，直接用原始mask_logits
+
+        queries = outputs["obj_queries"] # 6, bs, N, D
+        pixel_embed = outputs["pixel_embed"] # bs, D, H', W'
+        instance_embeds = outputs["instance_embeds"] 
+
+        use_aux = self.use_aux and self.training
+        aux_outputs = []
+
+        obj_logits = None
+        if self.new_score_head:
+            obj_logits = self.score_head(queries).squeeze(-1)
 
         if self.clip_distill:
             text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], VILD_PROMPT)
@@ -826,7 +1173,6 @@ class SAM3_TEACHER(nn.Module):
 
                     gt_clip_features_list = []
                     gt_valid_mask_list = [] 
-                    teacher_logits_list = []
 
                     for t_idx, t in enumerate(targets):
                         gt_masks = t["masks"]      # [N_gt, H_pad, W_pad]
@@ -860,64 +1206,141 @@ class SAM3_TEACHER(nn.Module):
                             
                             # 2. 对模板相似度进行聚合
                             # sim_cls_logits: [N_gt, Num_Classes]
-                            cur_sim_cls_logits = aggregate_name_to_class_logits(
-                                sim_name_logits, 
+                            sim_cls_logits = aggregate_name_to_class_logits(
+                                sim_name_logits, # 直接传入无 batch 维的张量
                                 num_templates_teacher
                             )
                             
                             # 3. 获取 Teacher 预测的类别 ID
-                            teacher_preds = cur_sim_cls_logits.argmax(dim=-1) # [N_gt]
+                            teacher_preds = sim_cls_logits.argmax(dim=-1) # [N_gt]
                             
                             # 4. 比较 Teacher 预测与 GT Label
                             is_consistent = (teacher_preds == gt_classes)
                             
                             gt_clip_features_list.append(pooled_feat) # 存入 [N_gt, C]
                             gt_valid_mask_list.append(is_consistent)
-                            teacher_logits_list.append(cur_sim_cls_logits)
 
                         else:
                             gt_clip_features_list.append(torch.empty(0, 768, device=self.device)) 
                             gt_valid_mask_list.append(torch.empty(0, dtype=torch.bool, device=self.device)) # 存空
-                            
-            for t_idx in range(len(targets)):
-                if targets[t_idx]["masks"].shape[0] > 0:
-                    # 获取类别名 (处理 meta)
-                    curr_dataname = get_dataname(batched_inputs[t_idx])
-                    meta = self.train_metadata_dict.get(curr_dataname, MetadataCatalog.get(curr_dataname))
-                    try:
-                        c_names = meta.stuff_classes
-                    except:
-                        c_names = meta.thing_classes
+    
 
-                    # 准备去标准化的图像 (imgs_bb2 已经是 [0, 255] 或已调整过的)
-                    # 如果 imgs_bb2 还是被 mean/std 减过的，需要加回来
-                    vis_img = imgs_bb2[t_idx].detach()
+        for i in range(6):
+            assert queries.shape[0] == 6
+            assert queries.shape[2] == N
+            if use_aux or i == 5 :
+                tp_queries = queries[i,:,:,:].clone() 
 
-                    # 调用可视化
-                    diag_path = f"distill_debug/iter_{t_idx}_{random.randint(0,100)}.png"
-                    visualize_distill_logic(
-                        image_tensor=vis_img,
-                        gt_masks=targets[t_idx]["masks"],
-                        gt_labels=targets[t_idx]["labels"],
-                        teacher_logits=teacher_logits_list[t_idx], # 注意：这需要是你之前 aggregate_name_to_class_logits 后的结果
-                        is_consistent=gt_valid_mask_list[t_idx],
-                        class_names=c_names,
-                        save_path=diag_path
-                    )
+                cur_obj_logits = obj_logits[i] if obj_logits is not None else None
+
+                if self.use_query_proj:
+                    tp_queries = self.query_proj(tp_queries)
+
+                if self.clip_distill:
+                    tp_queries_clip = self.sam2Clip(tp_queries)
+                    if self.use_cos_sim:
+                        tp_queries = F.normalize(tp_queries, dim=-1, p=2)
+                        tp_queries_clip = F.normalize(tp_queries_clip, dim=-1, p=2)
+                    if self.use_cdt:
+                        raise NotImplementedError
+                    query_names_results = torch.einsum("bnd,cd->bnc", tp_queries_clip, text_classifier2)
+
+                else:
+                    if self.use_cos_sim:
+                        tp_queries = F.normalize(tp_queries, dim=-1, p=2)
+
+                    if self.use_cdt:
+                        query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, text_classifier) # bs, N, C
+                    else:
+                        query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier) # bs, N, C
+                
+
+                if self.use_cos_sim:
+                    cur_logit_scale = self.logit_scale.exp()
+                    cur_logit_scale = torch.clamp(cur_logit_scale, max=100.0)
+                    query_names_results = cur_logit_scale * query_names_results
+                    if self.logit_bias is not None:
+                        cur_logit_bias = self.logit_bias
+                        query_names_results = query_names_results + cur_logit_bias
+                else:
+                    if self.logit_bias is not None:
+                        cur_logit_bias = self.logit_bias
+                        query_names_results = query_names_results + self.logit_bias
+
+                query_cls_results= []
+                cur_idx = 0
+                if self.clip_distill:
+                    tp_num_templates = num_templates_teacher
+                else:
+                    tp_num_templates = num_templates
+
+                for num_t in tp_num_templates: 
+                    query_cls_results.append(query_names_results[:,:, cur_idx: cur_idx + num_t].max(-1).values)
+                    cur_idx += num_t
+                if self.void_embedding is not None:
+                    query_cls_results.append(query_names_results[:,:, -1])
+                query_cls_results = torch.stack(query_cls_results, dim=-1) # bs, N, num_classes
+                # print(f"aux query_cls_results[{i}] shape:", query_cls_results.shape)
+                    
+                if i<5:
+                    aux_out = {
+                        'pred_logits': query_cls_results, 
+                        'pred_masks': outputs['aux_outputs'][i]["pred_masks"], 
+                        'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'],
+                        'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"],
+                    }
+                    if cur_obj_logits is not None:
+                        aux_out['pred_objectness_logits'] = cur_obj_logits
+                    if self.clip_distill:
+                        aux_out['pred_region_features'] =  tp_queries_clip
+                    
+                    aux_outputs.append(aux_out)
+                else:
+                    query_cls_results_final = query_cls_results
+                    obj_logits_final = cur_obj_logits
+                    if self.clip_distill:
+                        final_queries_clip =  tp_queries_clip
         
 
         if self.training:
-            # 1. 获取所有参与训练的参数，求和并乘以 0
-            # 这样 loss 的数值始终为 0，但它与模型参数是“相连”的
-            fake_loss = sum(p.sum() for p in self.parameters() if p.requires_grad) * 0.0
-            
-            # 2. 如果你的 forward 中有一些输入数据（比如 queries），
-            # 也可以把它们带上，确保 backward 路径覆盖到这些中间变量
-            # fake_loss += queries.sum() * 0.0 
 
-            losses = {
-                "loss_fake": fake_loss
+            criterion_pred = {
+                'pred_logits': query_cls_results_final,
+                'pred_masks': outputs["pred_masks"],
+                'pred_boxes': outputs['pred_boxes'],
+                'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
+                'aux_outputs': aux_outputs if use_aux is True else None,
             }
+            if obj_logits_final is not None:
+                criterion_pred['pred_objectness_logits'] = obj_logits_final
+
+            if self.clip_distill and self.contrast_on:
+                criterion_pred['pred_region_features'] = final_queries_clip
+                for i in range(len(targets)):
+                    targets[i]['teacher_features'] = gt_clip_features_list[i]
+                    targets[i]['teacher_valid_mask'] = gt_valid_mask_list[i]
+
+            losses = self.criterion(criterion_pred, targets)
+
+                
+                                                
+
+            for k in list(losses.keys()):
+                # print("loss:", k, losses[k].item())
+                if k in self.criterion.weight_dict:
+                    losses[k] *= self.criterion.weight_dict[k]
+                else:
+                    # remove this loss if not specified in `weight_dict`
+                    losses.pop(k)
+            
+            if self.encoder_loss:
+                encoder_outputs = {'pred_logits': encoder_cls_logits, 'pred_boxes': encoder_box}
+                encoder_losses = self.encoder_criterion(encoder_outputs, targets)
+                for k in list(encoder_losses.keys()):
+                    # print("loss:", k, losses[k].item())
+                    if k in self.encoder_criterion.weight_dict:
+                        losses[k + '_encoder'] = encoder_losses[k] * self.encoder_criterion.weight_dict[k]
+
             return losses
         
         else:
@@ -926,6 +1349,7 @@ class SAM3_TEACHER(nn.Module):
                 imgs_bb2 = images.tensor * self.pixel_std + self.pixel_mean
                 mean = None
                 std = None
+                aligned_masks = None
                 if self.Teacher == "DINOv3TXT":                
                     imgs_bb2 = imgs_bb2 / 255.0  # 转换到 [0, 1]
                     mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
@@ -933,6 +1357,17 @@ class SAM3_TEACHER(nn.Module):
                 elif self.Teacher == "CONVCLIP":
                     mean = torch.tensor([122.7709383, 116.7460125, 104.09373615], device=self.device).view(1, 3, 1, 1)
                     std =  torch.tensor([68.5005327, 66.6321579, 70.32316305], device=self.device).view(1, 3, 1, 1)
+
+                    target_l = 896
+                    if h_orig > w_orig:
+                        new_h, new_w = target_l, int(target_l * w_orig / h_orig + 0.5)
+                    else:
+                        new_h, new_w = int(target_l * h_orig / w_orig + 0.5), target_l
+
+                    imgs_bb2 = F.interpolate(imgs_bb2, size=(new_h, new_w), mode='bilinear', align_corners=False)
+
+                    aligned_masks = F.interpolate(outputs["pred_masks"], size=(new_h//4, new_w//4), mode='bilinear', align_corners=False)
+
                 elif self.Teacher == "PE":
                     imgs_bb2 = imgs_bb2 / 255.0  # 转换到 [0, 1]
                     mean = torch.tensor([0.5, 0.5, 0.5], device=self.device).view(1, 3, 1, 1)
@@ -949,10 +1384,13 @@ class SAM3_TEACHER(nn.Module):
                 if self.Teacher == "CONVCLIP":
                     clip_vis_dense = self.backbone2.visual_prediction_forward_convnext_2d(clip_feature)
                 
-                text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], DINO_PROMPT_TEMPLATES)
+                text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], VILD_PROMPT)
 
                 if self.use_MaskAdapter:
-                    binary_masks = outputs["pred_masks"] > 0
+                    if aligned_masks is not None:
+                        binary_masks = aligned_masks > 0
+                    else:
+                        binary_masks = outputs["pred_masks"] > 0
                     maps_for_pooling = self.mask_adapter(clip_vis_dense, binary_masks)
                     maps_for_pooling = F.interpolate(maps_for_pooling, size=clip_vis_dense.shape[-2:],
                                                 mode='bilinear', align_corners=False)
@@ -965,7 +1403,7 @@ class SAM3_TEACHER(nn.Module):
                     pooled_img_feat = pooled_clip_feature
                     pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
                 else:
-                    img_feat_for_pool = F.normalize(clip_vis_dense, dim=1, p=2)
+                    img_feat_for_pool = clip_vis_dense
                     mask_for_pool = F.interpolate(outputs["pred_masks"], size=img_feat_for_pool.shape[-2:],
                                                         mode='bilinear', align_corners=False)
                     pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
@@ -978,9 +1416,15 @@ class SAM3_TEACHER(nn.Module):
                 
                 maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates_teacher)
                                 
-                out_vocab_cls_probs = F.softmax(maskpool_cls_logits, dim=-1)
-
-                in_vocab_cls_probs = query_cls_results_final.sigmoid()
+                
+                if self.use_softmax:
+                    is_void_prob = F.softmax(query_cls_results_final, dim=-1)[..., -1:]
+                    in_vocab_cls_results = query_cls_results_final[..., :-1] 
+                    in_vocab_cls_probs = in_vocab_cls_results.softmax(-1)
+                    out_vocab_cls_probs = maskpool_cls_logits.softmax(-1)
+                else:
+                    in_vocab_cls_probs = torch.sigmoid(query_cls_results_final)
+                    out_vocab_cls_probs = F.softmax(maskpool_cls_logits, dim=-1)
                 category_overlapping_mask = self.category_overlapping_mask.to(self.device)
                 alpha = 0.5
                 beta = 0.8
@@ -999,16 +1443,17 @@ class SAM3_TEACHER(nn.Module):
                     (out_vocab_cls_probs + eps) ** beta
                 )
 
-                # 组合概率 (注意这里不是加 log，而是选通概率)
-                final_probs = (
-                    probs_seen * category_overlapping_mask + 
-                    probs_unseen * (1 - category_overlapping_mask)
+                ensemble_logits = (
+                    probs_seen.log() * category_overlapping_mask + 
+                    probs_unseen.log() * (1 - category_overlapping_mask)
                 )
-                
-                # 钳位数值防止 logit 计算出现 inf/-inf
-                final_probs = torch.clamp(final_probs, min=eps, max=1-eps)
-                query_cls_results_final = torch.logit(final_probs)
 
+                final_probs = torch.cat([
+                    ensemble_logits.softmax(-1) * (1.0 - is_void_prob), 
+                    is_void_prob
+                ], dim=-1)
+
+                query_cls_results_final = torch.log(final_probs + 1e-8)
 
 
 
@@ -1063,7 +1508,7 @@ class SAM3_TEACHER(nn.Module):
                 # --- A. 语义分割 (Semantic Segmentation) ---
                 if self.semantic_on:
                     # 使用你原来的逻辑，但注意输入变成了 logits
-                    mask_cls_prob = mask_cls_i.sigmoid()
+                    mask_cls_prob = F.softmax(mask_cls_i, dim=-1)[..., :-1]
                     mask_pred_prob = mask_pred_i.sigmoid()
                     semseg = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_prob)
                     res["sem_seg"] = semseg
@@ -1294,11 +1739,20 @@ class SAM3_TEACHER(nn.Module):
         # mask_pred: [Q, H, W] (Logits or Probs, depends on input)
         
         # 1. 计算分数 (Sigmoid 而不是 Softmax)
-        scores, labels = mask_cls.sigmoid().max(-1) # [Q]
+        scores, labels = F.softmax(mask_cls, dim=-1).max(-1) # [Q]
         mask_pred = mask_pred.sigmoid() # [Q, H, W]
 
-        # 2. 过滤掉低分 Query
+        # --- 新增：识别背景索引 ---
+        # 在 FC-CLIP/Softmax 模式下，最后一个索引是背景
+        num_classes = mask_cls.shape[-1]
+        bg_idx = num_classes - 1 if self.use_softmax else -1
+
+        # 2. 过滤低分 Query
         keep = scores > self.object_mask_threshold
+        
+        # --- 新增：过滤掉背景类 ---
+        if self.use_softmax:
+            keep = keep & (labels != bg_idx)
         
         cur_scores = scores[keep]
         cur_classes = labels[keep]
@@ -1365,7 +1819,7 @@ class SAM3_TEACHER(nn.Module):
         image_size = mask_pred.shape[-2:]
         
         # 1. 计算分数 (Sigmoid)
-        scores = mask_cls.sigmoid() # [Q, K]
+        scores = F.softmax(mask_cls, dim=-1)[:, :-1]
         num_classes = scores.shape[-1]
         
         # 2. 展开所有 Query-Class 对
@@ -1858,107 +2312,3 @@ def get_classification_logits(x, text_classifier, logit_scale, num_templates=Non
     # final_pred_logits.append(pred_logits[:, :, -1]) # the last classifier is for void
     final_pred_logits = torch.stack(final_pred_logits, dim=-1)
     return final_pred_logits
-
-@torch.no_grad()
-def visualize_distill_logic(
-    image_tensor,       # [3, H, W]
-    gt_masks,           # [N_gt, H, W]
-    gt_labels,          # [N_gt]
-    teacher_logits,     # [N_gt, Num_Classes]
-    is_consistent,      # [N_gt]
-    class_names,        # List[str]
-    save_path,
-    top_k=3,
-    logit_scale=100.0
-):
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import torch.nn.functional as F
-    from matplotlib.patches import Rectangle
-    import matplotlib.gridspec as gridspec
-
-    # 1. 数据准备
-    img = image_tensor.permute(1, 2, 0).cpu().numpy()
-    img = (img - img.min()) / (img.max() - img.min() + 1e-6)
-    
-    N_gt, H, W = gt_masks.shape
-    if N_gt == 0: return
-
-    probs = F.softmax(teacher_logits * logit_scale, dim=-1)
-    teacher_preds = probs.argmax(dim=-1) 
-    topk_vals, topk_indices = torch.topk(probs, k=min(top_k, len(class_names)), dim=-1)
-
-    # 颜色调色板
-    np.random.seed(42)
-    full_palette = np.random.randint(0, 255, size=(len(class_names), 3))
-    fail_color = np.array([255, 0, 0])
-
-    # 生成各个 Map
-    gt_map = np.zeros((H, W, 3), dtype=np.uint8)
-    raw_teacher_map = np.zeros((H, W, 3), dtype=np.uint8)
-    filtered_map = np.zeros((H, W, 3), dtype=np.uint8)
-
-    present_class_ids = set()
-    for i in range(N_gt):
-        mask = gt_masks[i].cpu().numpy() > 0.5
-        gt_cls = gt_labels[i].item()
-        pred_cls = teacher_preds[i].item()
-        present_class_ids.add(gt_cls)
-        present_class_ids.add(pred_cls)
-
-        gt_map[mask] = full_palette[gt_cls]
-        raw_teacher_map[mask] = full_palette[pred_cls]
-        if is_consistent[i]:
-            filtered_map[mask] = full_palette[pred_cls]
-        else:
-            filtered_map[mask] = fail_color
-
-    # 2. 重新设计布局 (使用 GridSpec)
-    # 2x2 图片区域 + 右侧 1 列文本区域
-    fig = plt.figure(figsize=(24, 16)) # 增加高度
-    gs = gridspec.GridSpec(3, 3, width_ratios=[1, 1, 0.6], height_ratios=[1, 1, 0.4])
-
-    # 绘制图片 (2x2)
-    ax0 = fig.add_subplot(gs[0, 0]); ax0.imshow(img); ax0.set_title("Original Image", fontsize=20)
-    ax1 = fig.add_subplot(gs[0, 1]); ax1.imshow(gt_map); ax1.set_title("Ground Truth", fontsize=20)
-    ax2 = fig.add_subplot(gs[1, 0]); ax2.imshow(raw_teacher_map); ax2.set_title("Teacher Raw Pred", fontsize=20)
-    ax3 = fig.add_subplot(gs[1, 1]); ax3.imshow(filtered_map); ax3.set_title("Filtered (Red=Fail)", fontsize=20)
-
-    for ax in [ax0, ax1, ax2, ax3]: ax.axis('off')
-
-    # 绘制 Top-K 文本分析 (占据右侧跨行)
-    ax_text = fig.add_subplot(gs[0:2, 2])
-    ax_text.axis('off')
-    analysis_text = "Region Analysis (Top-K):\n(Scaled Probs)\n\n"
-    
-    for i in range(min(N_gt, 15)): # 增加展示数量
-        gt_cls_idx = gt_labels[i].item()
-        status = "PASS" if is_consistent[i] else "FAIL"
-        analysis_text += f"Obj {i} [{status}]: GT={class_names[gt_cls_idx][:15]}\n"
-        
-        for k in range(topk_indices.shape[1]):
-            c_idx = topk_indices[i, k].item()
-            p_val = topk_vals[i, k].item()
-            star = "*" if c_idx == gt_cls_idx else " "
-            analysis_text += f" {star}{p_val:.3f} {class_names[c_idx][:15]}\n"
-        analysis_text += "-"*25 + "\n"
-    
-    ax_text.text(0, 1, analysis_text, fontsize=12, verticalalignment='top', family='monospace')
-
-    # 绘制图例 (放在底部区域)
-    ax_leg = fig.add_subplot(gs[2, :2])
-    ax_leg.axis('off')
-    legend_elements = []
-    sorted_ids = sorted(list(present_class_ids))
-    for cid in sorted_ids:
-        color = full_palette[cid] / 255.0
-        legend_elements.append(Rectangle((0, 0), 1, 1, color=color, label=class_names[cid]))
-    legend_elements.append(Rectangle((0, 0), 1, 1, color=fail_color/255.0, label="Filtered/Fail"))
-    
-    # 调整图例列数，避免太长
-    ax_leg.legend(handles=legend_elements, loc='center', ncol=5, fontsize=12, frameon=True)
-
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path, dpi=100, bbox_inches='tight')
-    plt.close()

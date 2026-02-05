@@ -1,0 +1,90 @@
+MODEL:
+  # --- 保持 SAM3 的模型设置 ---
+  PIXEL_MEAN : [127.5, 127.5, 127.5]
+  PIXEL_STD : [127.5, 127.5, 127.5]
+  META_ARCHITECTURE: "SAM3CLIP"
+  
+  SAM3:
+    BPE_PATH: "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
+    ENABLE_SEGMENTATION: True
+    NUM_CDT: 0
+    USE_QUERY_PROJ: False
+    USE_PE_TEXT: False
+    # DYNAMIC_QUERY: True
+    # ENCODER_LOSS: True
+    # NUM_ENCODER_QUERY: 200
+    # COS_SIM: False
+    USE_SOFTMAX: True
+
+  # WEIGHTS: "/data/hmp/sam3.pt"
+  WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
+  # WEIGHTS: /data/hmp/SAM_MultiDateset/out/cocopano/model_0007499.pth
+
+DATASETS:
+  # 只保留 COCO Panoptic
+  TRAIN: ("coco_2017_train_panoptic", )
+  TEST: ("openvocab_ade20k_panoptic_val",) 
+
+SOLVER:
+  AMP:
+    ENABLED: True
+  IMS_PER_BATCH: 48
+  BASE_LR: 0.00002
+  LR_SCHEDULER_NAME: WarmupPolyLR
+  MAX_ITER: 45000
+  CHECKPOINT_PERIOD: 7500
+  
+
+  CLASS_WEIGHT: 2.0
+  MASK_WEIGHT: 5.0
+  DICE_WEIGHT: 5.0
+  USE_AUX : True
+
+
+
+INPUT:
+  DATASET_MAPPER_NAME: "coco_combine_lsj"
+  IMAGE_SIZE: 1008
+  MIN_SCALE: 0.1
+  MAX_SCALE: 2.0
+  FORMAT: "RGB"
+  COLOR_AUG_SSD: True 
+  MASK_FORMAT: "bitmask"
+
+
+DATALOADER:
+  # 如果你的代码支持，可以改回 "TrainingSampler"，
+  # 但为了兼容你现有的 MultiDatasetSampler 代码逻辑，建议保持并调整参数为长度1
+  SAMPLER_TRAIN: "MultiDatasetSampler"
+  
+  # 只有一个数据集，比例设为 1.0
+  DATASET_RATIO: [1.0]
+
+  # # Batch Size 对应单个数据集
+  DATASET_BS: [4]
+  
+  # COCO 通常不需要 RFS (Repeat Factor Sampling)
+  USE_RFS: [False]
+  
+  # COCO Panoptic 包含 box 和 mask，这里根据你代码对标注类型的定义填写
+  DATASET_ANN: ['box'] 
+  
+  NUM_WORKERS: 12
+  FILTER_EMPTY_ANNOTATIONS: True
+  ASPECT_RATIO_GROUPING: True
+  
+  # 单数据集训练时，此项建议设为 False 以遵循 SOLVER.IMS_PER_BATCH
+  USE_DIFF_BS_SIZE: True
+
+TEST:
+  EVAL_PERIOD: 75
+  INSTANCE_ON: True   
+  PANOPTIC_ON: True   
+  SEMANTIC_ON: True   
+
+# 修改输出目录名称以区分实验
+VERSION: 2
+
+OUTPUT_DIR: ./out/test/
+# OUTPUT_DIR: ./out/copa_baseline
+  
