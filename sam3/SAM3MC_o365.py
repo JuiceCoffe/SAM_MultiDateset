@@ -323,7 +323,12 @@ class SAM3MC_o365(nn.Module):
                 self.encoder_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
 
-        losses = ["labels", "masks", "boxes", 'contrast']
+        losses = ["labels", "masks", "boxes"]
+        self.contrast_on = False
+        if contrast_weight > 0 and self.clip_distill:
+            losses.append("contrast")
+            self.contrast_on = True
+
         # building criterion
         matcher = HungarianMatcher(
             cost_class=class_weight,
@@ -1124,7 +1129,7 @@ class SAM3MC_o365(nn.Module):
 
         if self.clip_distill:
             text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], VILD_PROMPT)
-            if self.training:
+            if self.training and self.contrast_on:
                 mean = torch.tensor([122.7709383, 116.7460125, 104.09373615], device=self.device).view(1, 3, 1, 1)
                 std =  torch.tensor([68.5005327, 66.6321579, 70.32316305], device=self.device).view(1, 3, 1, 1)
                 with torch.no_grad():
@@ -1246,7 +1251,7 @@ class SAM3MC_o365(nn.Module):
             if obj_logits_final is not None:
                 criterion_pred['pred_objectness_logits'] = obj_logits_final
 
-            if self.clip_distill:
+            if self.clip_distill and self.contrast_on:
                 criterion_pred['pred_region_features'] = final_queries_clip
                 for i in range(len(targets)):
                     targets[i]['teacher_features'] = gt_clip_features_list[i]
@@ -1366,7 +1371,7 @@ class SAM3MC_o365(nn.Module):
 
 
 
-        # ====================== Oracle 逻辑 ====================== 
+            # ====================== Oracle 逻辑 ====================== 
             self.OracleSelect_on = False# 你可以从cfg配置中读取此开关
 
             if self.OracleSelect_on:
