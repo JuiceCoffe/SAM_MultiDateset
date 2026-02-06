@@ -1359,6 +1359,9 @@ class SAM3CLIP(nn.Module):
                     std =  torch.tensor([68.5005327, 66.6321579, 70.32316305], device=self.device).view(1, 3, 1, 1)
 
                     target_l = 896
+                    h_orig = batched_inputs[0]["height"]
+                    w_orig = batched_inputs[0]["width"]
+
                     if h_orig > w_orig:
                         new_h, new_w = target_l, int(target_l * w_orig / h_orig + 0.5)
                     else:
