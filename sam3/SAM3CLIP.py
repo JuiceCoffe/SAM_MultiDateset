@@ -163,8 +163,8 @@ class SAM3CLIP(nn.Module):
 
         self.Teacher = cfg.MODEL.TEACHER
         self.Teacher_MaskPool = cfg.MODEL.TEACHER_MASKPOOL and self.Teacher is not None
-        if self.Teacher_MaskPool:
-            self.mask_pooling = MaskPooling()
+ 
+        self.mask_pooling = MaskPooling()
 
         self.use_MaskAdapter = cfg.MODEL.USE_MASKADAPTER
         if self.use_MaskAdapter:
@@ -223,7 +223,7 @@ class SAM3CLIP(nn.Module):
         # -------------------------------------------------------
         # 计算逻辑
         # -------------------------------------------------------
-        self.add_pixelfeat = cfg.MODEL.ADD_PIXELFEAT
+        self.add_pixelfeat = cfg.MODEL.SAM3.ADD_PIXELFEAT
 
 
         # -------------------------------------------------------
@@ -1152,8 +1152,8 @@ class SAM3CLIP(nn.Module):
         queries_masks = out_masks # out_probs是通过与池化prompt投影卷积实现的，多类别下失效，直接用原始mask_logits
 
         queries = outputs["obj_queries"] # 6, bs, N, D
-        pixel_embed = outputs["pixel_embed"] # bs, D, H', W'
-        instance_embeds = outputs["instance_embeds"] 
+        
+        # instance_embeds = outputs["instance_embeds"] 
 
         use_aux = self.use_aux and self.training
         aux_outputs = []
@@ -1237,6 +1237,11 @@ class SAM3CLIP(nn.Module):
             if use_aux or i == 5 :
                 tp_queries = queries[i,:,:,:].clone() 
 
+                if self.add_pixelfeat:
+                    pixel_embed = outputs["pixel_embed"] # bs, D, H', W'
+
+                    pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"] if i ==5 else outputs['aux_outputs'][i]["pred_masks"])
+                    tp_queries = tp_queries + pooled_pixel_embed
 
                 cur_obj_logits = obj_logits[i] if obj_logits is not None else None
 

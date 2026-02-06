@@ -31,7 +31,7 @@ def add_sam3_config(cfg):
     cfg.MODEL.SAM3.COS_SIM = True
     cfg.MODEL.SAM3.NEW_SCORE_HEAD = False
     cfg.MODEL.SAM3.USE_SOFTMAX = False
-    cfg.MODEL.ADD_PIXELFEAT = False
+    cfg.MODEL.SAM3.ADD_PIXELFEAT = False
 
     cfg.MODEL.TEACHER = None
     cfg.MODEL.TEACHER_MASKPOOL = False
