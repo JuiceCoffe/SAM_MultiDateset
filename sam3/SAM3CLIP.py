@@ -170,7 +170,7 @@ class SAM3CLIP(nn.Module):
         if self.use_MaskAdapter:
             from .mask_adapter_head import load_mask_adapter_standalone
             self.mask_adapter = load_mask_adapter_standalone(
-                weight_path="/data/hmp/MaskAdapter/adapter_stage1.pth",
+                weight_path="/root/hmp/maskadapterweight/adapter_stage1.pth",
                 clip_model_name="fcclip_convnext_large", # 只要包含 '_large' 即可
                 num_channels=768,              
                 num_output_maps=16,           
@@ -219,6 +219,12 @@ class SAM3CLIP(nn.Module):
         if self.new_score_head:
             self.score_head = MLP(256, 256, 1, 3)
             init_score_head(self.score_head)
+
+        # -------------------------------------------------------
+        # 计算逻辑
+        # -------------------------------------------------------
+        self.add_pixelfeat = cfg.MODEL.ADD_PIXELFEAT
+
 
         # -------------------------------------------------------
         # 训练配置
@@ -1231,6 +1237,7 @@ class SAM3CLIP(nn.Module):
             if use_aux or i == 5 :
                 tp_queries = queries[i,:,:,:].clone() 
 
+
                 cur_obj_logits = obj_logits[i] if obj_logits is not None else None
 
                 if self.use_query_proj:
@@ -1429,8 +1436,8 @@ class SAM3CLIP(nn.Module):
                     in_vocab_cls_probs = torch.sigmoid(query_cls_results_final)
                     out_vocab_cls_probs = F.softmax(maskpool_cls_logits, dim=-1)
                 category_overlapping_mask = self.category_overlapping_mask.to(self.device)
-                alpha = 0.5
-                beta = 0.8
+                alpha = 1.0
+                beta = 1.0
                 # 为了数值稳定性，加一个小 epsilon
                 eps = 1e-7 
 
