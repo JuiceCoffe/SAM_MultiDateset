@@ -29,7 +29,7 @@ class DINOv3TXT(Backbone):
     def __init__(self, ):
         super().__init__()
         model, tokenizer = dinov3_vitl16_dinotxt_tet1280d20h24l()
-        model.to("cuda", non_blocking=True)
+        # model.to("cuda", non_blocking=True)
         model.eval()
         tokenizer = tokenizer.tokenize
 
@@ -58,7 +58,7 @@ class DINOv3TXT(Backbone):
         return self.model
 
     def tokenize_text(self, text_list):
-        tokens = self.tokenizer(text_list).to("cuda", non_blocking=True)
+        tokens = self.tokenizer(text_list) #.to("cuda", non_blocking=True)
         return tokens
 
     def get_text_classifier(self, text_list, device):

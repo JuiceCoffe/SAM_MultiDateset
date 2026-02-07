@@ -83,7 +83,7 @@ class SAM3VLBackbone(nn.Module):
 
     def _forward_image_no_act_ckpt(self, samples):
         # Forward through backbone
-        sam3_features, sam3_pos, sam2_features, sam2_pos = self.vision_backbone.forward(
+        sam3_features, sam3_pos, sam2_features, sam2_pos , vit_feature= self.vision_backbone.forward(
             samples
         )
         if self.scalp > 0:
@@ -114,6 +114,7 @@ class SAM3VLBackbone(nn.Module):
             "vision_pos_enc": sam3_pos,
             "backbone_fpn": sam3_features,
             "sam2_backbone_out": sam2_output,
+            "vit_feature": vit_feature,
         }
 
         return output

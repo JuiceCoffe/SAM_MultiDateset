@@ -1,0 +1,100 @@
+MODEL:
+  # --- 保持 SAM3 的模型设置 ---
+  PIXEL_MEAN : [127.5, 127.5, 127.5]
+  PIXEL_STD : [127.5, 127.5, 127.5]
+  META_ARCHITECTURE: "SAM3CLIP"
+  
+  SAM3:
+    BPE_PATH: "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
+    ENABLE_SEGMENTATION: True
+    NUM_CDT: 0
+    USE_QUERY_PROJ: False
+    USE_PE_TEXT: False
+    # DYNAMIC_QUERY: True
+    # ENCODER_LOSS: True
+    # NUM_ENCODER_QUERY: 200
+    # COS_SIM: False
+    USE_SOFTMAX: True
+    ADD_PIXELFEAT: True
+
+    ALPHA: 0.5
+    BETA: 0.6
+
+  TEACHER: CONVCLIP
+  TEACHER_MASKPOOL: True
+  USE_MASKADAPTER: True
+  MASKADAPTERPATH: /data/hmp/MaskAdapterWeight/adapter_stage1.pth
+  WEIGHTS: "/data/hmp/sam3.pt"
+  # WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
+  # WEIGHTS: /root/hmp/SAMweight/copa_softmax_0029999.pth
+
+DATASETS:
+  TRAIN: ("coco_2017_train_panoptic", "openvocab_coco_2017_train_stuff_sem_seg",)  
+  TEST: ("openvocab_ade20k_panoptic_val",) 
+  # TEST: ("openvocab_ade20k_full_sem_seg_val","openvocab_pascal20_sem_seg_val",'openvocab_pascal_ctx459_sem_seg_val', 'openvocab_pascal_ctx59_sem_seg_val',)
+  # TEST: ("openvocab_ade20k_panoptic_val", "openvocab_ade20k_full_sem_seg_val","openvocab_pascal20_sem_seg_val",'openvocab_pascal_ctx459_sem_seg_val', 'openvocab_pascal_ctx59_sem_seg_val',)
+
+
+SOLVER:
+  AMP:
+    ENABLED: True
+  IMS_PER_BATCH: 48
+  BASE_LR: 0.00002
+  LR_SCHEDULER_NAME: WarmupPolyLR
+  MAX_ITER: 60000
+  CHECKPOINT_PERIOD: 7500
+  
+
+  CLASS_WEIGHT: 2.0
+  MASK_WEIGHT: 5.0
+  DICE_WEIGHT: 5.0
+  USE_AUX : True
+
+
+
+INPUT:
+  DATASET_MAPPER_NAME: "coco_combine_lsj"
+  IMAGE_SIZE: 1008
+  MIN_SCALE: 0.5
+  MAX_SCALE: 2.0
+  FORMAT: "RGB"
+  COLOR_AUG_SSD: True 
+  MASK_FORMAT: "bitmask"
+
+
+DATALOADER:
+  # 如果你的代码支持，可以改回 "TrainingSampler"，
+  # 但为了兼容你现有的 MultiDatasetSampler 代码逻辑，建议保持并调整参数为长度1
+  SAMPLER_TRAIN: "MultiDatasetSampler"
+  
+  # 只有一个数据集，比例设为 1.0
+  DATASET_RATIO: [2.0, 1.0]
+
+  # # Batch Size 对应单个数据集
+  DATASET_BS: [4, 4]
+  
+  # 针对长尾分布采样：Obj365开启(True)，COCO关闭(False)
+  USE_RFS: [False, False]
+  
+  # 指定标注类型，用于计算采样频率
+  DATASET_ANN: ['box', 'box']
+  
+  NUM_WORKERS: 12
+  FILTER_EMPTY_ANNOTATIONS: True
+  ASPECT_RATIO_GROUPING: True
+  
+  # 单数据集训练时，此项建议设为 False 以遵循 SOLVER.IMS_PER_BATCH
+  USE_DIFF_BS_SIZE: True
+
+TEST:
+  EVAL_PERIOD: 7500
+  INSTANCE_ON: True   
+  PANOPTIC_ON: True   
+  SEMANTIC_ON: True   
+
+# 修改输出目录名称以区分实验
+VERSION: 2
+
+# OUTPUT_DIR: ./out/test/
+OUTPUT_DIR: ./out/copa_stuff_softmax_pixelfeat
+  

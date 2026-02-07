@@ -56,9 +56,70 @@ import random
 
 import math
 
+from .dinov3txt import DINOv3TXT
+
+class DINOv3Shim(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # 实例化你提供的类
+        self.dino = DINOv3TXT()
+        
+        # 双重保险：确保它是 eval 模式且不更新梯度
+        self.dino.eval()
+        for p in self.dino.parameters():
+            p.requires_grad = False
+
+    def train(self, mode=True):
+        # 强制始终处于 eval 模式，防止 BN/Dropout 状态改变
+        super().train(False)
+
+    def forward(self, x):
+        # SAM3 Neck 传入的是 [B, 3, H, W] 的 tensor
+        
+        # 1. 调用你的类提取特征
+        # DINOv3TXT.forward 调用了 extract_features，返回字典
+        out_dict = self.dino(x) 
+        
+        # 2. 拆包字典，取出核心特征
+        # 你的类中 key 是 "clip_vis_dense"
+        features = out_dict["clip_vis_dense"] # [B, 1024, H/16, W/16]
+
+        return [features] # 适配neck期望的多维度特征
+
+def create_DINO_backbone(compile_mode=None, enable_inst_interactivity=False, cfg=None):
+    # 1. 构建原始的 SAM3 视觉主干 (包含 ViT + Neck)
+    # 这会加载原始权重
+    print("Building original SAM3 backbone...")
+    full_backbone =  _create_vision_backbone(
+            compile_mode=compile_mode, 
+            enable_inst_interactivity=cfg.MODEL.SAM3.ENABLE_INST_INTERACTIVITY
+        )
+    
+    # 2. 替换 trunk (ViT) 部分
+    print("Replacing SAM3 Trunk (ViT) with DINOv3TXT...")
+    
+    # 根据你提供的结构图，full_backbone 是 Sam3DualViTDetNeck
+    # 它的子模块名为 'trunk' (即原始的 ViT)
+    if hasattr(full_backbone, 'trunk'):
+        # 释放旧 ViT 的显存
+        del full_backbone.trunk 
+        
+        # 装入我们的垫片
+        full_backbone.trunk = DINOv3Shim()
+        
+        print("Success: Backbone trunk replaced. DINOv3 is frozen.")
+    else:
+        AttributeError("Could not find 'trunk' in backbone to replace.")
+
+    # 3. 编译 (可选)
+    if compile_mode:
+        # 注意：DINOv3 有些算子可能不支持 torch.compile，如果报错请关闭 compile
+        full_backbone = torch.compile(full_backbone, mode=compile_mode)
+        
+    return full_backbone
 
 @META_ARCH_REGISTRY.register()
-class SAM3CLIP(nn.Module):
+class DINOSAM(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.device_type = cfg.MODEL.DEVICE
@@ -70,9 +131,10 @@ class SAM3CLIP(nn.Module):
         # -------------------------------------------------------       
         compile_mode = "default" if cfg.MODEL.SAM3.COMPILE else None
         
-        vision_encoder = _create_vision_backbone(
+        vision_encoder = create_DINO_backbone(
             compile_mode=compile_mode, 
-            enable_inst_interactivity=cfg.MODEL.SAM3.ENABLE_INST_INTERACTIVITY
+            enable_inst_interactivity=cfg.MODEL.SAM3.ENABLE_INST_INTERACTIVITY,
+            cfg=cfg 
         )
         text_encoder = _create_text_encoder(cfg.MODEL.SAM3.BPE_PATH)
         backbone = _create_vl_backbone(vision_encoder, text_encoder)
@@ -109,10 +171,7 @@ class SAM3CLIP(nn.Module):
             self.detector.eval()
         print("SAM3创建成功!")
 
-        if cfg.MODEL.SAM3.USE_VILD_PROMPT:
-            self.PROMPT = VILD_PROMPT
-        else:
-            self.PROMPT = ["{}"]
+        self.PROMPT = DINO_PROMPT_TEMPLATES
         # -------------------------------------------------------
         # 新增模块
         # -------------------------------------------------------
@@ -124,12 +183,7 @@ class SAM3CLIP(nn.Module):
         # 通过 cfg 控制是否启用，硬编码输入输出维度为 256
         self.use_query_proj = cfg.MODEL.SAM3.USE_QUERY_PROJ
         if self.use_query_proj:
-            if self.use_pe_text:
-                self.query_proj = nn.Linear(256, 1024, bias=False)
-            else:
-                self.query_proj = nn.Linear(256, 256, bias=False)
-            # 【关键】初始化策略：建议初始化为 Identity (单位矩阵)
-            # 这样在训练开始时，特征保持原样，随着训练进行逐渐学习对齐，比随机初始化更稳
+            self.query_proj = nn.Linear(256, 1024, bias=False)
             nn.init.eye_(self.query_proj.weight)
         else:
             self.query_proj = None
@@ -159,10 +213,6 @@ class SAM3CLIP(nn.Module):
 
 
         self.text_encoder_cache = {} 
-
-
-        self.Teacher = cfg.MODEL.TEACHER
-        self.Teacher_MaskPool = cfg.MODEL.TEACHER_MASKPOOL and self.Teacher is not None
  
         self.mask_pooling = MaskPooling()
 
@@ -179,46 +229,14 @@ class SAM3CLIP(nn.Module):
             )
             self.mask_adapter.eval()
             self.num_output_maps = 16
-
-        
-        self.text_classifier2 = None
-        if self.Teacher == "DINOv3TXT":
-            from .dinov3txt import DINOv3TXT
-            self.backbone2 = DINOv3TXT()
-        elif self.Teacher == "CONVCLIP":
-            from .clip import CLIP
-            self.backbone2 = CLIP(cfg)
-        elif self.Teacher == "PE":
-            from .PEEncoder import PEEncoder
-            self.backbone2 = PEEncoder(cfg)        
-
-        self.clip_distill = cfg.SOLVER.CLIP_DISTILL
-        if self.clip_distill:
-            from .clip import CLIP
-            self.backbone2 = CLIP(cfg)
-            self.sam2Clip = MLP(
-                        input_dim=256,
-                        hidden_dim=2048,
-                        output_dim=768,
-                        num_layers=2,
-                        dropout=0.1,
-                        residual=False,
-                        out_norm=nn.LayerNorm(768),
-                    )
-            # self.clipV2T = MLP(
-            #             input_dim=768,
-            #             hidden_dim=2048,
-            #             output_dim=768,
-            #             num_layers=2,
-            #             dropout=0.1,
-            #             residual=True,
-            #         )
-            self.mask_pooling = MaskPooling()
+   
 
         self.new_score_head = cfg.MODEL.SAM3.NEW_SCORE_HEAD
         if self.new_score_head:
             self.score_head = MLP(256, 256, 1, 3)
             init_score_head(self.score_head)
+
+        self.text_feat_resizer = nn.Linear(1024, 256)
 
         # -------------------------------------------------------
         # 计算逻辑
@@ -269,7 +287,7 @@ class SAM3CLIP(nn.Module):
         self.use_softmax = cfg.MODEL.SAM3.USE_SOFTMAX
         self.void_embedding = None
         if self.use_softmax:
-            self.void_embedding = nn.Embedding(1, 256)
+            self.void_embedding = nn.Embedding(1, 1024)
 
 
         self.logit_bias = None
@@ -335,13 +353,6 @@ class SAM3CLIP(nn.Module):
             if self.use_cos_sim:
                 self.encoder_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-
-        
-        self.contrast_on = False
-        if contrast_weight > 0 and self.clip_distill:
-            losses.append("contrast")
-            self.contrast_on = True
-
         # building criterion
         if self.use_softmax:
             from .loss.fcclip_criterion import FcclipSetCriterion
@@ -401,7 +412,7 @@ class SAM3CLIP(nn.Module):
 
     def _freeze(self, ):
         for name, param in self.named_parameters():
-            if 'backbone' in name:
+            if 'dino' in name:
                 param.requires_grad = False
             # elif 'dot_prod_scoring' in name:
             #     param.requires_grad = False
@@ -582,51 +593,6 @@ class SAM3CLIP(nn.Module):
     #     self.test_text_classifier = None
     #     return
 
-    @torch.no_grad()
-    def get_teacher_text_classifier(self, dataname, prompt_teacher):
-        if self.training:
-            if self.train_dataname_teacher != dataname or self.text_classifier2 is None:
-                self.category_overlapping_mask_teacher, self.train_num_templates_teacher, self.train_class_names_teacher = self.prepare_class_names_from_metadata(
-                    self.train_metadata_dict.get(dataname, MetadataCatalog.get(dataname)), 
-                    self.train_metadata, 
-                    prompt_teacher
-                    )
-                text_classifier = []
-                bs = 128
-                print("Generating text classifier for", dataname, "with", len(self.train_class_names), "classes.")
-                for idx in range(0, len(self.train_class_names_teacher), bs):
-                    text_classifier.append(self.backbone2.get_text_classifier(self.train_class_names_teacher[idx:idx+bs], self.device).detach())
-                text_classifier = torch.cat(text_classifier, dim=0)
-                print("text_classifier shape before normalize:", text_classifier.shape)
-
-                text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
-                print("text_classifier shape before reshape:", text_classifier.shape)
-                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(prompt_teacher), len(prompt_teacher), text_classifier.shape[-1]).mean(1) 
-                text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
-                self.text_classifier2 = text_classifier
-                self.train_dataname_teacher = dataname
-            return self.text_classifier2, self.train_num_templates_teacher
-
-        else:
-            if self.test_dataname_teacher != dataname or self.text_classifier2 is None:
-                self.category_overlapping_mask_teacher, self.test_num_templates_teacher, self.test_class_names_teacher = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata, prompt_teacher)
-                text_classifier = []
-                bs = 128
-                print("Generating text classifier for", dataname, "with", len(self.test_class_names), "classes.")
-                for idx in range(0, len(self.test_class_names_teacher), bs):
-                    text_classifier.append(self.backbone2.get_text_classifier(self.test_class_names_teacher[idx:idx+bs], self.device).detach())
-                text_classifier = torch.cat(text_classifier, dim=0)
-                print("text_classifier shape before normalize:", text_classifier.shape)
-
-                text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
-                print("text_classifier shape before reshape:", text_classifier.shape)
-                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(prompt_teacher), len(prompt_teacher), text_classifier.shape[-1]).mean(1) 
-                text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
-                self.text_classifier2 = text_classifier
-                self.test_dataname_teacher = dataname
-            return self.text_classifier2, self.test_num_templates_teacher
-
-
     def get_text_classifier(self, dataname):
         if self.training:
             if self.train_dataname != dataname:
@@ -679,70 +645,28 @@ class SAM3CLIP(nn.Module):
                             
                             # 3. 截断 num_templates (用于后续 Logit 聚合的计数列表)
                             self.train_num_templates = self.train_num_templates[num_things_classes:]
-                    # ---------------- 修改结束 ----------------
-
-                        # ======= 新增打印验证逻辑 =======
-                        # print(f"\n" + "="*40)
-                        # print(f"DEBUG: 数据集 [{dataname}] 类别过滤完成")
-                        # print(f"剩余类别数量 (num_classes): {len(self.train_num_templates)}")
-                        
-                        # # 提取每个类别的第一个模板名进行展示
-                        # display_names = []
-                        # current_idx = 0
-                        # for num_t in self.train_num_templates:
-                        #     # 取该类别的第一个 prompt 作为代表名
-                        #     display_names.append(self.train_class_names[current_idx])
-                        #     current_idx += num_t
-                        
-                        # print("前 10 个 Stuff 类别示例:")
-                        # for i, name in enumerate(display_names[:10]):
-                        #     print(f"  Class {i}: {name}")
-                        
-                        # print("最后 5 个 Stuff 类别示例:")
-                        # for i, name in enumerate(display_names[-5:]):
-                        #     print(f"  Class {len(display_names)-5+i}: {name}")
-                        # print("="*40 + "\n")
-                        # ===============================
 
                     # --- 原有生成逻辑开始 ---
                     text_classifier = []
-                    text_feat = []
-                    language_mask = []
-                    # this is needed to avoid oom, which may happen when num of class is large
                     bs = 128
                     print("Generating text classifier for", dataname, "with", len(self.train_class_names), "classes.")
                     for idx in range(0, len(self.train_class_names), bs):
-                        state_text = self.detector.backbone.forward_text(self.train_class_names[idx:idx+bs], device=self.device)
-
-                        batch_text_feat = state_text["language_features"].detach()
-                        mask = state_text["language_mask"] # bs, L
-                        batch_text_feat = batch_text_feat.permute(1,0,2) # -> bs, L, D 
-                        if self.use_pe_text:
-                            text_classifier.append(state_text["pe_text_out"]["pe_textfeat"])
-                        else:    
-                            text_classifier.append(batch_text_feat)
-                        text_feat.append(batch_text_feat)
-                        language_mask.append(mask) # bs, L
+                        batch_text_feat = self.detector.backbone.vision_backbone.trunk.dino.get_text_classifier(self.train_class_names[idx:idx+bs], device=self.device)
+                        text_classifier.append(batch_text_feat)
                     text_classifier = torch.cat(text_classifier, dim=0)
-                    text_feat = torch.cat(text_feat, dim=0)
-                    language_mask = torch.cat(language_mask, dim=0) # (num_names * self.PROMPT,  L)
-                    # average across templates and normalization.
-                    text_feat = text_feat.reshape(text_feat.shape[0]//len(self.PROMPT), len(self.PROMPT), text_feat.shape[-2], text_feat.shape[-1]) # num_names, self.PROMPT, L, D
-                    text_feat /= (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
-                    text_feat[language_mask.view(text_feat.shape[0],text_feat.shape[1],text_feat.shape[2])] = 0.0 # [num_names, self.PROMPT, L, D] 掩码掉 padding 部分
-                    
-                    language_features = text_feat.mean(1) # num_names, L, D
-
-                    text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.PROMPT), len(self.PROMPT), text_classifier.shape[-2], text_classifier.shape[-1]) # num_names, self.PROMPT, L, D
-                    text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
-                    text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 # [num_names, self.PROMPT, L, D] 掩码掉 padding 部分
+                    text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.PROMPT), len(self.PROMPT), -1, text_classifier.shape[-1]) # num_names, self.PROMPT, L, D
+                    print("text_classifier:",text_classifier.shape)
+                    language_features = text_classifier.mean(1) # num_names, L, D
                     text_classifier = text_classifier.mean(-2) 
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                     text_classifier = text_classifier.mean(1)
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                     
                     self.language_features = language_features.detach() # num_names , L, D
-                    self.language_mask = torch.min(language_mask.view(language_features.shape[0],len(self.PROMPT),language_features.shape[1]), dim=1).values# [num_names, L]
+                    self.language_mask = torch.zeros(
+                        self.language_features.shape[0], self.language_features.shape[1], 
+                        dtype=torch.bool, device=self.device
+                    )
                     self.train_text_classifier = text_classifier.detach()
                     # --- 原有生成逻辑结束 ---
 
@@ -761,43 +685,24 @@ class SAM3CLIP(nn.Module):
             if self.test_dataname != dataname:
                 self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata, self.PROMPT)
                 text_classifier = []
-                text_feat = []
-                language_mask = []
-                # this is needed to avoid oom, which may happen when num of class is large
                 bs = 128
                 print("Generating text classifier for", dataname, "with", len(self.test_class_names), "classes.")
                 for idx in range(0, len(self.test_class_names), bs):
-                    state_text = self.detector.backbone.forward_text(self.test_class_names[idx:idx+bs], device=self.device)
-
-                    batch_text_feat = state_text["language_features"].detach()
-                    mask = state_text["language_mask"] # bs, L
-                    batch_text_feat = batch_text_feat.permute(1,0,2) # -> bs, L, D 
-                    if self.use_pe_text:
-                        text_classifier.append(state_text["pe_text_out"]["pe_textfeat"])
-                    else:    
-                        text_classifier.append(batch_text_feat)
-                    text_feat.append(batch_text_feat)
-                    language_mask.append(mask) # bs, L
+                    batch_text_feat = self.detector.backbone.vision_backbone.trunk.dino.get_text_classifier(self.test_class_names[idx:idx+bs], device=self.device)
+                    text_classifier.append(batch_text_feat)
                 text_classifier = torch.cat(text_classifier, dim=0)
-                text_feat = torch.cat(text_feat, dim=0)
-                language_mask = torch.cat(language_mask, dim=0) # (num_names * self.PROMPT,  L)
-                # average across templates and normalization.
-                text_feat = text_feat.reshape(text_feat.shape[0]//len(self.PROMPT), len(self.PROMPT), text_feat.shape[-2], text_feat.shape[-1]) # num_names, self.PROMPT, L, D
-                text_feat /= (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
-                text_feat[language_mask.view(text_feat.shape[0],text_feat.shape[1],text_feat.shape[2])] = 0.0 # [num_names, self.PROMPT, L, D] 掩码掉 padding 部分
-                
-                language_features = text_feat.mean(1) # num_names, L, D
-
-                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.PROMPT), len(self.PROMPT), text_classifier.shape[-2], text_classifier.shape[-1]) # num_names, self.PROMPT, L, D
-                text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
-                text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 # [num_names, self.PROMPT, L, D] 掩码掉 padding 部分
+                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.PROMPT), len(self.PROMPT), -1, text_classifier.shape[-1]) # num_names, self.PROMPT, L, D
+                language_features = text_classifier.mean(1) # num_names, L, D
                 text_classifier = text_classifier.mean(-2) 
                 text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                 text_classifier = text_classifier.mean(1)
                 text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                 
                 self.language_features = language_features.detach() # num_names , L, D
-                self.language_mask = torch.min(language_mask.view(language_features.shape[0],len(self.PROMPT),language_features.shape[1]), dim=1).values# [num_names, L]
+                self.language_mask = torch.zeros(
+                        self.language_features.shape[0], self.language_features.shape[1], 
+                        dtype=torch.bool, device=self.device
+                    )
                 self.test_text_classifier = text_classifier.detach()
                 self.test_dataname = dataname
             return self.test_text_classifier.clone(), self.test_num_templates
@@ -808,11 +713,9 @@ class SAM3CLIP(nn.Module):
 
     def forward(self, batched_inputs):
 
-        self._manage_extra_modules_device()
-
         images = [x["image"].to(self.device) for x in batched_inputs]
         # print("shape of first image:", images[0].shape)
-        images = [(x - self.pixel_mean) / self.pixel_std for x in images]
+        images = [(x / 255.0 - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, 14)
         # print("shape of images.tensor:", images.tensor.shape)
         img_h, img_w = images.tensor.shape[-2:]
@@ -908,6 +811,8 @@ class SAM3CLIP(nn.Module):
         else:
             language_features_input = self.language_features.expand(bs, -1, -1, -1) # (bs, num_names, L, dim)
             language_mask_input = self.language_mask.expand(bs, -1, -1) # (bs, num_names, L)
+
+        language_features_input = self.text_feat_resizer(language_features_input) # (bs, num_names, L, 1024) -> (bs, num_names, L, 256)
 
         # print("shape of input:",language_features_input.shape, language_mask_input.shape)
         language_features_input = language_features_input.reshape(bs, -1, language_features_input.shape[-1]) # (bs, num_names * L, dim)
@@ -1159,73 +1064,6 @@ class SAM3CLIP(nn.Module):
         if self.new_score_head:
             obj_logits = self.score_head(queries).squeeze(-1)
 
-        if self.clip_distill:
-            text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], VILD_PROMPT)
-            if self.training and self.contrast_on:
-                mean = torch.tensor([122.7709383, 116.7460125, 104.09373615], device=self.device).view(1, 3, 1, 1)
-                std =  torch.tensor([68.5005327, 66.6321579, 70.32316305], device=self.device).view(1, 3, 1, 1)
-                with torch.no_grad():
-                    imgs_bb2 = images.tensor * self.pixel_std + self.pixel_mean
-                    imgs_bb2 = F.interpolate(
-                        imgs_bb2,
-                        size = (1024,1024),
-                        mode='bilinear', align_corners=False,
-                    )
-                    imgs_bb2 = (imgs_bb2 - mean) / std
-                    clip_feature = self.backbone2.extract_features(imgs_bb2)["clip_vis_dense"]
-
-                    gt_clip_features_list = []
-                    gt_valid_mask_list = [] 
-
-                    for t_idx, t in enumerate(targets):
-                        gt_masks = t["masks"]      # [N_gt, H_pad, W_pad]
-                        gt_classes = t["labels"]   # [N_gt]
-                        curr_img_feat = clip_feature[t_idx] # [C, H', W']
-
-                        if gt_masks.shape[0] > 0:
-                            # 插值 GT Mask 到 CLIP 特征图大小
-                            gt_masks_down = F.interpolate(
-                                gt_masks.unsqueeze(1).float(), 
-                                size=curr_img_feat.shape[-2:], 
-                                mode='bilinear', align_corners=False
-                            ).squeeze(1) # [N_gt, H', W']
-                            
-                            # Mask Pooling
-                            # 输入 curr_img_feat: [C, H', W'] -> unsqueeze(0) -> [1, C, H', W']
-                            # 输入 gt_masks_down: [N_gt, H', W'] -> unsqueeze(0) -> [1, N_gt, H', W']
-                            pooled_feat = self.mask_pooling(
-                                curr_img_feat.unsqueeze(0), 
-                                gt_masks_down.unsqueeze(0)
-                            ) # 输出形状: [1, N_gt, C]
-                            
-                            pooled_feat = self.backbone2.visual_prediction_forward(pooled_feat).squeeze(0)
-                            pooled_feat = F.normalize(pooled_feat, p=2, dim=-1)
-                            
-                            # ================= 修正后的过滤逻辑 =================
-                            # 1. 计算视觉特征与所有模板的相似度
-                            # pooled_feat: [N_gt, C], text_names: [Total_Templates, C]
-                            # sim_name_logits: [N_gt, Total_Templates]
-                            sim_name_logits = torch.einsum("nc,kc->nk", pooled_feat, text_classifier2)
-                            
-                            # 2. 对模板相似度进行聚合
-                            # sim_cls_logits: [N_gt, Num_Classes]
-                            sim_cls_logits = aggregate_name_to_class_logits(
-                                sim_name_logits, # 直接传入无 batch 维的张量
-                                num_templates_teacher
-                            )
-                            
-                            # 3. 获取 Teacher 预测的类别 ID
-                            teacher_preds = sim_cls_logits.argmax(dim=-1) # [N_gt]
-                            
-                            # 4. 比较 Teacher 预测与 GT Label
-                            is_consistent = (teacher_preds == gt_classes)
-                            
-                            gt_clip_features_list.append(pooled_feat) # 存入 [N_gt, C]
-                            gt_valid_mask_list.append(is_consistent)
-
-                        else:
-                            gt_clip_features_list.append(torch.empty(0, 768, device=self.device)) 
-                            gt_valid_mask_list.append(torch.empty(0, dtype=torch.bool, device=self.device)) # 存空
     
 
         for i in range(6):
@@ -1245,24 +1083,16 @@ class SAM3CLIP(nn.Module):
                 if self.use_query_proj:
                     tp_queries = self.query_proj(tp_queries)
 
-                if self.clip_distill:
-                    tp_queries_clip = self.sam2Clip(tp_queries)
-                    if self.use_cos_sim:
-                        tp_queries = F.normalize(tp_queries, dim=-1, p=2)
-                        tp_queries_clip = F.normalize(tp_queries_clip, dim=-1, p=2)
-                    if self.use_cdt:
-                        raise NotImplementedError
-                    query_names_results = torch.einsum("bnd,cd->bnc", tp_queries_clip, text_classifier2)
 
+                if self.use_cos_sim:
+                    tp_queries = F.normalize(tp_queries, dim=-1, p=2)
+
+
+                if self.use_cdt:
+                    query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, text_classifier) # bs, N, C
                 else:
-                    if self.use_cos_sim:
-                        tp_queries = F.normalize(tp_queries, dim=-1, p=2)
-
-                    if self.use_cdt:
-                        query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, text_classifier) # bs, N, C
-                    else:
-                        query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier) # bs, N, C
-                
+                    query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier) # bs, N, C
+            
 
                 if self.use_cos_sim:
                     cur_logit_scale = self.logit_scale.exp()
@@ -1278,10 +1108,8 @@ class SAM3CLIP(nn.Module):
 
                 query_cls_results= []
                 cur_idx = 0
-                if self.clip_distill:
-                    tp_num_templates = num_templates_teacher
-                else:
-                    tp_num_templates = num_templates
+
+                tp_num_templates = num_templates
 
                 for num_t in tp_num_templates: 
                     query_cls_results.append(query_names_results[:,:, cur_idx: cur_idx + num_t].max(-1).values)
@@ -1300,16 +1128,13 @@ class SAM3CLIP(nn.Module):
                     }
                     if cur_obj_logits is not None:
                         aux_out['pred_objectness_logits'] = cur_obj_logits
-                    if self.clip_distill:
-                        aux_out['pred_region_features'] =  tp_queries_clip
+
                     
                     aux_outputs.append(aux_out)
                 else:
                     query_cls_results_final = query_cls_results
                     obj_logits_final = cur_obj_logits
-                    if self.clip_distill:
-                        final_queries_clip =  tp_queries_clip
-        
+
 
         if self.training:
 
@@ -1323,11 +1148,6 @@ class SAM3CLIP(nn.Module):
             if obj_logits_final is not None:
                 criterion_pred['pred_objectness_logits'] = obj_logits_final
 
-            if self.clip_distill and self.contrast_on:
-                criterion_pred['pred_region_features'] = final_queries_clip
-                for i in range(len(targets)):
-                    targets[i]['teacher_features'] = gt_clip_features_list[i]
-                    targets[i]['teacher_valid_mask'] = gt_valid_mask_list[i]
 
             losses = self.criterion(criterion_pred, targets)
 
@@ -1353,80 +1173,40 @@ class SAM3CLIP(nn.Module):
             return losses
         
         else:
-
-            if self.Teacher_MaskPool:
-                imgs_bb2 = images.tensor * self.pixel_std + self.pixel_mean
-                mean = None
-                std = None
-                aligned_masks = None
-                if self.Teacher == "DINOv3TXT":                
-                    imgs_bb2 = imgs_bb2 / 255.0  # 转换到 [0, 1]
-                    mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
-                    std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
-                elif self.Teacher == "CONVCLIP":
-                    mean = torch.tensor([122.7709383, 116.7460125, 104.09373615], device=self.device).view(1, 3, 1, 1)
-                    std =  torch.tensor([68.5005327, 66.6321579, 70.32316305], device=self.device).view(1, 3, 1, 1)
-
-                    target_l = 896
-                    h_orig = batched_inputs[0]["height"]
-                    w_orig = batched_inputs[0]["width"]
-
-                    if h_orig > w_orig:
-                        new_h, new_w = target_l, int(target_l * w_orig / h_orig + 0.5)
-                    else:
-                        new_h, new_w = int(target_l * h_orig / w_orig + 0.5), target_l
-
-                    imgs_bb2 = F.interpolate(imgs_bb2, size=(new_h, new_w), mode='bilinear', align_corners=False)
-
-                    aligned_masks = F.interpolate(outputs["pred_masks"], size=(new_h//4, new_w//4), mode='bilinear', align_corners=False)
-
-                elif self.Teacher == "PE":
-                    imgs_bb2 = imgs_bb2 / 255.0  # 转换到 [0, 1]
-                    mean = torch.tensor([0.5, 0.5, 0.5], device=self.device).view(1, 3, 1, 1)
-                    std = torch.tensor([0.5, 0.5, 0.5], device=self.device).view(1, 3, 1, 1)
                 
-                if mean is not None and std is not None:
-                    imgs_bb2 = (imgs_bb2 - mean) / std
-                
-                # ==========================================
-                # 2. 提取特征
-                # ==========================================
-                # 你的 extract_features 内部已经包含了 resize 到 patch 倍数的逻辑 (encode_image)
-                clip_feature = self.backbone2.extract_features(imgs_bb2)["clip_vis_dense"]
-                if self.Teacher == "CONVCLIP":
-                    clip_vis_dense = self.backbone2.visual_prediction_forward_convnext_2d(clip_feature)
-                
-                text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], VILD_PROMPT)
+            # ==========================================
+            # 2. 提取特征
+            # ==========================================
 
-                if self.use_MaskAdapter:
-                    if aligned_masks is not None:
-                        binary_masks = aligned_masks > 0
-                    else:
-                        binary_masks = outputs["pred_masks"] > 0
-                    maps_for_pooling = self.mask_adapter(clip_vis_dense, binary_masks)
-                    maps_for_pooling = F.interpolate(maps_for_pooling, size=clip_vis_dense.shape[-2:],
-                                                mode='bilinear', align_corners=False)
-                    N_maps = maps_for_pooling.size(1)
-                    num_instances = N_maps // self.num_output_maps
-                    maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N_maps,-1), dim=-1)
-                    pooled_clip_feature = torch.bmm(maps_for_pooling, clip_feature.view(bs, clip_feature.size(1), -1).permute(0, 2, 1))
-                    pooled_clip_feature = self.backbone2.visual_prediction_forward(pooled_clip_feature)
-                    pooled_clip_feature = (pooled_clip_feature.reshape(bs,num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
-                    pooled_img_feat = pooled_clip_feature
-                    pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
-                else:
-                    img_feat_for_pool = clip_vis_dense
-                    mask_for_pool = F.interpolate(outputs["pred_masks"], size=img_feat_for_pool.shape[-2:],
-                                                        mode='bilinear', align_corners=False)
-                    pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
-                    pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
 
-                
-                maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier2, pooled_img_feat) 
+            if self.use_MaskAdapter:
+                raise NotImplementedError("Mask Adapter 逻辑尚未实现，后续版本将提供支持。")
+                # binary_masks = outputs["pred_masks"] > 0
+                # maps_for_pooling = self.mask_adapter(clip_vis_dense, binary_masks)
+                # maps_for_pooling = F.interpolate(maps_for_pooling, size=clip_vis_dense.shape[-2:],
+                #                             mode='bilinear', align_corners=False)
+                # N_maps = maps_for_pooling.size(1)
+                # num_instances = N_maps // self.num_output_maps
+                # maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N_maps,-1), dim=-1)
+                # pooled_clip_feature = torch.bmm(maps_for_pooling, clip_feature.view(bs, clip_feature.size(1), -1).permute(0, 2, 1))
+                # pooled_clip_feature = self.backbone2.visual_prediction_forward(pooled_clip_feature)
+                # pooled_clip_feature = (pooled_clip_feature.reshape(bs,num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
+                # pooled_img_feat = pooled_clip_feature
+                # pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
+            else:
+                img_feat_for_pool = backbone_out_vision['vit_feature']
+                mask_for_pool = F.interpolate(outputs["pred_masks"], size=img_feat_for_pool.shape[-2:],
+                                                    mode='bilinear', align_corners=False)
+                pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
+                pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
 
-                maskpool_name_logits = maskpool_name_logits * torch.clamp(self.backbone2.clip_model.logit_scale.exp(), max=100)
+                text_classifier, num_templates = self.get_text_classifier(dataname)
+
+                maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier, pooled_img_feat) 
+
+                maskpool_name_logits = maskpool_name_logits * torch.clamp(self.detector.backbone.vision_backbone.trunk.dino.clip_model.logit_scale.exp(), max=100)
                 
-                maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates_teacher)
+                maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
                                 
                 
                 if self.use_softmax:
@@ -1569,7 +1349,7 @@ class SAM3CLIP(nn.Module):
                             gt_result= batched_inputs[i]["sem_seg"].to(self.device),           # 本身就是 Square
                             class_names=current_class_names + ['background'],
                             original_image_tensor=img_tensor_square, # 本身就是 Square
-                            save_path=f"./show_{self.Teacher}_semantic/{batched_inputs[i]['file_name'].split('/')[-1].split('.')[0]}.png"
+                            save_path=f"./show_semantic/{batched_inputs[i]['file_name'].split('/')[-1].split('.')[0]}.png"
                         )
                 #     # =========== 修改结束 ===========
 
@@ -2034,36 +1814,6 @@ class SAM3CLIP(nn.Module):
         losses = {"loss_ce": loss_ce}
         return losses
     
-    def _manage_extra_modules_device(self):
-        """
-        根据当前模式（训练/推理）动态移动模型到 CPU 或 GPU。
-        """
-        gpu_device = self.device  # 通常是 cuda:0
-        cpu_device = torch.device("cpu")
-
-        if self.training:
-            # --- 训练模式 ---
-            # 1. mask_adapter 在你提供的训练逻辑中没有被用到，可以放回 CPU
-            if self.use_MaskAdapter and hasattr(self, "mask_adapter"):
-                if next(self.mask_adapter.parameters()).device != cpu_device:
-                    self.mask_adapter.to(cpu_device)
-
-            # 2. backbone2 (Teacher) 只有在开启 clip_distill 时才在训练中使用
-            # 如果没有开启 distill，则训练时它完全没用，放回 CPU
-            if hasattr(self, "backbone2") and not self.clip_distill:
-                if next(self.backbone2.parameters()).device != cpu_device:
-                    self.backbone2.to(cpu_device)
-            # 注意：如果 self.clip_distill 为 True，backbone2 需要保持在 GPU 用于计算特征
-        else:
-            # --- 推理/Eval 模式 ---
-            # 确保推理所需的模块回到 GPU
-            if self.use_MaskAdapter and hasattr(self, "mask_adapter"):
-                if next(self.mask_adapter.parameters()).device != gpu_device:
-                    self.mask_adapter.to(gpu_device)
-            
-            if hasattr(self, "backbone2") and self.Teacher_MaskPool:
-                if next(self.backbone2.parameters()).device != gpu_device:
-                    self.backbone2.to(gpu_device)
 
 def aggregate_name_to_class_logits(query_names_results, num_templates):
     """

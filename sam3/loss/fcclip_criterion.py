@@ -111,14 +111,15 @@ class FcclipSetCriterion(nn.Module):
             losses: list of all the losses to be applied. See get_loss for list of available losses.
         """
         super().__init__()
-        self.num_classes = num_classes
+        # self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
         self.losses = losses
-        empty_weight = torch.ones(self.num_classes + 1)
-        empty_weight[-1] = self.eos_coef
-        self.register_buffer("empty_weight", empty_weight)
+
+        # empty_weight = torch.ones(self.num_classes + 1)
+        # empty_weight[-1] = self.eos_coef
+        # self.register_buffer("empty_weight", empty_weight)
 
         # pointwise mask loss parameters
         self.num_points = num_points
@@ -131,15 +132,25 @@ class FcclipSetCriterion(nn.Module):
         """
         assert "pred_logits" in outputs
         src_logits = outputs["pred_logits"].float()
+        current_num_classes = src_logits.shape[-1] - 1
 
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
         target_classes = torch.full(
-            src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device
+            src_logits.shape[:2], 
+            # self.num_classes, 
+            current_num_classes, 
+            dtype=torch.int64, device=src_logits.device
         )
         target_classes[idx] = target_classes_o
 
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+        empty_weight = torch.ones(current_num_classes + 1, device=src_logits.device)
+        empty_weight[-1] = self.eos_coef
+
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, 
+                                #   self.empty_weight
+                                  empty_weight,
+        )
         losses = {"loss_cls": loss_ce}
         return losses
     
@@ -253,21 +264,21 @@ class FcclipSetCriterion(nn.Module):
 
         return losses
 
-    def __repr__(self):
-        head = "Criterion " + self.__class__.__name__
-        body = [
-            "matcher: {}".format(self.matcher.__repr__(_repr_indent=8)),
-            "losses: {}".format(self.losses),
-            "weight_dict: {}".format(self.weight_dict),
-            "num_classes: {}".format(self.num_classes),
-            "eos_coef: {}".format(self.eos_coef),
-            "num_points: {}".format(self.num_points),
-            "oversample_ratio: {}".format(self.oversample_ratio),
-            "importance_sample_ratio: {}".format(self.importance_sample_ratio),
-        ]
-        _repr_indent = 4
-        lines = [head] + [" " * _repr_indent + line for line in body]
-        return "\n".join(lines)
+    # def __repr__(self):
+    #     head = "Criterion " + self.__class__.__name__
+    #     body = [
+    #         "matcher: {}".format(self.matcher.__repr__(_repr_indent=8)),
+    #         "losses: {}".format(self.losses),
+    #         "weight_dict: {}".format(self.weight_dict),
+    #         "num_classes: {}".format(self.num_classes),
+    #         "eos_coef: {}".format(self.eos_coef),
+    #         "num_points: {}".format(self.num_points),
+    #         "oversample_ratio: {}".format(self.oversample_ratio),
+    #         "importance_sample_ratio: {}".format(self.importance_sample_ratio),
+    #     ]
+    #     _repr_indent = 4
+    #     lines = [head] + [" " * _repr_indent + line for line in body]
+    #     return "\n".join(lines)
 
     def loss_boxes(self, outputs, targets, indices, num_masks):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss

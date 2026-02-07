@@ -33,10 +33,14 @@ def add_sam3_config(cfg):
     cfg.MODEL.SAM3.USE_SOFTMAX = False
     cfg.MODEL.SAM3.ADD_PIXELFEAT = False
 
+    cfg.MODEL.SAM3.ALPHA = 0.0
+    cfg.MODEL.SAM3.BETA = 0.0
+
     cfg.MODEL.TEACHER = None
     cfg.MODEL.TEACHER_MASKPOOL = False
 
     cfg.MODEL.USE_MASKADAPTER = False
+    cfg.MODEL.MASKADAPTERPATH = ""
 
     cfg.INPUT.DATASET_MAPPER_NAME = "mask_former_semantic"
     cfg.INPUT.IMAGE_SIZE = 1008
