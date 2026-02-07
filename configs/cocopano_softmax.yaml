@@ -28,6 +28,9 @@ DATASETS:
   # 只保留 COCO Panoptic
   TRAIN: ("coco_2017_train_panoptic", )
   TEST: ("openvocab_ade20k_panoptic_val",) 
+  # TEST: ("openvocab_ade20k_full_sem_seg_val","openvocab_pascal20_sem_seg_val",'openvocab_pascal_ctx459_sem_seg_val', 'openvocab_pascal_ctx59_sem_seg_val',)
+  # TEST: ("openvocab_ade20k_panoptic_val", "openvocab_ade20k_full_sem_seg_val","openvocab_pascal20_sem_seg_val",'openvocab_pascal_ctx459_sem_seg_val', 'openvocab_pascal_ctx59_sem_seg_val',)
+
 
 SOLVER:
   AMP:
