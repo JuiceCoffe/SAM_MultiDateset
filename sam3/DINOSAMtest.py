@@ -1194,57 +1194,65 @@ class DINOSAM(nn.Module):
                 # pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
             else:
                 img_feat_for_pool = backbone_out_vision['vit_feature']
-                mask_for_pool = F.interpolate(outputs["pred_masks"], size=img_feat_for_pool.shape[-2:],
-                                                    mode='bilinear', align_corners=False)
-                pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
-                pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
+                
+
+                # mask_for_pool = F.interpolate(outputs["pred_masks"], size=img_feat_for_pool.shape[-2:],
+                #                                     mode='bilinear', align_corners=False)
+                # pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
+                # pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
 
                 text_classifier, num_templates = self.get_text_classifier(dataname)
 
-                maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier, pooled_img_feat) 
+                img_feat_for_pool = F.normalize(img_feat_for_pool, dim=1, p=2)
 
-                maskpool_name_logits = maskpool_name_logits * torch.clamp(self.detector.backbone.vision_backbone.trunk.dino.clip_model.logit_scale.exp(), max=100)
+                zs_semseg = torch.einsum("bdhw, cd->bhwc", img_feat_for_pool, text_classifier) # bs, H', W', C
+
+                zs_semseg = aggregate_name_to_class_logits(zs_semseg, num_templates) # bs, H', W', num_classes
+
+                # maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier, pooled_img_feat) 
+
+                # maskpool_name_logits = maskpool_name_logits * torch.clamp(self.detector.backbone.vision_backbone.trunk.dino.clip_model.logit_scale.exp(), max=100)
                 
-                maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
+                # maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
                                 
                 
-                if self.use_softmax:
-                    is_void_prob = F.softmax(query_cls_results_final, dim=-1)[..., -1:]
-                    in_vocab_cls_results = query_cls_results_final[..., :-1] 
-                    in_vocab_cls_probs = in_vocab_cls_results.softmax(-1)
-                    out_vocab_cls_probs = maskpool_cls_logits.softmax(-1)
-                else:
-                    in_vocab_cls_probs = torch.sigmoid(query_cls_results_final)
-                    out_vocab_cls_probs = F.softmax(maskpool_cls_logits, dim=-1)
-                category_overlapping_mask = self.category_overlapping_mask.to(self.device)
-                alpha = self.alpha
-                beta = self.beta
-                # 为了数值稳定性，加一个小 epsilon
-                eps = 1e-7 
+                # if self.use_softmax:
+                #     is_void_prob = F.softmax(query_cls_results_final, dim=-1)[..., -1:]
+                #     in_vocab_cls_results = query_cls_results_final[..., :-1] 
+                #     in_vocab_cls_probs = in_vocab_cls_results.softmax(-1)
+                #     out_vocab_cls_probs = maskpool_cls_logits.softmax(-1)
+                # else:
+                #     in_vocab_cls_probs = torch.sigmoid(query_cls_results_final)
+                #     out_vocab_cls_probs = F.softmax(maskpool_cls_logits, dim=-1)
+                # category_overlapping_mask = self.category_overlapping_mask.to(self.device)
+                # alpha = self.alpha
+                # beta = self.beta
+                # # 为了数值稳定性，加一个小 epsilon
+                # eps = 1e-7 
 
-                # 计算 Seen 类的加权几何平均概率
-                probs_seen = (
-                    (in_vocab_cls_probs + eps) ** (1 - alpha) * 
-                    (out_vocab_cls_probs + eps) ** alpha
-                )
+                # # 计算 Seen 类的加权几何平均概率
+                # probs_seen = (
+                #     (in_vocab_cls_probs + eps) ** (1 - alpha) * 
+                #     (out_vocab_cls_probs + eps) ** alpha
+                # )
                 
-                # 计算 Unseen 类的加权几何平均概率
-                probs_unseen = (
-                    (in_vocab_cls_probs + eps) ** (1 - beta) * 
-                    (out_vocab_cls_probs + eps) ** beta
-                )
+                # # 计算 Unseen 类的加权几何平均概率
+                # probs_unseen = (
+                #     (in_vocab_cls_probs + eps) ** (1 - beta) * 
+                #     (out_vocab_cls_probs + eps) ** beta
+                # )
 
-                ensemble_logits = (
-                    probs_seen.log() * category_overlapping_mask + 
-                    probs_unseen.log() * (1 - category_overlapping_mask)
-                )
+                # ensemble_logits = (
+                #     probs_seen.log() * category_overlapping_mask + 
+                #     probs_unseen.log() * (1 - category_overlapping_mask)
+                # )
 
-                final_probs = torch.cat([
-                    ensemble_logits.softmax(-1) * (1.0 - is_void_prob), 
-                    is_void_prob
-                ], dim=-1)
+                # final_probs = torch.cat([
+                #     ensemble_logits.softmax(-1) * (1.0 - is_void_prob), 
+                #     is_void_prob
+                # ], dim=-1)
 
-                query_cls_results_final = torch.log(final_probs + 1e-8)
+                # query_cls_results_final = torch.log(final_probs + 1e-8)
 
 
 
@@ -1268,18 +1276,22 @@ class DINOSAM(nn.Module):
                 
                 # 直接用 oracle logits 替换模型原来的分类结果
                 query_cls_results_final = oracle_logits
+
+
+            zs_semseg = zs_semseg.permute(0, 3, 1, 2) 
+            print("zs_semseg shape after permute:", zs_semseg.shape) # bs, num_classes, H', W'
         # =======================================================
         
-            mask_cls_logits = query_cls_results_final # 保持 Logits 状态
-            mask_pred_logits = outputs["pred_masks"]  # 保持 Logits 状态
+            # mask_cls_logits = query_cls_results_final # 保持 Logits 状态
+            # mask_pred_logits = outputs["pred_masks"]  # 保持 Logits 状态
 
 
             results = []
             
             for i in range(bs):
                 # 获取单张图数据
-                mask_cls_i = mask_cls_logits[i]       # [Q, C]
-                mask_pred_i = mask_pred_logits[i]     # [Q, H, W]
+                # mask_cls_i = mask_cls_logits[i]       # [Q, C]
+                # mask_pred_i = mask_pred_logits[i]     # [Q, H, W]
                 
                 # 获取原始图像尺寸
                 img_h_orig = batched_inputs[i]["height"]
@@ -1287,22 +1299,25 @@ class DINOSAM(nn.Module):
                 
                 # 上采样 Mask 到原始图像尺寸 (非常重要)
                 # 使用 bilinear 插值 logits
-                mask_pred_i = F.interpolate(
-                    mask_pred_i.unsqueeze(0), 
-                    size=(img_h_orig, img_w_orig), 
-                    mode="bilinear", 
-                    align_corners=False
-                ).squeeze(0)
+                # mask_pred_i = F.interpolate(
+                #     mask_pred_i.unsqueeze(0), 
+                #     size=(img_h_orig, img_w_orig), 
+                #     mode="bilinear", 
+                #     align_corners=False
+                # ).squeeze(0)
 
                 res = {}
 
                 # --- A. 语义分割 (Semantic Segmentation) ---
                 if self.semantic_on:
-                    # 使用你原来的逻辑，但注意输入变成了 logits
-                    mask_cls_prob = F.softmax(mask_cls_i, dim=-1)[..., :-1]
-                    mask_pred_prob = mask_pred_i.sigmoid()
-                    semseg = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_prob)
-                    res["sem_seg"] = semseg
+                    # # 使用你原来的逻辑，但注意输入变成了 logits
+                    # mask_cls_prob = F.softmax(mask_cls_i, dim=-1)[..., :-1]
+                    # mask_pred_prob = mask_pred_i.sigmoid()
+                    # semseg = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_prob)
+                    # res["sem_seg"] = semseg
+                    current_zs_logits = zs_semseg[i]
+
+                    
 
                     # =========== 修改开始：为可视化准备 Square 数据 ===========
                     
@@ -1312,17 +1327,26 @@ class DINOSAM(nn.Module):
                     
                     # 2. 将 Logits 插值到 Tensor 尺寸 (而不是原图尺寸)
                     # 注意：这里要用原始的 mask_pred_logits[i]，不要用已经 resize 过的 mask_pred_i
-                    mask_pred_i_square = F.interpolate(
-                        mask_pred_logits[i].unsqueeze(0), 
+                    logits_square = F.interpolate(
+                        current_zs_logits.unsqueeze(0), # [1, C, H, W]
                         size=(tensor_h, tensor_w), 
                         mode="bilinear", 
                         align_corners=False
-                    ).squeeze(0).sigmoid()
+                    ).squeeze(0) # [C, tensor_h, tensor_w]
+
+
+
+                    res["sem_seg"] =  F.interpolate(
+                        logits_square.unsqueeze(0), # [1, C, H, W]
+                        size=(img_h_orig, img_w_orig),
+                        mode="bilinear",
+                        align_corners=False
+                    ).squeeze(0)
                     
                     # 3. 计算 Square 的语义分割结果
-                    semseg_square = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_i_square)
-                    pred_result_square = semseg_square.argmax(0).cpu()
-
+                    # semseg_square = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_i_square)
+                    # pred_result_square = semseg_square.argmax(0).cpu()
+                    pred_result_square = logits_square.argmax(0).cpu()
                     # 5. 准备 Image (它本身就是 Square 的)
                     img_tensor_square = batched_inputs[i]["image"]
 
@@ -1340,7 +1364,7 @@ class DINOSAM(nn.Module):
 
                     # 7. 绘图 (全部传入 Square 的数据)
                     visualize_semantic = False
-                    # visualize_semantic = True
+                    visualize_semantic = True
 
                     if visualize_semantic:
                         visualize_segmentation(
@@ -1352,22 +1376,22 @@ class DINOSAM(nn.Module):
                         )
                 #     # =========== 修改结束 ===========
 
-                # --- B. 全景分割 (Panoptic Segmentation) ---
-                if self.panoptic_on:
-                    excluded_datasets = ["lvis_v1_val", "lvis_v1_train"]
+                # # --- B. 全景分割 (Panoptic Segmentation) ---
+                # if self.panoptic_on:
+                #     excluded_datasets = ["lvis_v1_val", "lvis_v1_train"]
                     
-                    if dataname not in excluded_datasets:
-                        panoptic_seg, segments_info = self.panoptic_inference(
-                            mask_cls_i, mask_pred_i, dataname
-                        )
-                        res["panoptic_seg"] = (panoptic_seg, segments_info)
+                #     if dataname not in excluded_datasets:
+                #         panoptic_seg, segments_info = self.panoptic_inference(
+                #             mask_cls_i, mask_pred_i, dataname
+                #         )
+                #         res["panoptic_seg"] = (panoptic_seg, segments_info)
                 
-                # --- C. 实例分割 (Instance Segmentation) ---
-                if self.instance_on:
-                    instances = self.instance_inference(
-                        mask_cls_i, mask_pred_i, dataname
-                    )
-                    res["instances"] = instances
+                # # --- C. 实例分割 (Instance Segmentation) ---
+                # if self.instance_on:
+                #     instances = self.instance_inference(
+                #         mask_cls_i, mask_pred_i, dataname
+                #     )
+                #     res["instances"] = instances
 
                 results.append(res)
 
