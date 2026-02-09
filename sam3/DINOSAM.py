@@ -715,7 +715,7 @@ class DINOSAM(nn.Module):
         images = [x["image"].to(self.device) for x in batched_inputs]
         # print("shape of first image:", images[0].shape)
         images = [(x / 255.0 - self.pixel_mean) / self.pixel_std for x in images]
-        images = ImageList.from_tensors(images, 14)
+        images = ImageList.from_tensors(images, 16)
         # print("shape of images.tensor:", images.tensor.shape)
         img_h, img_w = images.tensor.shape[-2:]
 
