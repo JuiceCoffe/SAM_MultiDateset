@@ -98,6 +98,6 @@ TEST:
 # 修改输出目录名称以区分实验
 VERSION: 2
 
-OUTPUT_DIR: ./out/test/
-# OUTPUT_DIR: ./out/DINOSAM/copa_3
+# OUTPUT_DIR: ./out/test/
+OUTPUT_DIR: ./out/DINOSAM/copa_SAMtext
   
