@@ -432,7 +432,7 @@ class DINOSAM(nn.Module):
             # 'text_feat_resizer': 顶层的 1024->256 投影层
             freeze_keywords = [
                 'dino',
-
+                'geometry_encoder',
                 'language_backbone', 
                 'text_model', 
 
