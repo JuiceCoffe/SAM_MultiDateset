@@ -1319,7 +1319,7 @@ class DINOSAM(nn.Module):
                 query_cls_results= []
                 cur_idx = 0
 
-                tp_num_templates = num_templates
+                tp_num_templates = SAM_num_templates
 
                 for num_t in tp_num_templates: 
                     query_cls_results.append(query_names_results[:,:, cur_idx: cur_idx + num_t].max(-1).values)
