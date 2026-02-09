@@ -172,6 +172,7 @@ class DINOSAM(nn.Module):
         print("SAM3创建成功!")
 
         self.PROMPT = DINO_PROMPT_TEMPLATES
+        self.SAM_PROMPT = ['{}']
         # -------------------------------------------------------
         # 新增模块
         # -------------------------------------------------------
@@ -209,9 +210,6 @@ class DINOSAM(nn.Module):
             self.encoder_box_head = MLP(256, 256, 4, 3)
             nn.init.constant_(self.encoder_box_head.layers[-1].weight.data, 0)
             nn.init.constant_(self.encoder_box_head.layers[-1].bias.data, 0)
-
-
-        self.text_encoder_cache = {} 
  
         self.mask_pooling = MaskPooling()
 
@@ -235,7 +233,7 @@ class DINOSAM(nn.Module):
             self.score_head = MLP(256, 256, 1, 3)
             init_score_head(self.score_head)
 
-        self.text_feat_resizer = nn.Linear(1024, 256)
+        # self.text_feat_resizer = nn.Linear(1024, 256)
 
         # -------------------------------------------------------
         # 计算逻辑
@@ -250,10 +248,12 @@ class DINOSAM(nn.Module):
         # 你需要检查 sam3_loss 的初始化参数
         self.train_dataname = None
         self.test_dataname = None
-        self.train_dataname_teacher = None
-        self.test_dataname_teacher = None
+        self.SAM_train_dataname = None
+        self.SAM_test_dataname = None
+        self.text_encoder_cache = {} 
+        self.SAM_text_encoder_cache = {}
+
         self.test_metadata = {i: MetadataCatalog.get(i) for i in cfg.DATASETS.TEST}
-        # 【修改】建立 Metadata 字典，方便后续查找
         self.train_metadata_dict = {name: MetadataCatalog.get(name) for name in cfg.DATASETS.TRAIN}
         
         # 【修改】这里初始化为 None 或第一个数据集的均可，反正 get_text_classifier 会覆盖它
@@ -286,7 +286,7 @@ class DINOSAM(nn.Module):
         self.use_softmax = cfg.MODEL.SAM3.USE_SOFTMAX
         self.void_embedding = None
         if self.use_softmax:
-            self.void_embedding = nn.Embedding(1, 1024)
+            self.void_embedding = nn.Embedding(1, 256)
 
 
         self.logit_bias = None
@@ -409,23 +409,59 @@ class DINOSAM(nn.Module):
 
         self._freeze()
 
-    def _freeze(self, ):
-        for name, param in self.named_parameters():
-            if 'dino' in name:
-                param.requires_grad = False
-            # elif 'dot_prod_scoring' in name:
-            #     param.requires_grad = False
-            elif 'geometry_encoder' in name:
-                param.requires_grad = False
-            else:
-                param.requires_grad = True
+    # def _freeze(self, ):
+    #     for name, param in self.named_parameters():
+    #         if 'dino' in name:
+    #             param.requires_grad = False
+    #         elif 'language_backbone' in name:
+    #             param.requires_grad = False
+    #         elif 'geometry_encoder' in name:
+    #             param.requires_grad = False
+    #         else:
+    #             param.requires_grad = True
         
-        print('='*10,'Parameters to be trained', '='*10)
-        for name, param in self.named_parameters():
-            if param.requires_grad == True:
-                print(name)
-        # exit()
+    #     print('='*10,'Parameters to be trained', '='*10)
+    #     for name, param in self.named_parameters():
+    #         if param.requires_grad == True:
+    #             print(name)
+    #     # exit()
+    def _freeze(self):
+            # 1. 定义需要冻结的关键字
+            # 'language_backbone': 处理语言的主干及其 256 维 resizer
+            # 'text_model': DINO 内部的文本编码器分支
+            # 'text_feat_resizer': 顶层的 1024->256 投影层
+            freeze_keywords = [
+                'dino',
 
+                'language_backbone', 
+                'text_model', 
+
+            ]
+
+            # 2. 遍历参数并设置 requires_grad
+            for name, param in self.named_parameters():
+                # 检查参数名是否包含上述任何一个关键字
+                if any(key in name for key in freeze_keywords):
+                    param.requires_grad = False
+                else:
+                    # 其他部分（如 vision_backbone 的视觉部分、transformer 训练层等）保持开启
+                    param.requires_grad = True
+            
+            # 特殊处理：如果您希望整个 DINO (包括视觉分支) 也冻结，请取消下面注释
+            # for name, param in self.named_parameters():
+            #     if 'detector.backbone.vision_backbone.trunk.dino' in name:
+            #         param.requires_grad = False
+
+            # 3. 打印结果以供校验
+            print('='*10, 'Parameters to be TRAINED (requires_grad=True)', '='*10)
+            trainable_count = 0
+            for name, param in self.named_parameters():
+                if param.requires_grad:
+                    print(f"TRAINABLE: {name}")
+                    trainable_count += 1
+            
+            print(f"\nTotal trainable parameter groups: {trainable_count}")
+            print('='*40)
     # def prepare_targets(self, targets, images):
     #     h_pad, w_pad = images.tensor.shape[-2:]
     #     new_targets = []
@@ -706,6 +742,181 @@ class DINOSAM(nn.Module):
                 self.test_dataname = dataname
             return self.test_text_classifier.clone(), self.test_num_templates
 
+    def get_SAM_text_classifier(self, dataname):
+        if self.training:
+            if self.SAM_train_dataname != dataname:
+                if dataname in self.SAM_text_encoder_cache:
+                    cache = self.SAM_text_encoder_cache[dataname]
+                    # 从 CPU 缓存加载并移回 GPU
+                    self.SAM_language_features = cache["language_features"].to(self.device)
+                    self.SAM_language_mask = cache["language_mask"].to(self.device)
+                    self.SAM_train_text_classifier = cache["text_classifier"].to(self.device)
+                    
+                    # 直接恢复列表，不要再重新计算
+                    self.SAM_train_num_templates = cache["num_templates"] 
+                    self.SAM_train_class_names = cache["class_names"]
+
+                else:
+                    # ============== 关键修改开始 ==============
+                    # 获取 metadata
+                    if dataname in self.train_metadata_dict:
+                        current_metadata = self.train_metadata_dict[dataname]
+                    else:
+                        current_metadata = MetadataCatalog.get(dataname)
+
+                    # 计算类别名和模板数量
+                    # 【注意】这里不要用 self.train_num_templates[dataname]，因为它不是字典
+                    # 直接覆盖 self.train_num_templates 为当前数据集的 List
+                    _, self.SAM_train_num_templates, self.SAM_train_class_names = self.prepare_class_names_from_metadata(
+                        current_metadata, current_metadata, self.SAM_PROMPT
+                    )
+                    # ============== 关键修改结束 ==============
+
+                    # 如果开启 only_instance 且当前是 COCO Stuff，我们需要移除前 80 个 Things 类
+                    # 这样生成的 text_classifier 就只包含 Stuff 类，且从 0 开始索引
+                    # ---------------- 修改开始 ----------------
+                    is_coco_stuff = "openvocab_coco_2017_train_stuff_sem_seg" in dataname
+                    
+                    if self.only_instance and is_coco_stuff:
+                        num_things_classes = 80 
+                        
+                        if len(self.SAM_train_num_templates) > num_things_classes:
+                            print(f"[{dataname}] Filtering out {num_things_classes} Thing classes for Stuff training.")
+                            
+                            # 1. 计算前 80 个类总共占用了多少个文本 Prompt 
+                            # 【关键修正】这里必须乘以每个同义词对应的 Prompt 数量 (len(self.PROMPT))
+                            # train_num_templates 存的是同义词数量，train_class_names 存的是展开后的 Prompt
+                            num_synonyms_to_skip = sum(self.SAM_train_num_templates[:num_things_classes])
+                            offset_text_idx = num_synonyms_to_skip * len(self.SAM_PROMPT)
+                            
+                            # 2. 截断 class_names (输入给 Text Encoder 的文本列表)
+                            self.SAM_train_class_names = self.SAM_train_class_names[offset_text_idx:]
+                            
+                            # 3. 截断 num_templates (用于后续 Logit 聚合的计数列表)
+                            self.SAM_train_num_templates = self.SAM_train_num_templates[num_things_classes:]
+                    # ---------------- 修改结束 ----------------
+
+                        # ======= 新增打印验证逻辑 =======
+                        # print(f"\n" + "="*40)
+                        # print(f"DEBUG: 数据集 [{dataname}] 类别过滤完成")
+                        # print(f"剩余类别数量 (num_classes): {len(self.train_num_templates)}")
+                        
+                        # # 提取每个类别的第一个模板名进行展示
+                        # display_names = []
+                        # current_idx = 0
+                        # for num_t in self.train_num_templates:
+                        #     # 取该类别的第一个 prompt 作为代表名
+                        #     display_names.append(self.train_class_names[current_idx])
+                        #     current_idx += num_t
+                        
+                        # print("前 10 个 Stuff 类别示例:")
+                        # for i, name in enumerate(display_names[:10]):
+                        #     print(f"  Class {i}: {name}")
+                        
+                        # print("最后 5 个 Stuff 类别示例:")
+                        # for i, name in enumerate(display_names[-5:]):
+                        #     print(f"  Class {len(display_names)-5+i}: {name}")
+                        # print("="*40 + "\n")
+                        # ===============================
+
+                    # --- 原有生成逻辑开始 ---
+                    text_classifier = []
+                    text_feat = []
+                    language_mask = []
+                    # this is needed to avoid oom, which may happen when num of class is large
+                    bs = 128
+                    print("Generating text classifier for", dataname, "with", len(self.SAM_train_class_names), "classes.")
+                    for idx in range(0, len(self.SAM_train_class_names), bs):
+                        state_text = self.detector.backbone.forward_text(self.SAM_train_class_names[idx:idx+bs], device=self.device)
+
+                        batch_text_feat = state_text["language_features"].detach()
+                        mask = state_text["language_mask"] # bs, L
+                        batch_text_feat = batch_text_feat.permute(1,0,2) # -> bs, L, D 
+                        if self.use_pe_text:
+                            text_classifier.append(state_text["pe_text_out"]["pe_textfeat"])
+                        else:    
+                            text_classifier.append(batch_text_feat)
+                        text_feat.append(batch_text_feat)
+                        language_mask.append(mask) # bs, L
+                    text_classifier = torch.cat(text_classifier, dim=0)
+                    text_feat = torch.cat(text_feat, dim=0)
+                    language_mask = torch.cat(language_mask, dim=0) # (num_names * self.PROMPT,  L)
+                    # average across templates and normalization.
+                    text_feat = text_feat.reshape(text_feat.shape[0]//len(self.SAM_PROMPT), len(self.SAM_PROMPT), text_feat.shape[-2], text_feat.shape[-1]) # num_names, self.PROMPT, L, D
+                    text_feat /= (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
+                    text_feat[language_mask.view(text_feat.shape[0],text_feat.shape[1],text_feat.shape[2])] = 0.0 # [num_names, self.PROMPT, L, D] 掩码掉 padding 部分
+                    
+                    language_features = text_feat.mean(1) # num_names, L, D
+
+                    text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.SAM_PROMPT), len(self.SAM_PROMPT), text_classifier.shape[-2], text_classifier.shape[-1]) # num_names, self.PROMPT, L, D
+                    text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
+                    text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 # [num_names, self.PROMPT, L, D] 掩码掉 padding 部分
+                    text_classifier = text_classifier.mean(-2) 
+                    text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
+                    text_classifier = text_classifier.mean(1)
+                    text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
+                    
+                    self.SAM_language_features = language_features.detach() # num_names , L, D
+                    self.SAM_language_mask = torch.min(language_mask.view(language_features.shape[0],len(self.SAM_PROMPT),language_features.shape[1]), dim=1).values# [num_names, L]
+                    self.SAM_train_text_classifier = text_classifier.detach()
+                    # --- 原有生成逻辑结束 ---
+
+                    # 【新增】2. 将生成的特征移至 CPU 并存入缓存
+                    self.SAM_text_encoder_cache[dataname] = {
+                        "language_features": self.SAM_language_features.cpu(),
+                        "language_mask": self.SAM_language_mask.cpu(),
+                        "text_classifier": self.SAM_train_text_classifier.cpu(),
+                        "num_templates": self.SAM_train_num_templates, # 缓存当前的 List
+                        "class_names": self.SAM_train_class_names      # 缓存当前的 List
+                    }
+
+                self.SAM_train_dataname = dataname
+            return self.SAM_train_text_classifier.clone(), self.SAM_train_num_templates
+        else:
+            if self.SAM_test_dataname != dataname:
+                self.SAM_category_overlapping_mask, self.SAM_test_num_templates, self.SAM_test_class_names = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata, self.SAM_PROMPT)
+                text_classifier = []
+                text_feat = []
+                language_mask = []
+                # this is needed to avoid oom, which may happen when num of class is large
+                bs = 128
+                print("Generating text classifier for", dataname, "with", len(self.SAM_test_class_names), "classes.")
+                for idx in range(0, len(self.SAM_test_class_names), bs):
+                    state_text = self.detector.backbone.forward_text(self.SAM_test_class_names[idx:idx+bs], device=self.device)
+
+                    batch_text_feat = state_text["language_features"].detach()
+                    mask = state_text["language_mask"] # bs, L
+                    batch_text_feat = batch_text_feat.permute(1,0,2) # -> bs, L, D 
+                    if self.use_pe_text:
+                        text_classifier.append(state_text["pe_text_out"]["pe_textfeat"])
+                    else:    
+                        text_classifier.append(batch_text_feat)
+                    text_feat.append(batch_text_feat)
+                    language_mask.append(mask) # bs, L
+                text_classifier = torch.cat(text_classifier, dim=0)
+                text_feat = torch.cat(text_feat, dim=0)
+                language_mask = torch.cat(language_mask, dim=0) # (num_names * self.PROMPT,  L)
+                # average across templates and normalization.
+                text_feat = text_feat.reshape(text_feat.shape[0]//len(self.SAM_PROMPT), len(self.SAM_PROMPT), text_feat.shape[-2], text_feat.shape[-1]) # num_names, self.PROMPT, L, D
+                text_feat /= (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
+                text_feat[language_mask.view(text_feat.shape[0],text_feat.shape[1],text_feat.shape[2])] = 0.0 # [num_names, self.PROMPT, L, D] 掩码掉 padding 部分
+                
+                language_features = text_feat.mean(1) # num_names, L, D
+
+                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.SAM_PROMPT), len(self.SAM_PROMPT), text_classifier.shape[-2], text_classifier.shape[-1]) # num_names, self.PROMPT, L, D
+                text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
+                text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 # [num_names, self.PROMPT, L, D] 掩码掉 padding 部分
+                text_classifier = text_classifier.mean(-2) 
+                text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
+                text_classifier = text_classifier.mean(1)
+                text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
+                
+                self.SAM_language_features = language_features.detach() # num_names , L, D
+                self.SAM_language_mask = torch.min(language_mask.view(language_features.shape[0],len(self.SAM_PROMPT),language_features.shape[1]), dim=1).values# [num_names, L]
+                self.SAM_test_text_classifier = text_classifier.detach()
+                self.SAM_test_dataname = dataname
+            return self.SAM_test_text_classifier.clone(), self.SAM_test_num_templates
+
     @property
     def device(self):
         return self.pixel_mean.device
@@ -756,17 +967,17 @@ class DINOSAM(nn.Module):
             # language_features:[num_names, num_templates, L, dim] language_mask:[num_names, num_templates, L]
             
             # text_classifier, num_templates = self.get_text_classifier(meta['dataname'])
-            text_classifier, num_templates = self.get_text_classifier(dataname)
+            SAM_text_classifier, SAM_num_templates = self.get_SAM_text_classifier(dataname)
             if self.void_embedding is not None:
-                text_classifier = torch.cat([text_classifier, F.normalize(self.void_embedding.weight, dim=-1)], dim=0)
+                SAM_text_classifier = torch.cat([SAM_text_classifier, F.normalize(self.void_embedding.weight, dim=-1)], dim=0)
 
             # others
             geometric_prompt = self.detector._get_dummy_prompt(bs)
         
         if self.use_cdt:
-            # text_classifier = self.cdt(img_feat,text_classifier)
-            for layer in self.cdt:
-                text_classifier = layer(img_feat,text_classifier) # 逐层通过
+            raise NotImplementedError("CDT is not implemented yet.")
+            # for layer in self.cdt:
+            #     text_classifier = layer(img_feat,text_classifier) # 逐层通过
 
         batch_gt_names_idx = []
         for i in range(bs):
@@ -785,7 +996,7 @@ class DINOSAM(nn.Module):
 
             gt_names_idx = []
             cur_idx = 0
-            for i,num_t in enumerate(num_templates): 
+            for i,num_t in enumerate(SAM_num_templates): 
                 if i in gt_classes:
                     gt_names_idx += list(range(cur_idx, cur_idx + num_t))
                 cur_idx += num_t
@@ -808,10 +1019,10 @@ class DINOSAM(nn.Module):
                 language_mask_input = language_mask_input.unsqueeze(0)
 
         else:
-            language_features_input = self.language_features.expand(bs, -1, -1, -1) # (bs, num_names, L, dim)
-            language_mask_input = self.language_mask.expand(bs, -1, -1) # (bs, num_names, L)
+            language_features_input = self.SAM_language_features.expand(bs, -1, -1, -1) # (bs, num_names, L, dim)
+            language_mask_input = self.SAM_language_mask.expand(bs, -1, -1) # (bs, num_names, L)
 
-        language_features_input = self.text_feat_resizer(language_features_input) # (bs, num_names, L, 1024) -> (bs, num_names, L, 256)
+        # language_features_input = self.text_feat_resizer(language_features_input) # (bs, num_names, L, 1024) -> (bs, num_names, L, 256)
 
         # print("shape of input:",language_features_input.shape, language_mask_input.shape)
         language_features_input = language_features_input.reshape(bs, -1, language_features_input.shape[-1]) # (bs, num_names * L, dim)
@@ -1048,7 +1259,7 @@ class DINOSAM(nn.Module):
         
 
         bs, N, H, W = out_masks.shape
-        C_ = text_classifier.shape[0] # num_names 
+        C_ = SAM_text_classifier.shape[0] # num_names 
 
         queries_masks = out_masks # out_probs是通过与池化prompt投影卷积实现的，多类别下失效，直接用原始mask_logits
 
@@ -1088,9 +1299,9 @@ class DINOSAM(nn.Module):
 
 
                 if self.use_cdt:
-                    query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, text_classifier) # bs, N, C
+                    query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, SAM_text_classifier) # bs, N, C
                 else:
-                    query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier) # bs, N, C
+                    query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, SAM_text_classifier) # bs, N, C
             
 
                 if self.use_cos_sim:

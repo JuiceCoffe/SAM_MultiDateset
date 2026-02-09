@@ -90,7 +90,7 @@ DATALOADER:
   USE_DIFF_BS_SIZE: True
 
 TEST:
-  EVAL_PERIOD: 3750
+  EVAL_PERIOD: 75
   INSTANCE_ON: True   
   PANOPTIC_ON: True   
   SEMANTIC_ON: True   
@@ -98,6 +98,6 @@ TEST:
 # 修改输出目录名称以区分实验
 VERSION: 2
 
-# OUTPUT_DIR: ./out/test/
-OUTPUT_DIR: ./out/DINOSAM/copa_3
+OUTPUT_DIR: ./out/test/
+# OUTPUT_DIR: ./out/DINOSAM/copa_3
   
