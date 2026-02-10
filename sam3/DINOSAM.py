@@ -57,6 +57,7 @@ import random
 import math
 
 from .dinov3txt import DINOv3TXT
+from .mask_adapter_head import build_mask_adapter
 
 class DINOv3Shim(nn.Module):
     def __init__(self):
@@ -216,16 +217,14 @@ class DINOSAM(nn.Module):
         self.use_MaskAdapter = cfg.MODEL.USE_MASKADAPTER
         if self.use_MaskAdapter:
             from .mask_adapter_head import load_mask_adapter_standalone
-            self.mask_adapter = load_mask_adapter_standalone(
-                weight_path=cfg.MODEL.MASKADAPTERPATH,
-                clip_model_name="fcclip_convnext_large", # 只要包含 '_large' 即可
-                num_channels=768,              
-                num_output_maps=16,           
-                mask_in_chans=16,           
-                use_checkpoint=False         
-            )
-            self.mask_adapter.eval()
-            self.num_output_maps = 16
+            self.mask_adapter = build_mask_adapter(cfg, cfg.MODEL.MASK_ADAPTER.NAME)
+            self.num_output_maps = cfg.MODEL.MASK_ADAPTER.NUM_OUTPUT_MAPS
+            self.iou_threshold = cfg.MODEL.MASK_ADAPTER.IOU_THRESHOLD
+            self.mask_threshold = cfg.MODEL.MASK_ADAPTER.MASK_THRESHOLD
+            self.num_gt_masks = cfg.MODEL.MASK_ADAPTER.NUM_GT_MASKS
+            self.num_pred_masks = cfg.MODEL.MASK_ADAPTER.NUM_PRED_MASKS
+
+            self.mask_adapter_weight_dict = {"loss_ce": cfg.MODEL.MASK_ADAPTER.CLASS_WEIGHT, "loss_cosine": cfg.MODEL.MASK_ADAPTER.COS_WEIGHT}
    
 
         self.new_score_head = cfg.MODEL.SAM3.NEW_SCORE_HEAD
@@ -268,6 +267,8 @@ class DINOSAM(nn.Module):
 
         self.use_aux = cfg.SOLVER.USE_AUX
         self.only_instance = cfg.DATASETS.ONLY_INSTANCE
+        if self.only_instance:
+            raise NotImplementedError("only_instance尚未给prepare_targets_for_maskadapter适配")
         # -------------------------------------------------------
         # criterion损失函数
         # -------------------------------------------------------
@@ -494,6 +495,10 @@ class DINOSAM(nn.Module):
     #             }
     #         )
     #     return new_targets
+
+    def dino(self):
+        return self.detector.backbone.vision_backbone.trunk.dino
+
     def prepare_targets(self, targets, images, batched_inputs):
         h_pad, w_pad = images.tensor.shape[-2:]
         new_targets = []
@@ -571,6 +576,71 @@ class DINOSAM(nn.Module):
                 }
             )
         return new_targets
+
+    def prepare_targets_for_maskadapter(self, targets, images):
+        h_pad, w_pad = images.tensor.shape[-2:]
+        new_targets = []
+        masks_list = []
+        labels_list = []
+
+        num_masks = self.num_gt_masks  
+
+        for targets_per_image in targets:
+            gt_masks = targets_per_image.gt_masks
+            if isinstance(gt_masks, BitMasks):
+                gt_masks = gt_masks.tensor
+            valid_mask_indices = [i for i, mask in enumerate(gt_masks) if mask.sum() > 0] 
+
+            if len(valid_mask_indices) > 0:
+                valid_gt_masks = gt_masks[valid_mask_indices]
+                valid_gt_classes = targets_per_image.gt_classes[valid_mask_indices]
+
+                padded_masks = torch.zeros((valid_gt_masks.shape[0], h_pad, w_pad), dtype=valid_gt_masks.dtype, device=valid_gt_masks.device)
+                padded_masks[:, :valid_gt_masks.shape[1], :valid_gt_masks.shape[2]] = valid_gt_masks
+                new_targets.append(
+                    {
+                        "labels": valid_gt_classes,
+                        "masks": padded_masks,
+                    }
+                )
+
+                total_masks = torch.zeros((num_masks, h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+                selected_labels = torch.full((num_masks,), -1, dtype=valid_gt_classes.dtype, device=gt_masks.device)
+
+                if valid_gt_masks.shape[0] > num_masks:
+                    selected_indices = torch.randperm(valid_gt_masks.shape[0])[:num_masks]
+                    for idx, mask_idx in enumerate(selected_indices):
+                        total_masks[idx, :valid_gt_masks[mask_idx].shape[0], :valid_gt_masks[mask_idx].shape[1]] = valid_gt_masks[mask_idx]
+                        selected_labels[idx] = valid_gt_classes[mask_idx]
+                else:
+                    for idx in range(valid_gt_masks.shape[0]):
+                        total_masks[idx, :valid_gt_masks[idx].shape[0], :valid_gt_masks[idx].shape[1]] = valid_gt_masks[idx]
+                        selected_labels[idx] = valid_gt_classes[idx]
+                    
+                    for idx in range(valid_gt_masks.shape[0], num_masks):
+                        total_masks[idx] = torch.zeros((h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+                        selected_labels[idx] = -1
+            else:
+                total_masks = torch.zeros((num_masks, h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+                selected_labels = torch.full((num_masks,), -1, dtype=torch.long, device=gt_masks.device)
+                
+                padded_masks = torch.zeros((0, h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+                valid_gt_classes = torch.zeros((0), device=gt_masks.device)
+                new_targets.append(
+                    {
+                        "labels": valid_gt_classes,
+                        "masks": padded_masks,
+                    }
+                )
+
+            masks_list.append(total_masks)
+            labels_list.append(selected_labels)
+
+        masks = torch.stack(masks_list, dim=0)
+        labels = torch.stack(labels_list, dim=0)
+        labels = labels.long()
+
+        return new_targets, masks, labels
 
     def prepare_class_names_from_metadata(self, metadata, train_metadata, prompt_list):
         def split_labels(x):
@@ -1347,6 +1417,7 @@ class DINOSAM(nn.Module):
 
 
         if self.training:
+            losses = {}
 
             criterion_pred = {
                 'pred_logits': query_cls_results_final,
@@ -1359,18 +1430,71 @@ class DINOSAM(nn.Module):
                 criterion_pred['pred_objectness_logits'] = obj_logits_final
 
 
-            losses = self.criterion(criterion_pred, targets)
+            fcclip_losses = self.criterion(criterion_pred, targets)
 
-                
-                                                
 
-            for k in list(losses.keys()):
+            for k in list(fcclip_losses.keys()):
                 # print("loss:", k, losses[k].item())
                 if k in self.criterion.weight_dict:
-                    losses[k] *= self.criterion.weight_dict[k]
+                    fcclip_losses[k] *= self.criterion.weight_dict[k]
                 else:
                     # remove this loss if not specified in `weight_dict`
-                    losses.pop(k)
+                    fcclip_losses.pop(k)
+
+            losses.update(fcclip_losses)
+
+            if self.use_MaskAdapter:
+                mask_adapter_losses = {}
+
+                img_feat_for_pool = backbone_out_vision['vit_feature']
+                print("img_feat_for_pool shape:", img_feat_for_pool.shape)
+                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                targets, masks, labels = self.prepare_targets_for_maskadapter(gt_instances, images)
+
+                mask_pred_results = outputs["pred_masks"]
+                mask_cls_results = query_cls_results_final
+
+                src_masks, target_masks, mask_labels = self.match_via_iou(mask_pred_results, mask_cls_results, targets, iou_threshold=self.iou_threshold,max_matches=self.num_pred_masks)
+                binary_src_masks = src_masks.sigmoid() > self.mask_threshold
+                binary_src_masks = binary_src_masks.float()
+
+                binary_src_masks = F.interpolate(binary_src_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+                target_masks = F.interpolate(target_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+
+                mask_pred = torch.cat((masks, binary_src_masks, target_masks),dim=1)
+                all_labels = torch.cat((labels, mask_labels, mask_labels),dim=1)
+                    
+                maps_for_pooling = self.mask_adapter(img_feat_for_pool, mask_pred)
+                
+                maps_for_pooling = F.interpolate(maps_for_pooling, size=img_feat_for_pool.shape[-2:],
+                                                    mode='bilinear', align_corners=False)
+
+            
+                N = maps_for_pooling.size(1)
+                num_instances = N // self.num_output_maps
+                maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N,-1), dim=-1)
+                pooled_img_feature = torch.bmm(maps_for_pooling, img_feat_for_pool.view(bs, img_feat_for_pool.size(1), -1).permute(0, 2, 1))
+                pooled_img_feature = (pooled_img_feature.reshape(bs, num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
+
+                loss_cosine_similarity = self.cosine_similarity_loss(pooled_img_feature[:, 16:24, :], pooled_img_feature[:, 24:, :])
+
+                text_classifier, num_templates = self.get_text_classifier(dataname)
+                mask_cls_results = get_classification_logits(pooled_img_feature, text_classifier, self.dino().clip_model.logit_scale, num_templates)
+
+                loss_mask_cls = self.cross_entropy_loss(mask_cls_results, all_labels)
+
+                mask_adapter_losses.update(loss_cosine_similarity)
+                mask_adapter_losses.update(loss_mask_cls)
+
+                for k in list(mask_adapter_losses.keys()):
+                    # print("loss:", k, losses[k].item())
+                    if k in self.mask_adapter_weight_dict:
+                        mask_adapter_losses[k] *= self.mask_adapter_weight_dict[k]
+                    else:
+                        # remove this loss if not specified in `weight_dict`
+                        mask_adapter_losses.pop(k)
+
+                losses.update(mask_adapter_losses)
             
             if self.encoder_loss:
                 encoder_outputs = {'pred_logits': encoder_cls_logits, 'pred_boxes': encoder_box}
@@ -1387,22 +1511,34 @@ class DINOSAM(nn.Module):
             # ==========================================
             # 2. 提取特征
             # ==========================================
-
+            # 释放不再需要的显存大户
+            if 'backbone_out' in locals(): del backbone_out
+            if 'encoder_out' in locals(): del encoder_out
+            if 'fusion_feat' in locals(): del fusion_feat
+            if 'backbone_fpn' in locals(): del backbone_fpn
+            # 强制清理 CUDA 缓存（虽然有开销，但能有效防止 OOM）
+            torch.cuda.empty_cache()
 
             if self.use_MaskAdapter:
-                raise NotImplementedError("Mask Adapter 逻辑尚未实现，后续版本将提供支持。")
-                # binary_masks = outputs["pred_masks"] > 0
-                # maps_for_pooling = self.mask_adapter(clip_vis_dense, binary_masks)
-                # maps_for_pooling = F.interpolate(maps_for_pooling, size=clip_vis_dense.shape[-2:],
-                #                             mode='bilinear', align_corners=False)
-                # N_maps = maps_for_pooling.size(1)
-                # num_instances = N_maps // self.num_output_maps
-                # maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N_maps,-1), dim=-1)
-                # pooled_clip_feature = torch.bmm(maps_for_pooling, clip_feature.view(bs, clip_feature.size(1), -1).permute(0, 2, 1))
-                # pooled_clip_feature = self.backbone2.visual_prediction_forward(pooled_clip_feature)
-                # pooled_clip_feature = (pooled_clip_feature.reshape(bs,num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
-                # pooled_img_feat = pooled_clip_feature
-                # pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
+                mask_cls_results = outputs["pred_logits"]
+                mask_pred_results = outputs["pred_masks"]
+
+                img_feat_for_pool = backbone_out_vision['vit_feature']
+
+                binary_masks = mask_pred_results.sigmoid() > self.mask_threshold
+                
+                maps_for_pooling = self.mask_adapter(img_feat_for_pool, binary_masks)
+                maps_for_pooling = F.interpolate(maps_for_pooling, size=img_feat_for_pool.shape[-2:],
+                                            mode='bilinear', align_corners=False)
+                N_maps = maps_for_pooling.size(1)
+                num_instances = N_maps // self.num_output_maps
+                maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N_maps,-1), dim=-1)
+                pooled_img_feature = torch.bmm(maps_for_pooling, img_feat_for_pool.view(bs, img_feat_for_pool.size(1), -1).permute(0, 2, 1))
+                pooled_img_feature = (pooled_img_feature.reshape(bs,num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
+                pooled_img_feat = pooled_img_feature
+                pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
+
+
             else:
                 img_feat_for_pool = backbone_out_vision['vit_feature']
                 mask_for_pool = F.interpolate(outputs["pred_masks"], size=img_feat_for_pool.shape[-2:],
@@ -1410,52 +1546,52 @@ class DINOSAM(nn.Module):
                 pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
                 pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
 
-                text_classifier, num_templates = self.get_text_classifier(dataname)
+            text_classifier, num_templates = self.get_text_classifier(dataname)
 
-                maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier, pooled_img_feat) 
+            maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier, pooled_img_feat) 
 
-                maskpool_name_logits = maskpool_name_logits * torch.clamp(self.detector.backbone.vision_backbone.trunk.dino.clip_model.logit_scale.exp(), max=100)
-                
-                maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
-                                
-                
-                if self.use_softmax:
-                    is_void_prob = F.softmax(query_cls_results_final, dim=-1)[..., -1:]
-                    in_vocab_cls_results = query_cls_results_final[..., :-1] 
-                    in_vocab_cls_probs = in_vocab_cls_results.softmax(-1)
-                    out_vocab_cls_probs = maskpool_cls_logits.softmax(-1)
-                else:
-                    in_vocab_cls_probs = torch.sigmoid(query_cls_results_final)
-                    out_vocab_cls_probs = F.softmax(maskpool_cls_logits, dim=-1)
-                category_overlapping_mask = self.category_overlapping_mask.to(self.device)
-                alpha = self.alpha
-                beta = self.beta
-                # 为了数值稳定性，加一个小 epsilon
-                eps = 1e-7 
+            maskpool_name_logits = maskpool_name_logits * torch.clamp(self.dino().clip_model.logit_scale.exp(), max=100)
+            
+            maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
+                            
+            
+            if self.use_softmax:
+                is_void_prob = F.softmax(query_cls_results_final, dim=-1)[..., -1:]
+                in_vocab_cls_results = query_cls_results_final[..., :-1] 
+                in_vocab_cls_probs = in_vocab_cls_results.softmax(-1)
+                out_vocab_cls_probs = maskpool_cls_logits.softmax(-1)
+            else:
+                in_vocab_cls_probs = torch.sigmoid(query_cls_results_final)
+                out_vocab_cls_probs = F.softmax(maskpool_cls_logits, dim=-1)
+            category_overlapping_mask = self.category_overlapping_mask.to(self.device)
+            alpha = self.alpha
+            beta = self.beta
+            # 为了数值稳定性，加一个小 epsilon
+            eps = 1e-7 
 
-                # 计算 Seen 类的加权几何平均概率
-                probs_seen = (
-                    (in_vocab_cls_probs + eps) ** (1 - alpha) * 
-                    (out_vocab_cls_probs + eps) ** alpha
-                )
-                
-                # 计算 Unseen 类的加权几何平均概率
-                probs_unseen = (
-                    (in_vocab_cls_probs + eps) ** (1 - beta) * 
-                    (out_vocab_cls_probs + eps) ** beta
-                )
+            # 计算 Seen 类的加权几何平均概率
+            probs_seen = (
+                (in_vocab_cls_probs + eps) ** (1 - alpha) * 
+                (out_vocab_cls_probs + eps) ** alpha
+            )
+            
+            # 计算 Unseen 类的加权几何平均概率
+            probs_unseen = (
+                (in_vocab_cls_probs + eps) ** (1 - beta) * 
+                (out_vocab_cls_probs + eps) ** beta
+            )
 
-                ensemble_logits = (
-                    probs_seen.log() * category_overlapping_mask + 
-                    probs_unseen.log() * (1 - category_overlapping_mask)
-                )
+            ensemble_logits = (
+                probs_seen.log() * category_overlapping_mask + 
+                probs_unseen.log() * (1 - category_overlapping_mask)
+            )
 
-                final_probs = torch.cat([
-                    ensemble_logits.softmax(-1) * (1.0 - is_void_prob), 
-                    is_void_prob
-                ], dim=-1)
+            final_probs = torch.cat([
+                ensemble_logits.softmax(-1) * (1.0 - is_void_prob), 
+                is_void_prob
+            ], dim=-1)
 
-                query_cls_results_final = torch.log(final_probs + 1e-8)
+            query_cls_results_final = torch.log(final_probs + 1e-8)
 
 
 
@@ -1478,7 +1614,8 @@ class DINOSAM(nn.Module):
                 )
                 
                 # 直接用 oracle logits 替换模型原来的分类结果
-                query_cls_results_final = oracle_logits
+                query_cls_results_final = oracle_logits 
+                query_cls_results_final *= (1.0 - is_void_prob)
         # =======================================================
         
             mask_cls_logits = query_cls_results_final # 保持 Logits 状态
@@ -1876,62 +2013,32 @@ class DINOSAM(nn.Module):
         return result
 
 
-    @torch.no_grad()
-    def match_via_iou(self, mask_pred_results, targets, extra_pred_info=None, extra_gt_info=None, iou_threshold=0.7, max_matches=8):
-        """
-        Args:
-            mask_pred_results: [B, Q, H, W] 预测的掩码
-            targets: List[Dict], 包含 'labels', 'masks'
-            
-            extra_pred_info: Dict[str, Tensor]
-                             Tensor 形状为 [B, Q, ...] (例如 Query Embeddings)
-                             
-            extra_gt_info:   Dict[str, List[Tensor]]
-                             List 长度为 B。每个元素是 Tensor，形状为 [Num_GTs_in_image, ...]
-                             (例如 GT 的 CLIP 特征，或 OCR 文本特征)
-            
-            iou_threshold:   IoU 阈值
-            max_matches:     每张图保留的最大匹配对数
-        """
+    @torch.no_grad()                            
+    def match_via_iou(self, mask_pred_results, mask_cls_results, targets, iou_threshold=0.7, max_matches=8):
         batch_size = mask_pred_results.shape[0]
-        
-        # --- 初始化输出容器 ---
         matched_src_masks = []
         matched_target_masks = []
         matched_labels = []
+
         
-        # 初始化额外信息的输出字典
-        # 结构: {"key": [Tensor_B1, Tensor_B2, ...]} -> 最后 stack
-        matched_pred_out = {}
-        if extra_pred_info is not None:
-            for k in extra_pred_info.keys():
-                matched_pred_out[k] = []
-
-        matched_gt_out = {}
-        if extra_gt_info is not None:
-            for k in extra_gt_info.keys():
-                matched_gt_out[k] = []
-
         for b in range(batch_size):
-            # --- 1. 获取当前 Batch 的基础数据 ---
-            tgt_label = targets[b]["labels"]
-            tgt_mask = targets[b]["masks"].to(mask_pred_results.device)
+            tgt_label = targets[b]["labels"] 
+            tgt_mask = targets[b]["masks"].to(mask_pred_results.device)  
             num_tgt_masks = tgt_mask.shape[0]
 
-            pred_mask = mask_pred_results[b]  # [Q, H, W]
-            
-            # --- 2. 计算 IoU ---
-            # 对齐尺寸
-            tgt_mask_interp = F.interpolate(tgt_mask[:, None].float(), size=pred_mask.shape[-2:], mode='bilinear', align_corners=False).squeeze(1)
-            
+            pred_mask = mask_pred_results[b] 
+            pred_cls = mask_cls_results[b]  
+            num_pred_masks = pred_mask.shape[0]
+
+            tgt_mask = F.interpolate(tgt_mask[:, None].float(), size=pred_mask.shape[-2:], mode='bilinear', align_corners=False).squeeze(1)
+
             pred_mask_flat = pred_mask.flatten(1)
-            tgt_mask_flat = tgt_mask_interp.flatten(1)
+            tgt_mask_flat = tgt_mask.flatten(1)
 
             with torch.no_grad():
                 ious = compute_mask_iou(pred_mask_flat, tgt_mask_flat)
 
-            # --- 3. 筛选与匹配逻辑 ---
-            matched_pred_idx = [] 
+            matched_pred_idx = []
             matched_tgt_idx = []
             
             for j in range(num_tgt_masks):
@@ -1942,77 +2049,37 @@ class DINOSAM(nn.Module):
                     matched_pred_idx.append(best_pred_idx.item())
                     matched_tgt_idx.append(j)
 
-            # --- 4. 截断逻辑 (不能超过 max_matches) ---
+
             if len(matched_pred_idx) > max_matches:
                 selected_indices = torch.randperm(len(matched_pred_idx))[:max_matches]
                 matched_pred_idx = [matched_pred_idx[i] for i in selected_indices]
                 matched_tgt_idx = [matched_tgt_idx[i] for i in selected_indices]
 
-            # 准备 Tensor 类型的索引，用于切片
-            idx_p = torch.as_tensor(matched_pred_idx, dtype=torch.long, device=pred_mask.device)
-            idx_t = torch.as_tensor(matched_tgt_idx, dtype=torch.long, device=tgt_mask.device)
-            
-            num_current = len(matched_pred_idx)
-            num_to_add = max_matches - num_current
+            if len(matched_pred_idx) < max_matches:
+                num_to_add = max_matches - len(matched_pred_idx)
+                
+                matched_src_masks.append(
+                    torch.cat([pred_mask[matched_pred_idx], 
+                            torch.zeros((num_to_add, *pred_mask.shape[1:]), device=pred_mask.device)], dim=0)
+                )
+                matched_target_masks.append(
+                    torch.cat([tgt_mask[matched_tgt_idx], 
+                            torch.zeros((num_to_add, *tgt_mask.shape[1:]), device=tgt_mask.device)], dim=0)
+                )
+                matched_labels.append(
+                    torch.cat([tgt_label[matched_tgt_idx], 
+                            torch.full((num_to_add,), -1, dtype=tgt_label.dtype, device=tgt_label.device)], dim=0)
+                )
+            else:
+                matched_src_masks.append(pred_mask[matched_pred_idx])
+                matched_target_masks.append(tgt_mask[matched_tgt_idx])
+                matched_labels.append(tgt_label[matched_tgt_idx])
 
-            # --- 5. 填充与组合 (Padding & Concatenation) ---
-            
-            # Helper: 如果不够 max_matches，生成 padding 并拼接；否则直接切片
-            def process_tensor(tensor_data, indices, pad_value=0):
-                # tensor_data: [N, ...]
-                selected = tensor_data[indices] # [K, ...]
-                if num_to_add > 0:
-                    pad_shape = (num_to_add, *tensor_data.shape[1:])
-                    # 处理 padding 值 (通常是0，label是-1)
-                    if pad_value == 0:
-                        padding = torch.zeros(pad_shape, dtype=tensor_data.dtype, device=tensor_data.device)
-                    else:
-                        padding = torch.full(pad_shape, pad_value, dtype=tensor_data.dtype, device=tensor_data.device)
-                    return torch.cat([selected, padding], dim=0)
-                return selected
-
-            # A. 基础 mask 和 label
-            matched_src_masks.append(process_tensor(pred_mask, idx_p, pad_value=0))
-            matched_target_masks.append(process_tensor(tgt_mask, idx_t, pad_value=0))
-            matched_labels.append(process_tensor(tgt_label, idx_t, pad_value=-1))
-
-            # B. 处理 Pred Info (形状 [Q, ...])
-            if extra_pred_info is not None:
-                for k, v in extra_pred_info.items():
-                    # v[b] 是当前图片的 Pred 特征
-                    matched_pred_out[k].append(process_tensor(v[b], idx_p, pad_value=0))
-            
-            # C. 处理 GT Info (形状 [Num_GT, ...])
-            if extra_gt_info is not None:
-                for k, v_list in extra_gt_info.items():
-                    # v_list[b] 是当前图片的 GT 特征
-                    curr_gt_feat = v_list[b].to(mask_pred_results.device) # 确保设备一致
-                    matched_gt_out[k].append(process_tensor(curr_gt_feat, idx_t, pad_value=0))
-
-        # --- 6. 堆叠 (Stacking) ---
         matched_src_masks = torch.stack(matched_src_masks, dim=0) 
         matched_target_masks = torch.stack(matched_target_masks, dim=0)
         matched_labels = torch.stack(matched_labels, dim=0)
         
-        final_pred_dict = {}
-        if extra_pred_info is not None:
-            for k, v_list in matched_pred_out.items():
-                final_pred_dict[k] = torch.stack(v_list, dim=0)
-
-        final_gt_dict = {}
-        if extra_gt_info is not None:
-            for k, v_list in matched_gt_out.items():
-                final_gt_dict[k] = torch.stack(v_list, dim=0)
-
-        return matched_src_masks, matched_target_masks, matched_labels, final_pred_dict, final_gt_dict
-
-    def cosine_similarity_loss(self, pred_features, gt_features):
-    
-        cosine_similarity_loss = {}
-        
-        cosine_sim = F.cosine_similarity(pred_features, gt_features, dim=-1)
-        cosine_similarity_loss[f"loss_cosine"] = 1 - cosine_sim.mean()
-        return cosine_similarity_loss
+        return matched_src_masks, matched_target_masks, matched_labels
 
     def cross_entropy_loss(self, mask_cls_results, labels):
         
@@ -2023,6 +2090,15 @@ class DINOSAM(nn.Module):
 
         losses = {"loss_ce": loss_ce}
         return losses
+    
+    def cosine_similarity_loss(self, pred_features, gt_features):
+    
+        cosine_similarity_loss = {}
+        
+        cosine_sim = F.cosine_similarity(pred_features, gt_features, dim=-1)
+        cosine_similarity_loss[f"loss_cosine"] = 1 - cosine_sim.mean()
+        return cosine_similarity_loss
+
     
 
 def aggregate_name_to_class_logits(query_names_results, num_templates):

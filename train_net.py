@@ -69,6 +69,8 @@ from sam3.SAM3_teacher import SAM3_TEACHER
 from sam3.SAM3CLIP import SAM3CLIP
 from sam3.DINOSAM import DINOSAM
 
+from sam3.mask_adapter_head import MASKAdapterHead
+
 
 # 临时修复 lvis 报错：AttributeError: module 'numpy' has no attribute 'float'.
 import numpy as np

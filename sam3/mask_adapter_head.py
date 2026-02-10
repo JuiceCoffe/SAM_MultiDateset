@@ -70,7 +70,7 @@ class MASKAdapterHead(nn.Module):
     @configurable
     def __init__(
         self,
-        clip_model_name,
+        feat_dim: int,
         mask_in_chans: int,
         num_channels: int,
         use_checkpoint: bool,
@@ -90,10 +90,7 @@ class MASKAdapterHead(nn.Module):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         
-        if '_base' in clip_model_name:
-            clip_dim = 640
-        elif '_large' in clip_model_name:
-            clip_dim = 768
+        clip_dim = feat_dim
         
         self.fuse = nn.Conv2d(clip_dim, num_channels, 1)
                 
@@ -121,7 +118,7 @@ class MASKAdapterHead(nn.Module):
     def from_config(cls, cfg):
 
         return {
-            "clip_model_name": cfg.MODEL.FC_CLIP.CLIP_MODEL_NAME,
+            "feat_dim": cfg.MODEL.MASK_ADAPTER.FEAT_DIM,
             "mask_in_chans": cfg.MODEL.MASK_ADAPTER.MASK_IN_CHANNELS,
             "num_channels": cfg.MODEL.MASK_ADAPTER.NUM_CHANNELS,
             "use_checkpoint": cfg.MODEL.MASK_ADAPTER.USE_CHECKPOINT,
