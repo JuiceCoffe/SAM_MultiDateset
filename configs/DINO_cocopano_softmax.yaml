@@ -22,8 +22,8 @@ MODEL:
   # TEACHER: CONVCLIP
   # TEACHER_MASKPOOL: True
   USE_MASKADAPTER: True
-  MASK_ADAPTER:
-    USE_CHECKPOINT: True
+  # MASK_ADAPTER:
+  #   USE_CHECKPOINT: True
   WEIGHTS: "/data/hmp/sam3.pt"
   # WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
   # WEIGHTS: /data/hmp/SAM_MultiDateset/out/DINOSAM/copa/model_0022499.pth
@@ -45,11 +45,11 @@ SOLVER:
   AMP:
     ENABLED: True
   IMS_PER_BATCH: 48
-  BASE_LR: 0.0001
+  BASE_LR: 0.00005
   LR_SCHEDULER_NAME: WarmupPolyLR
   STEPS: (30000, 60000)
   MAX_ITER: 90000
-  CHECKPOINT_PERIOD: 3750
+  CHECKPOINT_PERIOD: 7500
   
 
   CLASS_WEIGHT: 1.0
@@ -95,7 +95,7 @@ DATALOADER:
   USE_DIFF_BS_SIZE: True
 
 TEST:
-  EVAL_PERIOD: 3750
+  EVAL_PERIOD: 7500
   INSTANCE_ON: True   
   PANOPTIC_ON: True   
   SEMANTIC_ON: True   
