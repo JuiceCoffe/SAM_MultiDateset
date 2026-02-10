@@ -240,6 +240,7 @@ class DINOSAM(nn.Module):
         self.add_pixelfeat = cfg.MODEL.SAM3.ADD_PIXELFEAT
         self.alpha = cfg.MODEL.SAM3.ALPHA
         self.beta = cfg.MODEL.SAM3.BETA
+        self.OracleSelect_on = cfg.MODEL.SAM3.ORACLE_SELECT
 
         # -------------------------------------------------------
         # 训练配置
@@ -1604,13 +1605,11 @@ class DINOSAM(nn.Module):
 
 
             # ====================== Oracle 逻辑 ====================== 
-            self.OracleSelect_on = False # 你可以从cfg配置中读取此开关
 
             if self.OracleSelect_on:
                 # 临时构造 outputs 字典，用于传递给 oracle 函数
                 temp_outputs = {
                     "pred_masks": outputs["pred_masks"],
-                    # pred_logits 仅用于获取形状，其内容不参与计算
                     "pred_logits": query_cls_results_final 
                 }
                 
@@ -1620,10 +1619,13 @@ class DINOSAM(nn.Module):
                     batched_inputs, 
                     images
                 )
+
+                oracle_probs = F.softmax(oracle_logits, dim=-1)
                 
-                # 直接用 oracle logits 替换模型原来的分类结果
-                query_cls_results_final = oracle_logits 
-                query_cls_results_final *= (1.0 - is_void_prob)
+                final_oracle_probs = oracle_probs * (1.0 - is_void_prob)
+                final_oracle_probs[..., -1] += is_void_prob.squeeze(-1)
+
+                query_cls_results_final = torch.log(final_oracle_probs + 1e-8)
         # =======================================================
         
             mask_cls_logits = query_cls_results_final # 保持 Logits 状态
@@ -1796,7 +1798,7 @@ class DINOSAM(nn.Module):
 
             # 8. 填充 Oracle Logits
             query_indices = torch.arange(num_queries, device=self.device)
-            oracle_logits[i, query_indices, assigned_labels] = 100.0
+            oracle_logits[i, query_indices, assigned_labels] = 5.0
 
         return oracle_logits
     

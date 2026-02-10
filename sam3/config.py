@@ -36,6 +36,8 @@ def add_sam3_config(cfg):
     cfg.MODEL.SAM3.ALPHA = 0.0
     cfg.MODEL.SAM3.BETA = 0.0
 
+    cfg.MODEL.SAM3.ORACLE_SELECT = False
+
     cfg.MODEL.TEACHER = None
     cfg.MODEL.TEACHER_MASKPOOL = False
 
