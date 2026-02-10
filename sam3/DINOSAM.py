@@ -1604,7 +1604,7 @@ class DINOSAM(nn.Module):
 
 
             # ====================== Oracle 逻辑 ====================== 
-            self.OracleSelect_on = False# 你可以从cfg配置中读取此开关
+            self.OracleSelect_on = False # 你可以从cfg配置中读取此开关
 
             if self.OracleSelect_on:
                 # 临时构造 outputs 字典，用于传递给 oracle 函数
