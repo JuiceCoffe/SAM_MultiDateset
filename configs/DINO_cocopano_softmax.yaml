@@ -16,6 +16,9 @@ MODEL:
     USE_SOFTMAX: True
     ADD_PIXELFEAT: True
 
+    ALPHA: 1.0
+    BETA: 1.0
+
   # TEACHER: CONVCLIP
   # TEACHER_MASKPOOL: True
   USE_MASKADAPTER: True
@@ -59,7 +62,7 @@ SOLVER:
 INPUT:
   DATASET_MAPPER_NAME: "coco_combine_lsj"
   IMAGE_SIZE: 768
-  MIN_SCALE: 0.5
+  MIN_SCALE: 0.1
   MAX_SCALE: 2.0
   FORMAT: "RGB"
   COLOR_AUG_SSD: True 
@@ -92,7 +95,7 @@ DATALOADER:
   USE_DIFF_BS_SIZE: True
 
 TEST:
-  EVAL_PERIOD: 50
+  EVAL_PERIOD: 3750
   INSTANCE_ON: True   
   PANOPTIC_ON: True   
   SEMANTIC_ON: True   
@@ -101,5 +104,5 @@ TEST:
 VERSION: 2
 
 # OUTPUT_DIR: ./out/test/
-OUTPUT_DIR: ./out/DINOSAM/copa_SAMtext
+OUTPUT_DIR: ./out/DINOSAM/copa_SAMtext_adaptor
   

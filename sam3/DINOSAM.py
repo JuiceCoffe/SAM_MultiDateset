@@ -1447,7 +1447,7 @@ class DINOSAM(nn.Module):
                 mask_adapter_losses = {}
 
                 img_feat_for_pool = backbone_out_vision['vit_feature']
-                print("img_feat_for_pool shape:", img_feat_for_pool.shape)
+                # print("img_feat_for_pool shape:", img_feat_for_pool.shape)
                 gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
                 targets, masks, labels = self.prepare_targets_for_maskadapter(gt_instances, images)
 
