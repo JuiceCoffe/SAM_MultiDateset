@@ -1527,7 +1527,15 @@ class DINOSAM(nn.Module):
 
                 binary_masks = mask_pred_results.sigmoid() > self.mask_threshold
                 
-                maps_for_pooling = self.mask_adapter(img_feat_for_pool, binary_masks)
+                # maps_for_pooling = self.mask_adapter(img_feat_for_pool, binary_masks)
+                adapter_batchsize = 32
+                maps_for_pooling_list = []
+                for i in range(0, mask_pred_results.shape[1], adapter_batchsize):
+                    batch_binary_masks = binary_masks[:, i:i+adapter_batchsize, :, :]
+                    maps_for_pooling_batch = self.mask_adapter(img_feat_for_pool, batch_binary_masks)
+                    maps_for_pooling_list.append(maps_for_pooling_batch)
+                maps_for_pooling = torch.cat(maps_for_pooling_list, dim=1)
+
                 maps_for_pooling = F.interpolate(maps_for_pooling, size=img_feat_for_pool.shape[-2:],
                                             mode='bilinear', align_corners=False)
                 N_maps = maps_for_pooling.size(1)

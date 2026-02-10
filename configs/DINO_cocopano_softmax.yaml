@@ -64,8 +64,8 @@ INPUT:
   FORMAT: "RGB"
   COLOR_AUG_SSD: True 
   MASK_FORMAT: "bitmask"
-  MIN_SIZE_TEST: 384
-  MAX_SIZE_TEST: 384
+  MIN_SIZE_TEST: 768
+  MAX_SIZE_TEST: 768
 
 DATALOADER:
   # 如果你的代码支持，可以改回 "TrainingSampler"，
