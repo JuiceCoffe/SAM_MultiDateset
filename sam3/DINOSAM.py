@@ -1798,7 +1798,7 @@ class DINOSAM(nn.Module):
 
             # 8. 填充 Oracle Logits
             query_indices = torch.arange(num_queries, device=self.device)
-            oracle_logits[i, query_indices, assigned_labels] = 5.0
+            oracle_logits[i, query_indices, assigned_labels] = 100.0
 
         return oracle_logits
     
