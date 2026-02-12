@@ -18,16 +18,17 @@ MODEL:
 
     ALPHA: 1.0
     BETA: 1.0
-    ORACLE_SELECT: True
+    # ORACLE_SELECT: True
 
   # TEACHER: CONVCLIP
   # TEACHER_MASKPOOL: True
-  # USE_MASKADAPTER: True
+  USE_MASKADAPTER: True
   # MASK_ADAPTER:
   #   USE_CHECKPOINT: True
   # WEIGHTS: "/data/hmp/sam3.pt"
   # WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
-  WEIGHTS: /data/hmp/TASK/OVS/mysamMultiDateset/out/DINOSAM/copa_SAMtext_oracle3/model_0029999.pth
+  WEIGHTS: /data/hmp/SAMweight/SAMtext_oracle_copa2ep.pth
+  # WEIGHTS: /data/hmp/SAM_MultiDateset/out/DINOSAM/copa_SAMtext_oracle_adapter/model_0003749.pth
 
 DATASETS:
   # 只保留 COCO Panoptic
@@ -41,7 +42,7 @@ SOLVER:
   CLIP_GRADIENTS:
     ENABLED: True
     CLIP_TYPE: "full_model"
-    CLIP_VALUE: 0.1
+    CLIP_VALUE: 1.0
     NORM_TYPE: 2.0
   AMP:
     ENABLED: True
@@ -50,7 +51,7 @@ SOLVER:
   LR_SCHEDULER_NAME: WarmupPolyLR
   STEPS: (30000, 60000)
   MAX_ITER: 90000
-  CHECKPOINT_PERIOD: 7500
+  CHECKPOINT_PERIOD: 3750
   
 
   CLASS_WEIGHT: 2.0
@@ -58,7 +59,7 @@ SOLVER:
   DICE_WEIGHT: 5.0
   USE_AUX : True
 
-
+  TRAIN_MASK: False
 
 INPUT:
   DATASET_MAPPER_NAME: "coco_combine_lsj"
@@ -80,7 +81,7 @@ DATALOADER:
   DATASET_RATIO: [1.0]
 
   # # Batch Size 对应单个数据集
-  DATASET_BS: [4]
+  DATASET_BS: [2]
   
   # COCO 通常不需要 RFS (Repeat Factor Sampling)
   USE_RFS: [False]
@@ -96,7 +97,7 @@ DATALOADER:
   USE_DIFF_BS_SIZE: True
 
 TEST:
-  EVAL_PERIOD: 7500
+  EVAL_PERIOD: 3750
   INSTANCE_ON: True   
   PANOPTIC_ON: True   
   SEMANTIC_ON: True   
@@ -105,5 +106,5 @@ TEST:
 VERSION: 2
 
 # OUTPUT_DIR: ./out/test/
-OUTPUT_DIR: ./out/DINOSAM/copa_SAMtext_oracle3_resume
+OUTPUT_DIR: ./out/DINOSAM/copa_SAMtext_oracle_adapter
   
