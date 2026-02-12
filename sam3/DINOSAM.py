@@ -270,6 +270,8 @@ class DINOSAM(nn.Module):
         self.only_instance = cfg.DATASETS.ONLY_INSTANCE
         if self.only_instance:
             raise NotImplementedError("only_instance尚未给prepare_targets_for_maskadapter适配")
+        
+        self.train_mask = cfg.SOLVER.TRAIN_MASK
         # -------------------------------------------------------
         # criterion损失函数
         # -------------------------------------------------------
@@ -365,6 +367,8 @@ class DINOSAM(nn.Module):
                 cost_class=class_weight,
                 cost_mask=mask_weight,
                 cost_dice=dice_weight,
+                cost_bbox=bbox_weight,
+                cost_giou=giou_weight,
                 num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
             )
             self.criterion = FcclipSetCriterion(
@@ -1110,311 +1114,313 @@ class DINOSAM(nn.Module):
         }
 
         #=================================
-        find_input = self.find_stage
+        with torch.set_grad_enabled(self.train_mask):
 
-        with torch.profiler.record_function("SAM3Image._encode_prompt"):
-            prompt, prompt_mask, backbone_out = self.detector._encode_prompt(
-                backbone_out, find_input, geometric_prompt
-            )
-        # Run the encoder
-        with torch.profiler.record_function("SAM3Image._run_encoder"):
-            backbone_out, encoder_out, _ = self.detector._run_encoder(
-                backbone_out, find_input, prompt, prompt_mask
-            )
+            find_input = self.find_stage
 
-        fusion_feat = encoder_out["encoder_hidden_states"] # H'*W', bs, D
-        fusion_feat = fusion_feat.permute(1,0,2) # bs, H'*W', D
-        if self.use_cos_sim:
-            fusion_feat = F.normalize(fusion_feat, dim=-1)
+            with torch.profiler.record_function("SAM3Image._encode_prompt"):
+                prompt, prompt_mask, backbone_out = self.detector._encode_prompt(
+                    backbone_out, find_input, geometric_prompt
+                )
+            # Run the encoder
+            with torch.profiler.record_function("SAM3Image._run_encoder"):
+                backbone_out, encoder_out, _ = self.detector._run_encoder(
+                    backbone_out, find_input, prompt, prompt_mask
+                )
 
-        if self.encoder_loss:
-            if self.use_cdt:
-                encoder_logits = torch.einsum("bld,bcd->blc", fusion_feat, text_classifier)
-            else:
-                encoder_logits = torch.einsum("bld,cd->blc", fusion_feat, text_classifier)
-            
+            fusion_feat = encoder_out["encoder_hidden_states"] # H'*W', bs, D
+            fusion_feat = fusion_feat.permute(1,0,2) # bs, H'*W', D
             if self.use_cos_sim:
-                e_logit_scale = self.encoder_logit_scale.exp()
-                e_logit_scale = torch.clamp(e_logit_scale, max=100.0)
-                encoder_logits = encoder_logits * e_logit_scale + self.encoder_logit_bias
-            else:
-                encoder_logits = encoder_logits / (fusion_feat.shape[-1] ** 0.5) + self.encoder_logit_bias
+                fusion_feat = F.normalize(fusion_feat, dim=-1)
 
-
-            encoder_logits = aggregate_name_to_class_logits(encoder_logits, num_templates)
-
-            encoder_score = encoder_logits.max(-1).values # [bs, HW]
-            k_selected = self.num_encoder_query
-            topk_values, topk_indices = torch.topk(encoder_score, k_selected, dim=1) # [bs, k]
-            topk_indices_unsqueezed = topk_indices.unsqueeze(-1).repeat(1, 1, fusion_feat.shape[-1])
-            topK_fusion_feat = torch.gather(fusion_feat, 1, topk_indices_unsqueezed) # [bs, k, D]
-            num_classes = encoder_logits.shape[-1]
-            encoder_cls_logits = torch.gather(
-                encoder_logits, 
-                1, 
-                topk_indices.unsqueeze(-1).expand(-1, -1, num_classes)
-            )
-
-
-        out = {
-            "encoder_hidden_states": encoder_out["encoder_hidden_states"],
-            "prev_encoder_out": {
-                "encoder_out": encoder_out,
-                "backbone_out": backbone_out,
-            },
-        }
-        # print("keys of out before decoder:", out.keys()) # s(['encoder_hidden_states', 'prev_encoder_out'])
-        # Run the decoder
-        with torch.profiler.record_function("SAM3Image._run_decoder"):            
-            # out, hs = self.detector._run_decoder(
-            #     memory=out["encoder_hidden_states"],
-            #     pos_embed=encoder_out["pos_embed"],
-            #     src_mask=encoder_out["padding_mask"],
-            #     out=out,
-            #     prompt=prompt,
-            #     prompt_mask=prompt_mask,
-            #     encoder_out=encoder_out,
-            # )
-            if self.DynamicQuery:
-                # ---------------- Relative Offset Prediction 修改开始 ----------------
-                
-                # 1. 获取全图的网格锚点 (Grid Anchors)
-                # encoder_out["spatial_shapes"] 包含了特征图的高宽
-                # grid_anchors shape: [1, Total_HW, 2] -> (x, y)
-                grid_anchors = get_grid_reference_points(
-                    encoder_out["spatial_shapes"], 
-                    device=self.device
-                )
-                
-                # 2. 扩展到 Batch 维度
-                # grid_anchors shape: [bs, Total_HW, 2]
-                grid_anchors = grid_anchors.expand(bs, -1, -1)
-                
-                # 3. 根据 TopK 索引提取对应的锚点
-                # topk_indices shape: [bs, k]
-                # 我们需要 gather 最后一个维度 (x, y)，所以要扩展 indices
-                gather_idx = topk_indices.unsqueeze(-1).repeat(1, 1, 2) # [bs, k, 2]
-                
-                # topk_anchors_xy shape: [bs, k, 2]
-                topk_anchors_xy = torch.gather(grid_anchors, 1, gather_idx)
-                
-                # 4. 构建完整的 4D 锚点 (x, y, w, h)
-                # x, y 来自网格，w, h 初始化为一个较小的先验值 (例如 0.05)
-                # 这样 inverse_sigmoid 不会溢出，且符合物体初始尺寸较小的假设
-                anchor_wh_prior = torch.full_like(topk_anchors_xy, 0.05)
-                topk_anchors = torch.cat([topk_anchors_xy, anchor_wh_prior], dim=-1) # [bs, k, 4]
-                
-                # 5. 计算偏移量 (Logit Space)
-                # encoder_box_head 输出的是相对于锚点的偏移修正量
-                delta_box_logits = self.encoder_box_head(topK_fusion_feat)
-                
-                # 6. 核心公式：Box = Sigmoid( Delta + InverseSigmoid(Anchor) )
-                # 将锚点转换到 logit 域，加上偏移量，再转回 [0, 1] 域
-                anchor_logits = inverse_sigmoid(topk_anchors)
-                encoder_box = (delta_box_logits + anchor_logits).sigmoid() # [bs, k, 4]
-                
-                # ---------------- Relative Offset Prediction 修改结束 ----------------
-
-                hs, reference_boxes, dec_presence_out, dec_presence_feats = (
-                    self.detector.transformer.decoder(
-
-                        tgt=topK_fusion_feat.permute(1,0,2).detach(), # TopK fusion feat
-
-                        memory=out["encoder_hidden_states"],
-                        memory_key_padding_mask=encoder_out["padding_mask"],
-                        pos=encoder_out["pos_embed"],
-
-                        reference_boxes=encoder_box.permute(1,0,2).detach(),
-
-                        level_start_index=encoder_out["level_start_index"],
-                        spatial_shapes=encoder_out["spatial_shapes"],
-                        valid_ratios=encoder_out["valid_ratios"],
-                        tgt_mask=None,
-                        memory_text=prompt,
-                        text_attention_mask=prompt_mask,
-                        apply_dac=False,
-                    )
-                )
-
-            else:
-                query_embed = self.detector.transformer.decoder.query_embed.weight
-                query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
-
-                hs, reference_boxes, dec_presence_out, dec_presence_feats = (
-                    self.detector.transformer.decoder(
-                        tgt=query_embed,
-                        memory=out["encoder_hidden_states"],
-                        memory_key_padding_mask=encoder_out["padding_mask"],
-                        pos=encoder_out["pos_embed"],
-                        reference_boxes=None,
-                        level_start_index=encoder_out["level_start_index"],
-                        spatial_shapes=encoder_out["spatial_shapes"],
-                        valid_ratios=encoder_out["valid_ratios"],
-                        tgt_mask=None,
-                        memory_text=prompt,
-                        text_attention_mask=prompt_mask,
-                        apply_dac=False,
-                    )
-                )
-            hs = hs.transpose(1, 2)  # seq-first to batch-first
-            reference_boxes = reference_boxes.transpose(1, 2)  # seq-first to batch-first
-            if dec_presence_out is not None:
-                # seq-first to batch-first
-                dec_presence_out = dec_presence_out.transpose(1, 2)
-
-            out["presence_feats"] = dec_presence_feats
-            self.detector._update_scores_and_boxes(
-                out,
-                hs,
-                reference_boxes,
-                prompt,
-                prompt_mask,
-                dec_presence_out=dec_presence_out,
-            )
-
-
-        # print("keys of out after decoder:", out.keys()) # (['encoder_hidden_states', 'prev_encoder_out', 'presence_feats', 'queries', 'presence_logit_dec', 'pred_logits', 'pred_boxes', 'pred_boxes_xyxy'])
-        # Run segmentation heads
-        with torch.profiler.record_function("SAM3Image._run_segmentation_heads"):
-            self.detector._run_segmentation_heads(
-                out=out,
-                backbone_out=backbone_out,
-                img_ids=find_input.img_ids,
-                vis_feat_sizes=encoder_out["vis_feat_sizes"],
-                encoder_hidden_states=out["encoder_hidden_states"],
-                prompt=prompt,
-                prompt_mask=prompt_mask,
-                hs=hs,
-                aux_masks=True,
-            )
-        
-        # if self.detector.training or self.detector.num_interactive_steps_val > 0:
-        #     self.detector._compute_matching(out, self.detector.back_convert(find_target))
-
-        #========================================
-        outputs = out
-        # print("outputs keys:", outputs.keys())
-        # print('aux:',outputs['aux_outputs'][0].keys())
-        # print('aux box:',outputs['aux_outputs'][0]['pred_boxes'].shape)
-        # print('aux pred_boxes_xyxy:',outputs['aux_outputs'][0]['pred_boxes_xyxy'].shape)
-
-        if self.training:
-            # mask classification target
-            if "instances" in batched_inputs[0]:
-                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-                targets = self.prepare_targets(gt_instances, images, batched_inputs)
-            else:
-                targets = None
-
-        out_masks = outputs["pred_masks"].clone()
-
-        out_masks = out_masks.sigmoid()
-
-        # presence_score = outputs["presence_logit_dec"].sigmoid().unsqueeze(1) # 在多类别情况下认为失效
-
-        # out_semseg = outputs["semantic_seg"] # 原语义分割头输出，舍去
-        # out_semseg = F.interpolate(
-        #     out_semseg,
-        #     size=(img_h, img_w),
-        #     mode="bilinear",
-        #     align_corners=False,
-        # ).sigmoid()
-
-
-        # print("out_masks shape:", out_masks.shape, "out_probs shape:", out_probs.shape, "out_semseg shape:", out_semseg.shape, "presence_score shape:", presence_score.shape)
-        # out_masks shape: torch.Size([1, 200, 1008, 1008]) out_probs shape: torch.Size([1, 200]) out_semseg shape: torch.Size([1, 1, 1008, 1008]) presence_score shape: torch.Size([1, 1, 1])
-        pred_boxes = outputs['pred_boxes']
-        pred_boxes_xyxy = outputs['pred_boxes_xyxy']
-        # print("pred_boxes:",pred_boxes.shape)
-        # print("pred_boxes_xyxy:",pred_boxes_xyxy.shape)
-        
-
-        bs, N, H, W = out_masks.shape
-        C_ = SAM_text_classifier.shape[0] # num_names 
-
-        queries_masks = out_masks # out_probs是通过与池化prompt投影卷积实现的，多类别下失效，直接用原始mask_logits
-
-        queries = outputs["obj_queries"] # 6, bs, N, D
-        
-        # instance_embeds = outputs["instance_embeds"] 
-
-        use_aux = self.use_aux and self.training
-        aux_outputs = []
-
-        obj_logits = None
-        if self.new_score_head:
-            obj_logits = self.score_head(queries).squeeze(-1)
-
-    
-
-        for i in range(6):
-            assert queries.shape[0] == 6
-            assert queries.shape[2] == N
-            if use_aux or i == 5 :
-                tp_queries = queries[i,:,:,:].clone() 
-
-                if self.add_pixelfeat:
-                    pixel_embed = outputs["pixel_embed"] # bs, D, H', W'
-
-                    pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"] if i ==5 else outputs['aux_outputs'][i]["pred_masks"])
-                    tp_queries = tp_queries + pooled_pixel_embed
-
-                cur_obj_logits = obj_logits[i] if obj_logits is not None else None
-
-                if self.use_query_proj:
-                    tp_queries = self.query_proj(tp_queries)
-
-
-                if self.use_cos_sim:
-                    tp_queries = F.normalize(tp_queries, dim=-1, p=2)
-
-
+            if self.encoder_loss:
                 if self.use_cdt:
-                    query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, SAM_text_classifier) # bs, N, C
+                    encoder_logits = torch.einsum("bld,bcd->blc", fusion_feat, text_classifier)
                 else:
-                    query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, SAM_text_classifier) # bs, N, C
+                    encoder_logits = torch.einsum("bld,cd->blc", fusion_feat, text_classifier)
+                
+                if self.use_cos_sim:
+                    e_logit_scale = self.encoder_logit_scale.exp()
+                    e_logit_scale = torch.clamp(e_logit_scale, max=100.0)
+                    encoder_logits = encoder_logits * e_logit_scale + self.encoder_logit_bias
+                else:
+                    encoder_logits = encoder_logits / (fusion_feat.shape[-1] ** 0.5) + self.encoder_logit_bias
+
+
+                encoder_logits = aggregate_name_to_class_logits(encoder_logits, num_templates)
+
+                encoder_score = encoder_logits.max(-1).values # [bs, HW]
+                k_selected = self.num_encoder_query
+                topk_values, topk_indices = torch.topk(encoder_score, k_selected, dim=1) # [bs, k]
+                topk_indices_unsqueezed = topk_indices.unsqueeze(-1).repeat(1, 1, fusion_feat.shape[-1])
+                topK_fusion_feat = torch.gather(fusion_feat, 1, topk_indices_unsqueezed) # [bs, k, D]
+                num_classes = encoder_logits.shape[-1]
+                encoder_cls_logits = torch.gather(
+                    encoder_logits, 
+                    1, 
+                    topk_indices.unsqueeze(-1).expand(-1, -1, num_classes)
+                )
+
+
+            out = {
+                "encoder_hidden_states": encoder_out["encoder_hidden_states"],
+                "prev_encoder_out": {
+                    "encoder_out": encoder_out,
+                    "backbone_out": backbone_out,
+                },
+            }
+            # print("keys of out before decoder:", out.keys()) # s(['encoder_hidden_states', 'prev_encoder_out'])
+            # Run the decoder
+            with torch.profiler.record_function("SAM3Image._run_decoder"):            
+                # out, hs = self.detector._run_decoder(
+                #     memory=out["encoder_hidden_states"],
+                #     pos_embed=encoder_out["pos_embed"],
+                #     src_mask=encoder_out["padding_mask"],
+                #     out=out,
+                #     prompt=prompt,
+                #     prompt_mask=prompt_mask,
+                #     encoder_out=encoder_out,
+                # )
+                if self.DynamicQuery:
+                    # ---------------- Relative Offset Prediction 修改开始 ----------------
+                    
+                    # 1. 获取全图的网格锚点 (Grid Anchors)
+                    # encoder_out["spatial_shapes"] 包含了特征图的高宽
+                    # grid_anchors shape: [1, Total_HW, 2] -> (x, y)
+                    grid_anchors = get_grid_reference_points(
+                        encoder_out["spatial_shapes"], 
+                        device=self.device
+                    )
+                    
+                    # 2. 扩展到 Batch 维度
+                    # grid_anchors shape: [bs, Total_HW, 2]
+                    grid_anchors = grid_anchors.expand(bs, -1, -1)
+                    
+                    # 3. 根据 TopK 索引提取对应的锚点
+                    # topk_indices shape: [bs, k]
+                    # 我们需要 gather 最后一个维度 (x, y)，所以要扩展 indices
+                    gather_idx = topk_indices.unsqueeze(-1).repeat(1, 1, 2) # [bs, k, 2]
+                    
+                    # topk_anchors_xy shape: [bs, k, 2]
+                    topk_anchors_xy = torch.gather(grid_anchors, 1, gather_idx)
+                    
+                    # 4. 构建完整的 4D 锚点 (x, y, w, h)
+                    # x, y 来自网格，w, h 初始化为一个较小的先验值 (例如 0.05)
+                    # 这样 inverse_sigmoid 不会溢出，且符合物体初始尺寸较小的假设
+                    anchor_wh_prior = torch.full_like(topk_anchors_xy, 0.05)
+                    topk_anchors = torch.cat([topk_anchors_xy, anchor_wh_prior], dim=-1) # [bs, k, 4]
+                    
+                    # 5. 计算偏移量 (Logit Space)
+                    # encoder_box_head 输出的是相对于锚点的偏移修正量
+                    delta_box_logits = self.encoder_box_head(topK_fusion_feat)
+                    
+                    # 6. 核心公式：Box = Sigmoid( Delta + InverseSigmoid(Anchor) )
+                    # 将锚点转换到 logit 域，加上偏移量，再转回 [0, 1] 域
+                    anchor_logits = inverse_sigmoid(topk_anchors)
+                    encoder_box = (delta_box_logits + anchor_logits).sigmoid() # [bs, k, 4]
+                    
+                    # ---------------- Relative Offset Prediction 修改结束 ----------------
+
+                    hs, reference_boxes, dec_presence_out, dec_presence_feats = (
+                        self.detector.transformer.decoder(
+
+                            tgt=topK_fusion_feat.permute(1,0,2).detach(), # TopK fusion feat
+
+                            memory=out["encoder_hidden_states"],
+                            memory_key_padding_mask=encoder_out["padding_mask"],
+                            pos=encoder_out["pos_embed"],
+
+                            reference_boxes=encoder_box.permute(1,0,2).detach(),
+
+                            level_start_index=encoder_out["level_start_index"],
+                            spatial_shapes=encoder_out["spatial_shapes"],
+                            valid_ratios=encoder_out["valid_ratios"],
+                            tgt_mask=None,
+                            memory_text=prompt,
+                            text_attention_mask=prompt_mask,
+                            apply_dac=False,
+                        )
+                    )
+
+                else:
+                    query_embed = self.detector.transformer.decoder.query_embed.weight
+                    query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+
+                    hs, reference_boxes, dec_presence_out, dec_presence_feats = (
+                        self.detector.transformer.decoder(
+                            tgt=query_embed,
+                            memory=out["encoder_hidden_states"],
+                            memory_key_padding_mask=encoder_out["padding_mask"],
+                            pos=encoder_out["pos_embed"],
+                            reference_boxes=None,
+                            level_start_index=encoder_out["level_start_index"],
+                            spatial_shapes=encoder_out["spatial_shapes"],
+                            valid_ratios=encoder_out["valid_ratios"],
+                            tgt_mask=None,
+                            memory_text=prompt,
+                            text_attention_mask=prompt_mask,
+                            apply_dac=False,
+                        )
+                    )
+                hs = hs.transpose(1, 2)  # seq-first to batch-first
+                reference_boxes = reference_boxes.transpose(1, 2)  # seq-first to batch-first
+                if dec_presence_out is not None:
+                    # seq-first to batch-first
+                    dec_presence_out = dec_presence_out.transpose(1, 2)
+
+                out["presence_feats"] = dec_presence_feats
+                self.detector._update_scores_and_boxes(
+                    out,
+                    hs,
+                    reference_boxes,
+                    prompt,
+                    prompt_mask,
+                    dec_presence_out=dec_presence_out,
+                )
+
+
+            # print("keys of out after decoder:", out.keys()) # (['encoder_hidden_states', 'prev_encoder_out', 'presence_feats', 'queries', 'presence_logit_dec', 'pred_logits', 'pred_boxes', 'pred_boxes_xyxy'])
+            # Run segmentation heads
+            with torch.profiler.record_function("SAM3Image._run_segmentation_heads"):
+                self.detector._run_segmentation_heads(
+                    out=out,
+                    backbone_out=backbone_out,
+                    img_ids=find_input.img_ids,
+                    vis_feat_sizes=encoder_out["vis_feat_sizes"],
+                    encoder_hidden_states=out["encoder_hidden_states"],
+                    prompt=prompt,
+                    prompt_mask=prompt_mask,
+                    hs=hs,
+                    aux_masks=True,
+                )
+            
+            # if self.detector.training or self.detector.num_interactive_steps_val > 0:
+            #     self.detector._compute_matching(out, self.detector.back_convert(find_target))
+
+            #========================================
+            outputs = out
+            # print("outputs keys:", outputs.keys())
+            # print('aux:',outputs['aux_outputs'][0].keys())
+            # print('aux box:',outputs['aux_outputs'][0]['pred_boxes'].shape)
+            # print('aux pred_boxes_xyxy:',outputs['aux_outputs'][0]['pred_boxes_xyxy'].shape)
+
+            if self.training:
+                # mask classification target
+                if "instances" in batched_inputs[0]:
+                    gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                    targets = self.prepare_targets(gt_instances, images, batched_inputs)
+                else:
+                    targets = None
+
+            out_masks = outputs["pred_masks"].clone()
+
+            out_masks = out_masks.sigmoid()
+
+            # presence_score = outputs["presence_logit_dec"].sigmoid().unsqueeze(1) # 在多类别情况下认为失效
+
+            # out_semseg = outputs["semantic_seg"] # 原语义分割头输出，舍去
+            # out_semseg = F.interpolate(
+            #     out_semseg,
+            #     size=(img_h, img_w),
+            #     mode="bilinear",
+            #     align_corners=False,
+            # ).sigmoid()
+
+
+            # print("out_masks shape:", out_masks.shape, "out_probs shape:", out_probs.shape, "out_semseg shape:", out_semseg.shape, "presence_score shape:", presence_score.shape)
+            # out_masks shape: torch.Size([1, 200, 1008, 1008]) out_probs shape: torch.Size([1, 200]) out_semseg shape: torch.Size([1, 1, 1008, 1008]) presence_score shape: torch.Size([1, 1, 1])
+            pred_boxes = outputs['pred_boxes']
+            pred_boxes_xyxy = outputs['pred_boxes_xyxy']
+            # print("pred_boxes:",pred_boxes.shape)
+            # print("pred_boxes_xyxy:",pred_boxes_xyxy.shape)
             
 
-                if self.use_cos_sim:
-                    cur_logit_scale = self.logit_scale.exp()
-                    cur_logit_scale = torch.clamp(cur_logit_scale, max=100.0)
-                    query_names_results = cur_logit_scale * query_names_results
-                    if self.logit_bias is not None:
-                        cur_logit_bias = self.logit_bias
-                        query_names_results = query_names_results + cur_logit_bias
-                else:
-                    if self.logit_bias is not None:
-                        cur_logit_bias = self.logit_bias
-                        query_names_results = query_names_results + self.logit_bias
+            bs, N, H, W = out_masks.shape
+            C_ = SAM_text_classifier.shape[0] # num_names 
 
-                query_cls_results= []
-                cur_idx = 0
+            queries_masks = out_masks # out_probs是通过与池化prompt投影卷积实现的，多类别下失效，直接用原始mask_logits
 
-                tp_num_templates = SAM_num_templates
+            queries = outputs["obj_queries"] # 6, bs, N, D
+            
+            # instance_embeds = outputs["instance_embeds"] 
 
-                for num_t in tp_num_templates: 
-                    query_cls_results.append(query_names_results[:,:, cur_idx: cur_idx + num_t].max(-1).values)
-                    cur_idx += num_t
-                if self.void_embedding is not None:
-                    query_cls_results.append(query_names_results[:,:, -1])
-                query_cls_results = torch.stack(query_cls_results, dim=-1) # bs, N, num_classes
-                # print(f"aux query_cls_results[{i}] shape:", query_cls_results.shape)
-                    
-                if i<5:
-                    aux_out = {
-                        'pred_logits': query_cls_results, 
-                        'pred_masks': outputs['aux_outputs'][i]["pred_masks"], 
-                        'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'],
-                        'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"],
-                    }
-                    if cur_obj_logits is not None:
-                        aux_out['pred_objectness_logits'] = cur_obj_logits
+            use_aux = self.use_aux and self.training
+            aux_outputs = []
 
-                    
-                    aux_outputs.append(aux_out)
-                else:
-                    query_cls_results_final = query_cls_results
-                    obj_logits_final = cur_obj_logits
+            obj_logits = None
+            if self.new_score_head:
+                obj_logits = self.score_head(queries).squeeze(-1)
+
+        
+
+            for i in range(6):
+                assert queries.shape[0] == 6
+                assert queries.shape[2] == N
+                if use_aux or i == 5 :
+                    tp_queries = queries[i,:,:,:].clone() 
+
+                    if self.add_pixelfeat:
+                        pixel_embed = outputs["pixel_embed"] # bs, D, H', W'
+
+                        pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"] if i ==5 else outputs['aux_outputs'][i]["pred_masks"])
+                        tp_queries = tp_queries + pooled_pixel_embed
+
+                    cur_obj_logits = obj_logits[i] if obj_logits is not None else None
+
+                    if self.use_query_proj:
+                        tp_queries = self.query_proj(tp_queries)
+
+
+                    if self.use_cos_sim:
+                        tp_queries = F.normalize(tp_queries, dim=-1, p=2)
+
+
+                    if self.use_cdt:
+                        query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, SAM_text_classifier) # bs, N, C
+                    else:
+                        query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, SAM_text_classifier) # bs, N, C
+                
+
+                    if self.use_cos_sim:
+                        cur_logit_scale = self.logit_scale.exp()
+                        cur_logit_scale = torch.clamp(cur_logit_scale, max=100.0)
+                        query_names_results = cur_logit_scale * query_names_results
+                        if self.logit_bias is not None:
+                            cur_logit_bias = self.logit_bias
+                            query_names_results = query_names_results + cur_logit_bias
+                    else:
+                        if self.logit_bias is not None:
+                            cur_logit_bias = self.logit_bias
+                            query_names_results = query_names_results + self.logit_bias
+
+                    query_cls_results= []
+                    cur_idx = 0
+
+                    tp_num_templates = SAM_num_templates
+
+                    for num_t in tp_num_templates: 
+                        query_cls_results.append(query_names_results[:,:, cur_idx: cur_idx + num_t].max(-1).values)
+                        cur_idx += num_t
+                    if self.void_embedding is not None:
+                        query_cls_results.append(query_names_results[:,:, -1])
+                    query_cls_results = torch.stack(query_cls_results, dim=-1) # bs, N, num_classes
+                    # print(f"aux query_cls_results[{i}] shape:", query_cls_results.shape)
+                        
+                    if i<5:
+                        aux_out = {
+                            'pred_logits': query_cls_results, 
+                            'pred_masks': outputs['aux_outputs'][i]["pred_masks"], 
+                            'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'],
+                            'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"],
+                        }
+                        if cur_obj_logits is not None:
+                            aux_out['pred_objectness_logits'] = cur_obj_logits
+
+                        
+                        aux_outputs.append(aux_out)
+                    else:
+                        query_cls_results_final = query_cls_results
+                        obj_logits_final = cur_obj_logits
 
 
         if self.training:

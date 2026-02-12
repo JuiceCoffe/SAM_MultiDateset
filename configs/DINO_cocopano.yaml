@@ -50,12 +50,15 @@ SOLVER:
   LR_SCHEDULER_NAME: WarmupPolyLR
   STEPS: (30000, 60000)
   MAX_ITER: 90000
-  CHECKPOINT_PERIOD: 7500
+  CHECKPOINT_PERIOD: 3750
   
 
   CLASS_WEIGHT: 2.0
   MASK_WEIGHT: 5.0
   DICE_WEIGHT: 5.0
+  BBOX_WEIGHT: 2.5
+  GIOU_WEIGHT: 1.0
+
   USE_AUX : True
 
 
@@ -63,7 +66,7 @@ SOLVER:
 INPUT:
   DATASET_MAPPER_NAME: "coco_combine_lsj"
   IMAGE_SIZE: 896
-  MIN_SCALE: 0.1
+  MIN_SCALE: 0.5
   MAX_SCALE: 2.0
   FORMAT: "RGB"
   COLOR_AUG_SSD: True 
@@ -80,7 +83,7 @@ DATALOADER:
   DATASET_RATIO: [1.0]
 
   # # Batch Size 对应单个数据集
-  DATASET_BS: [4]
+  DATASET_BS: [8]
   
   # COCO 通常不需要 RFS (Repeat Factor Sampling)
   USE_RFS: [False]
@@ -96,7 +99,7 @@ DATALOADER:
   USE_DIFF_BS_SIZE: True
 
 TEST:
-  EVAL_PERIOD: 7500
+  EVAL_PERIOD: 3750
   INSTANCE_ON: True   
   PANOPTIC_ON: True   
   SEMANTIC_ON: True   
@@ -105,5 +108,5 @@ TEST:
 VERSION: 2
 
 # OUTPUT_DIR: ./out/test/
-OUTPUT_DIR: ./out/DINOSAM/copa_SAMtext_oracle
+OUTPUT_DIR: ./out/DINOSAM/copa_SAMtext_box_oracle
   

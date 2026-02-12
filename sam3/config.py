@@ -76,6 +76,8 @@ def add_sam3_config(cfg):
     cfg.SOLVER.CLIP_DISTILL = False
     cfg.SOLVER.CONTRAST_TEMPERATURE = 0.07
 
+    cfg.SOLVER.TRAIN_MASK = True
+
     cfg.TEST.SEMANTIC_ON = True
     cfg.TEST.INSTANCE_ON = False
     cfg.TEST.PANOPTIC_ON = False
