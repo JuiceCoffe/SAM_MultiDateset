@@ -1471,7 +1471,12 @@ class DINOSAM(nn.Module):
                 mask_pred = torch.cat((masks, binary_src_masks, target_masks),dim=1)
                 all_labels = torch.cat((labels, mask_labels, mask_labels),dim=1)
                     
-                maps_for_pooling = self.mask_adapter(img_feat_for_pool, mask_pred)
+                # maps_for_pooling = self.mask_adapter(img_feat_for_pool, mask_pred)
+                maps_for_pooling = []
+                for i in range(bs):
+                    maps_for_pooling_batch = self.mask_adapter(img_feat_for_pool[i:i+1, :, :, :], mask_pred[i:i+1, :, :, :])
+                    maps_for_pooling.append(maps_for_pooling_batch)
+                maps_for_pooling = torch.cat(maps_for_pooling, dim=0)
                 
                 maps_for_pooling = F.interpolate(maps_for_pooling, size=img_feat_for_pool.shape[-2:],
                                                     mode='bilinear', align_corners=False)

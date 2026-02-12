@@ -23,8 +23,9 @@ MODEL:
   # TEACHER: CONVCLIP
   # TEACHER_MASKPOOL: True
   USE_MASKADAPTER: True
-  # MASK_ADAPTER:
-  #   USE_CHECKPOINT: True
+  MASK_ADAPTER:
+    NUM_CHANNELS: 1024
+    USE_CHECKPOINT: True
   # WEIGHTS: "/data/hmp/sam3.pt"
   # WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
   WEIGHTS: /data/hmp/SAMweight/SAMtext_oracle_copa2ep.pth
@@ -63,14 +64,14 @@ SOLVER:
 
 INPUT:
   DATASET_MAPPER_NAME: "coco_combine_lsj"
-  IMAGE_SIZE: 768
+  IMAGE_SIZE: 896
   MIN_SCALE: 0.5
   MAX_SCALE: 2.0
   FORMAT: "RGB"
   COLOR_AUG_SSD: True 
   MASK_FORMAT: "bitmask"
-  MIN_SIZE_TEST: 768
-  MAX_SIZE_TEST: 768
+  MIN_SIZE_TEST: 896
+  MAX_SIZE_TEST: 896
 
 DATALOADER:
   # 如果你的代码支持，可以改回 "TrainingSampler"，
@@ -81,7 +82,7 @@ DATALOADER:
   DATASET_RATIO: [1.0]
 
   # # Batch Size 对应单个数据集
-  DATASET_BS: [2]
+  DATASET_BS: [4]
   
   # COCO 通常不需要 RFS (Repeat Factor Sampling)
   USE_RFS: [False]
