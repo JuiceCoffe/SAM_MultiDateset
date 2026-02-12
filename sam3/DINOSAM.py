@@ -1426,29 +1426,30 @@ class DINOSAM(nn.Module):
         if self.training:
             losses = {}
 
-            criterion_pred = {
-                'pred_logits': query_cls_results_final,
-                'pred_masks': outputs["pred_masks"],
-                'pred_boxes': outputs['pred_boxes'],
-                'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
-                'aux_outputs': aux_outputs if use_aux is True else None,
-            }
-            if obj_logits_final is not None:
-                criterion_pred['pred_objectness_logits'] = obj_logits_final
+            if self.train_mask:
+                criterion_pred = {
+                    'pred_logits': query_cls_results_final,
+                    'pred_masks': outputs["pred_masks"],
+                    'pred_boxes': outputs['pred_boxes'],
+                    'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
+                    'aux_outputs': aux_outputs if use_aux is True else None,
+                }
+                if obj_logits_final is not None:
+                    criterion_pred['pred_objectness_logits'] = obj_logits_final
 
 
-            fcclip_losses = self.criterion(criterion_pred, targets)
+                fcclip_losses = self.criterion(criterion_pred, targets)
 
 
-            for k in list(fcclip_losses.keys()):
-                # print("loss:", k, losses[k].item())
-                if k in self.criterion.weight_dict:
-                    fcclip_losses[k] *= self.criterion.weight_dict[k]
-                else:
-                    # remove this loss if not specified in `weight_dict`
-                    fcclip_losses.pop(k)
+                for k in list(fcclip_losses.keys()):
+                    # print("loss:", k, losses[k].item())
+                    if k in self.criterion.weight_dict:
+                        fcclip_losses[k] *= self.criterion.weight_dict[k]
+                    else:
+                        # remove this loss if not specified in `weight_dict`
+                        fcclip_losses.pop(k)
 
-            losses.update(fcclip_losses)
+                losses.update(fcclip_losses)
 
             if self.use_MaskAdapter:
                 mask_adapter_losses = {}
