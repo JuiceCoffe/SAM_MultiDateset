@@ -152,6 +152,13 @@ class FcclipHungarianMatcher(nn.Module):
             )
             C = C.reshape(num_queries, -1).cpu()
 
+            if not torch.isfinite(C).all():
+                # print("Warning: Cost matrix contains NaN/Inf! Patching...")
+                # 将 NaN/Inf 替换为一个巨大的常数（代表代价极大，绝不匹配）
+                # 必须转为 float32 处理，否则 1e6 在 fp16 可能还是 inf
+                C = C.float() 
+                C = torch.nan_to_num(C, nan=1e6, posinf=1e6, neginf=-1e6)
+
             indices.append(linear_sum_assignment(C))
 
         return [
