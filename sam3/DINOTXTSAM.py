@@ -57,6 +57,7 @@ import random
 import math
 
 from .dinov3txt import DINOv3TXT
+from .mask_adapter_head import build_mask_adapter
 
 class DINOv3Shim(nn.Module):
     def __init__(self):
@@ -119,7 +120,7 @@ def create_DINO_backbone(compile_mode=None, enable_inst_interactivity=False, cfg
     return full_backbone
 
 @META_ARCH_REGISTRY.register()
-class DINOSAM(nn.Module):
+class DINOTXTSAM(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.device_type = cfg.MODEL.DEVICE
@@ -172,6 +173,7 @@ class DINOSAM(nn.Module):
         print("SAM3创建成功!")
 
         self.PROMPT = DINO_PROMPT_TEMPLATES
+        self.SAM_PROMPT = ['{}']
         # -------------------------------------------------------
         # 新增模块
         # -------------------------------------------------------
@@ -209,25 +211,20 @@ class DINOSAM(nn.Module):
             self.encoder_box_head = MLP(256, 256, 4, 3)
             nn.init.constant_(self.encoder_box_head.layers[-1].weight.data, 0)
             nn.init.constant_(self.encoder_box_head.layers[-1].bias.data, 0)
-
-
-        self.text_encoder_cache = {} 
  
         self.mask_pooling = MaskPooling()
 
         self.use_MaskAdapter = cfg.MODEL.USE_MASKADAPTER
         if self.use_MaskAdapter:
             from .mask_adapter_head import load_mask_adapter_standalone
-            self.mask_adapter = load_mask_adapter_standalone(
-                weight_path=cfg.MODEL.MASKADAPTERPATH,
-                clip_model_name="fcclip_convnext_large", # 只要包含 '_large' 即可
-                num_channels=768,              
-                num_output_maps=16,           
-                mask_in_chans=16,           
-                use_checkpoint=False         
-            )
-            self.mask_adapter.eval()
-            self.num_output_maps = 16
+            self.mask_adapter = build_mask_adapter(cfg, cfg.MODEL.MASK_ADAPTER.NAME)
+            self.num_output_maps = cfg.MODEL.MASK_ADAPTER.NUM_OUTPUT_MAPS
+            self.iou_threshold = cfg.MODEL.MASK_ADAPTER.IOU_THRESHOLD
+            self.mask_threshold = cfg.MODEL.MASK_ADAPTER.MASK_THRESHOLD
+            self.num_gt_masks = cfg.MODEL.MASK_ADAPTER.NUM_GT_MASKS
+            self.num_pred_masks = cfg.MODEL.MASK_ADAPTER.NUM_PRED_MASKS
+
+            self.mask_adapter_weight_dict = {"loss_ce": cfg.MODEL.MASK_ADAPTER.CLASS_WEIGHT, "loss_cosine": cfg.MODEL.MASK_ADAPTER.COS_WEIGHT}
    
 
         self.new_score_head = cfg.MODEL.SAM3.NEW_SCORE_HEAD
@@ -235,7 +232,7 @@ class DINOSAM(nn.Module):
             self.score_head = MLP(256, 256, 1, 3)
             init_score_head(self.score_head)
 
-        self.text_feat_resizer = nn.Linear(1024, 256)
+        self.text_feat_resizer = MLP(1024, 512, 256, 3)
 
         # -------------------------------------------------------
         # 计算逻辑
@@ -243,6 +240,7 @@ class DINOSAM(nn.Module):
         self.add_pixelfeat = cfg.MODEL.SAM3.ADD_PIXELFEAT
         self.alpha = cfg.MODEL.SAM3.ALPHA
         self.beta = cfg.MODEL.SAM3.BETA
+        self.OracleSelect_on = cfg.MODEL.SAM3.ORACLE_SELECT
 
         # -------------------------------------------------------
         # 训练配置
@@ -250,10 +248,12 @@ class DINOSAM(nn.Module):
         # 你需要检查 sam3_loss 的初始化参数
         self.train_dataname = None
         self.test_dataname = None
-        self.train_dataname_teacher = None
-        self.test_dataname_teacher = None
+        self.train_feat_dataname = None
+        self.test_feat_dataname = None
+        self.text_encoder_cache = {} 
+        self.text_feat_cache = {}
+
         self.test_metadata = {i: MetadataCatalog.get(i) for i in cfg.DATASETS.TEST}
-        # 【修改】建立 Metadata 字典，方便后续查找
         self.train_metadata_dict = {name: MetadataCatalog.get(name) for name in cfg.DATASETS.TRAIN}
         
         # 【修改】这里初始化为 None 或第一个数据集的均可，反正 get_text_classifier 会覆盖它
@@ -268,6 +268,10 @@ class DINOSAM(nn.Module):
 
         self.use_aux = cfg.SOLVER.USE_AUX
         self.only_instance = cfg.DATASETS.ONLY_INSTANCE
+        if self.only_instance:
+            raise NotImplementedError("only_instance尚未给prepare_targets_for_maskadapter适配")
+        
+        self.train_mask = cfg.SOLVER.TRAIN_MASK
         # -------------------------------------------------------
         # criterion损失函数
         # -------------------------------------------------------
@@ -363,6 +367,8 @@ class DINOSAM(nn.Module):
                 cost_class=class_weight,
                 cost_mask=mask_weight,
                 cost_dice=dice_weight,
+                cost_bbox=bbox_weight,
+                cost_giou=giou_weight,
                 num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
             )
             self.criterion = FcclipSetCriterion(
@@ -409,23 +415,59 @@ class DINOSAM(nn.Module):
 
         self._freeze()
 
-    def _freeze(self, ):
-        for name, param in self.named_parameters():
-            if 'dino' in name:
-                param.requires_grad = False
-            # elif 'dot_prod_scoring' in name:
-            #     param.requires_grad = False
-            elif 'geometry_encoder' in name:
-                param.requires_grad = False
-            else:
-                param.requires_grad = True
+    # def _freeze(self, ):
+    #     for name, param in self.named_parameters():
+    #         if 'dino' in name:
+    #             param.requires_grad = False
+    #         elif 'language_backbone' in name:
+    #             param.requires_grad = False
+    #         elif 'geometry_encoder' in name:
+    #             param.requires_grad = False
+    #         else:
+    #             param.requires_grad = True
         
-        print('='*10,'Parameters to be trained', '='*10)
-        for name, param in self.named_parameters():
-            if param.requires_grad == True:
-                print(name)
-        # exit()
+    #     print('='*10,'Parameters to be trained', '='*10)
+    #     for name, param in self.named_parameters():
+    #         if param.requires_grad == True:
+    #             print(name)
+    #     # exit()
+    def _freeze(self):
+            # 1. 定义需要冻结的关键字
+            # 'language_backbone': 处理语言的主干及其 256 维 resizer
+            # 'text_model': DINO 内部的文本编码器分支
+            # 'text_feat_resizer': 顶层的 1024->256 投影层
+            freeze_keywords = [
+                'dino',
+                'geometry_encoder',
+                'language_backbone', 
+                'text_model', 
 
+            ]
+
+            # 2. 遍历参数并设置 requires_grad
+            for name, param in self.named_parameters():
+                # 检查参数名是否包含上述任何一个关键字
+                if any(key in name for key in freeze_keywords):
+                    param.requires_grad = False
+                else:
+                    # 其他部分（如 vision_backbone 的视觉部分、transformer 训练层等）保持开启
+                    param.requires_grad = True
+            
+            # 特殊处理：如果您希望整个 DINO (包括视觉分支) 也冻结，请取消下面注释
+            # for name, param in self.named_parameters():
+            #     if 'detector.backbone.vision_backbone.trunk.dino' in name:
+            #         param.requires_grad = False
+
+            # 3. 打印结果以供校验
+            print('='*10, 'Parameters to be TRAINED (requires_grad=True)', '='*10)
+            trainable_count = 0
+            for name, param in self.named_parameters():
+                if param.requires_grad:
+                    print(f"TRAINABLE: {name}")
+                    trainable_count += 1
+            
+            print(f"\nTotal trainable parameter groups: {trainable_count}")
+            print('='*40)
     # def prepare_targets(self, targets, images):
     #     h_pad, w_pad = images.tensor.shape[-2:]
     #     new_targets = []
@@ -458,6 +500,10 @@ class DINOSAM(nn.Module):
     #             }
     #         )
     #     return new_targets
+
+    def dino(self):
+        return self.detector.backbone.vision_backbone.trunk.dino
+
     def prepare_targets(self, targets, images, batched_inputs):
         h_pad, w_pad = images.tensor.shape[-2:]
         new_targets = []
@@ -536,6 +582,71 @@ class DINOSAM(nn.Module):
             )
         return new_targets
 
+    def prepare_targets_for_maskadapter(self, targets, images):
+        h_pad, w_pad = images.tensor.shape[-2:]
+        new_targets = []
+        masks_list = []
+        labels_list = []
+
+        num_masks = self.num_gt_masks  
+
+        for targets_per_image in targets:
+            gt_masks = targets_per_image.gt_masks
+            if isinstance(gt_masks, BitMasks):
+                gt_masks = gt_masks.tensor
+            valid_mask_indices = [i for i, mask in enumerate(gt_masks) if mask.sum() > 0] 
+
+            if len(valid_mask_indices) > 0:
+                valid_gt_masks = gt_masks[valid_mask_indices]
+                valid_gt_classes = targets_per_image.gt_classes[valid_mask_indices]
+
+                padded_masks = torch.zeros((valid_gt_masks.shape[0], h_pad, w_pad), dtype=valid_gt_masks.dtype, device=valid_gt_masks.device)
+                padded_masks[:, :valid_gt_masks.shape[1], :valid_gt_masks.shape[2]] = valid_gt_masks
+                new_targets.append(
+                    {
+                        "labels": valid_gt_classes,
+                        "masks": padded_masks,
+                    }
+                )
+
+                total_masks = torch.zeros((num_masks, h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+                selected_labels = torch.full((num_masks,), -1, dtype=valid_gt_classes.dtype, device=gt_masks.device)
+
+                if valid_gt_masks.shape[0] > num_masks:
+                    selected_indices = torch.randperm(valid_gt_masks.shape[0])[:num_masks]
+                    for idx, mask_idx in enumerate(selected_indices):
+                        total_masks[idx, :valid_gt_masks[mask_idx].shape[0], :valid_gt_masks[mask_idx].shape[1]] = valid_gt_masks[mask_idx]
+                        selected_labels[idx] = valid_gt_classes[mask_idx]
+                else:
+                    for idx in range(valid_gt_masks.shape[0]):
+                        total_masks[idx, :valid_gt_masks[idx].shape[0], :valid_gt_masks[idx].shape[1]] = valid_gt_masks[idx]
+                        selected_labels[idx] = valid_gt_classes[idx]
+                    
+                    for idx in range(valid_gt_masks.shape[0], num_masks):
+                        total_masks[idx] = torch.zeros((h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+                        selected_labels[idx] = -1
+            else:
+                total_masks = torch.zeros((num_masks, h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+                selected_labels = torch.full((num_masks,), -1, dtype=torch.long, device=gt_masks.device)
+                
+                padded_masks = torch.zeros((0, h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+                valid_gt_classes = torch.zeros((0), device=gt_masks.device)
+                new_targets.append(
+                    {
+                        "labels": valid_gt_classes,
+                        "masks": padded_masks,
+                    }
+                )
+
+            masks_list.append(total_masks)
+            labels_list.append(selected_labels)
+
+        masks = torch.stack(masks_list, dim=0)
+        labels = torch.stack(labels_list, dim=0)
+        labels = labels.long()
+
+        return new_targets, masks, labels
+
     def prepare_class_names_from_metadata(self, metadata, train_metadata, prompt_list):
         def split_labels(x):
             res = []
@@ -598,8 +709,6 @@ class DINOSAM(nn.Module):
                 if dataname in self.text_encoder_cache:
                     cache = self.text_encoder_cache[dataname]
                     # 从 CPU 缓存加载并移回 GPU
-                    self.language_features = cache["language_features"].to(self.device)
-                    self.language_mask = cache["language_mask"].to(self.device)
                     self.train_text_classifier = cache["text_classifier"].to(self.device)
                     
                     # 直接恢复列表，不要再重新计算
@@ -655,24 +764,17 @@ class DINOSAM(nn.Module):
                     text_classifier = torch.cat(text_classifier, dim=0)
                     text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.PROMPT), len(self.PROMPT), -1, text_classifier.shape[-1]) # num_names, self.PROMPT, L, D
                     print("text_classifier:",text_classifier.shape)
-                    language_features = text_classifier.mean(1) # num_names, L, D
                     text_classifier = text_classifier.mean(-2) 
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                     text_classifier = text_classifier.mean(1)
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                     
-                    self.language_features = language_features.detach() # num_names , L, D
-                    self.language_mask = torch.zeros(
-                        self.language_features.shape[0], self.language_features.shape[1], 
-                        dtype=torch.bool, device=self.device
-                    )
+
                     self.train_text_classifier = text_classifier.detach()
                     # --- 原有生成逻辑结束 ---
 
                     # 【新增】2. 将生成的特征移至 CPU 并存入缓存
                     self.text_encoder_cache[dataname] = {
-                        "language_features": self.language_features.cpu(),
-                        "language_mask": self.language_mask.cpu(),
                         "text_classifier": self.train_text_classifier.cpu(),
                         "num_templates": self.train_num_templates, # 缓存当前的 List
                         "class_names": self.train_class_names      # 缓存当前的 List
@@ -706,6 +808,99 @@ class DINOSAM(nn.Module):
                 self.test_dataname = dataname
             return self.test_text_classifier.clone(), self.test_num_templates
 
+    def get_simple_text_feat(self, dataname):
+        if self.training:
+            if self.train_feat_dataname != dataname:
+                if dataname in self.text_feat_cache:
+                    cache = self.text_feat_cache[dataname]
+                    # 从 CPU 缓存加载并移回 GPU
+                    self.language_features = cache["language_features"].to(self.device)
+                    self.language_mask = cache["language_mask"].to(self.device)
+
+                else:
+                    # ============== 关键修改开始 ==============
+                    # 获取 metadata
+                    if dataname in self.train_metadata_dict:
+                        current_metadata = self.train_metadata_dict[dataname]
+                    else:
+                        current_metadata = MetadataCatalog.get(dataname)
+
+                    # 计算类别名和模板数量
+                    # 【注意】这里不要用 self.train_num_templates[dataname]，因为它不是字典
+                    # 直接覆盖 self.train_num_templates 为当前数据集的 List
+                    _, self.train_num_templates, self.train_class_names = self.prepare_class_names_from_metadata(
+                        current_metadata, current_metadata, self.SAM_PROMPT
+                    )
+                    # ============== 关键修改结束 ==============
+
+                    # 如果开启 only_instance 且当前是 COCO Stuff，我们需要移除前 80 个 Things 类
+                    # 这样生成的 text_classifier 就只包含 Stuff 类，且从 0 开始索引
+                    # ---------------- 修改开始 ----------------
+                    is_coco_stuff = "openvocab_coco_2017_train_stuff_sem_seg" in dataname
+                    
+                    if self.only_instance and is_coco_stuff:
+                        num_things_classes = 80 
+                        
+                        if len(self.train_num_templates) > num_things_classes:
+                            print(f"[{dataname}] Filtering out {num_things_classes} Thing classes for Stuff training.")
+                            
+                            # 1. 计算前 80 个类总共占用了多少个文本 Prompt 
+                            # 【关键修正】这里必须乘以每个同义词对应的 Prompt 数量 (len(self.SAM_PROMPT))
+                            # train_num_templates 存的是同义词数量，train_class_names 存的是展开后的 Prompt
+                            num_synonyms_to_skip = sum(self.train_num_templates[:num_things_classes])
+                            offset_text_idx = num_synonyms_to_skip * len(self.SAM_PROMPT)
+                            
+                            # 2. 截断 class_names (输入给 Text Encoder 的文本列表)
+                            self.train_class_names = self.train_class_names[offset_text_idx:]
+                            
+                            # 3. 截断 num_templates (用于后续 Logit 聚合的计数列表)
+                            self.train_num_templates = self.train_num_templates[num_things_classes:]
+
+                    # --- 原有生成逻辑开始 ---
+                    text_classifier = []
+                    bs = 128
+                    print("Generating text feat for", dataname, "with", len(self.train_class_names), "classes.")
+                    for idx in range(0, len(self.train_class_names), bs):
+                        batch_text_feat = self.detector.backbone.vision_backbone.trunk.dino.get_text_classifier(self.train_class_names[idx:idx+bs], device=self.device)
+                        text_classifier.append(batch_text_feat)
+                    text_classifier = torch.cat(text_classifier, dim=0)
+                    text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.SAM_PROMPT), len(self.SAM_PROMPT), -1, text_classifier.shape[-1]) # num_names, self.SAM_PROMPT, L, D
+                    language_features = text_classifier.mean(1) # num_names, L, D
+                    
+                    self.language_features = language_features.detach() # num_names , L, D
+                    self.language_mask = torch.zeros(
+                        self.language_features.shape[0], self.language_features.shape[1], 
+                        dtype=torch.bool, device=self.device
+                    )
+
+                    # 【新增】2. 将生成的特征移至 CPU 并存入缓存
+                    self.text_feat_cache[dataname] = {
+                        "language_features": self.language_features.cpu(),
+                        "language_mask": self.language_mask.cpu(),
+                    }
+
+                self.train_feat_dataname = dataname
+        else:
+            if self.test_feat_dataname != dataname:
+                self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata, self.SAM_PROMPT)
+                text_classifier = []
+                bs = 128
+                print("Generating text feat for", dataname, "with", len(self.test_class_names), "classes.")
+                for idx in range(0, len(self.test_class_names), bs):
+                    batch_text_feat = self.detector.backbone.vision_backbone.trunk.dino.get_text_classifier(self.test_class_names[idx:idx+bs], device=self.device)
+                    text_classifier.append(batch_text_feat)
+                text_classifier = torch.cat(text_classifier, dim=0)
+                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.SAM_PROMPT), len(self.SAM_PROMPT), -1, text_classifier.shape[-1]) # num_names, self.SAM_PROMPT, L, D
+                language_features = text_classifier.mean(1) # num_names, L, D
+
+                
+                self.language_features = language_features.detach() # num_names , L, D
+                self.language_mask = torch.zeros(
+                        self.language_features.shape[0], self.language_features.shape[1], 
+                        dtype=torch.bool, device=self.device
+                    )
+                self.test_feat_dataname = dataname
+
     @property
     def device(self):
         return self.pixel_mean.device
@@ -715,7 +910,7 @@ class DINOSAM(nn.Module):
         images = [x["image"].to(self.device) for x in batched_inputs]
         # print("shape of first image:", images[0].shape)
         images = [(x / 255.0 - self.pixel_mean) / self.pixel_std for x in images]
-        images = ImageList.from_tensors(images, 14)
+        images = ImageList.from_tensors(images, 16)
         # print("shape of images.tensor:", images.tensor.shape)
         img_h, img_w = images.tensor.shape[-2:]
 
@@ -751,65 +946,25 @@ class DINOSAM(nn.Module):
                 backbone_fpn[k] = backbone_fpn[k].detach()
 
 
-            # 语言特征
-            # text_classifier:[num_names, dim] 
-            # language_features:[num_names, num_templates, L, dim] language_mask:[num_names, num_templates, L]
+            self.get_simple_text_feat(dataname)
             
-            # text_classifier, num_templates = self.get_text_classifier(meta['dataname'])
-            text_classifier, num_templates = self.get_text_classifier(dataname)
+            text_classifier, num_templates = self.get_text_classifier(meta['dataname'])
+            # SAM_text_classifier, SAM_num_templates = self.get_SAM_text_classifier(dataname)
             if self.void_embedding is not None:
+                # SAM_text_classifier = torch.cat([SAM_text_classifier, F.normalize(self.void_embedding.weight, dim=-1)], dim=0)
                 text_classifier = torch.cat([text_classifier, F.normalize(self.void_embedding.weight, dim=-1)], dim=0)
 
             # others
             geometric_prompt = self.detector._get_dummy_prompt(bs)
         
         if self.use_cdt:
-            # text_classifier = self.cdt(img_feat,text_classifier)
-            for layer in self.cdt:
-                text_classifier = layer(img_feat,text_classifier) # 逐层通过
+            raise NotImplementedError("CDT is not implemented yet.")
+            # for layer in self.cdt:
+            #     text_classifier = layer(img_feat,text_classifier) # 逐层通过
 
-        batch_gt_names_idx = []
-        for i in range(bs):
-            # gt_classes = get_gt_labels_from_sem_seg(batched_inputs[i]["sem_seg"].to(self.device))
 
-            # === 修改开始：适配 Objects365 的 Instances 格式 ===
-            gt_classes = []
-            if "instances" in batched_inputs[i]:
-                # 从实例中提取去重后的类别 ID
-                if len(batched_inputs[i]["instances"]) > 0:
-                    gt_classes = batched_inputs[i]["instances"].gt_classes.unique().cpu().tolist()
-            elif "sem_seg" in batched_inputs[i]:
-                # 兼容旧的 COCO Stuff 逻辑
-                gt_classes = get_gt_labels_from_sem_seg(batched_inputs[i]["sem_seg"].to(self.device))
-            # === 修改结束 ===
-
-            gt_names_idx = []
-            cur_idx = 0
-            for i,num_t in enumerate(num_templates): 
-                if i in gt_classes:
-                    gt_names_idx += list(range(cur_idx, cur_idx + num_t))
-                cur_idx += num_t
-            batch_gt_names_idx.append(gt_names_idx)
-
-        # =======================================================
-        
-        language_features_input = []
-
-        # USE_GT_NAMES_ONLY = True
-        USE_GT_NAMES_ONLY = False
-        
-        if USE_GT_NAMES_ONLY:
-            language_features_input = [self.language_features[batch_gt_names_idx[i],:,:] for i in range(bs)]
-            language_features_input = torch.cat(language_features_input, dim=0) # (bs, num_names * L, dim)
-            language_mask_input = [self.language_mask[batch_gt_names_idx[i],:] for i in range(bs)]
-            language_mask_input = torch.cat(language_mask_input, dim=0) # (bs, num_names * L)
-            if bs == 1:
-                language_features_input = language_features_input.unsqueeze(0)
-                language_mask_input = language_mask_input.unsqueeze(0)
-
-        else:
-            language_features_input = self.language_features.expand(bs, -1, -1, -1) # (bs, num_names, L, dim)
-            language_mask_input = self.language_mask.expand(bs, -1, -1) # (bs, num_names, L)
+        language_features_input = self.language_features.expand(bs, -1, -1, -1) # (bs, num_names, L, dim)
+        language_mask_input = self.language_mask.expand(bs, -1, -1) # (bs, num_names, L)
 
         language_features_input = self.text_feat_resizer(language_features_input) # (bs, num_names, L, 1024) -> (bs, num_names, L, 256)
 
@@ -828,338 +983,400 @@ class DINOSAM(nn.Module):
         }
 
         #=================================
-        find_input = self.find_stage
+        with torch.set_grad_enabled(self.train_mask):
 
-        with torch.profiler.record_function("SAM3Image._encode_prompt"):
-            prompt, prompt_mask, backbone_out = self.detector._encode_prompt(
-                backbone_out, find_input, geometric_prompt
-            )
-        # Run the encoder
-        with torch.profiler.record_function("SAM3Image._run_encoder"):
-            backbone_out, encoder_out, _ = self.detector._run_encoder(
-                backbone_out, find_input, prompt, prompt_mask
-            )
+            find_input = self.find_stage
 
-        fusion_feat = encoder_out["encoder_hidden_states"] # H'*W', bs, D
-        fusion_feat = fusion_feat.permute(1,0,2) # bs, H'*W', D
-        if self.use_cos_sim:
-            fusion_feat = F.normalize(fusion_feat, dim=-1)
+            with torch.profiler.record_function("SAM3Image._encode_prompt"):
+                prompt, prompt_mask, backbone_out = self.detector._encode_prompt(
+                    backbone_out, find_input, geometric_prompt
+                )
+            # Run the encoder
+            with torch.profiler.record_function("SAM3Image._run_encoder"):
+                backbone_out, encoder_out, _ = self.detector._run_encoder(
+                    backbone_out, find_input, prompt, prompt_mask
+                )
 
-        if self.encoder_loss:
-            if self.use_cdt:
-                encoder_logits = torch.einsum("bld,bcd->blc", fusion_feat, text_classifier)
-            else:
-                encoder_logits = torch.einsum("bld,cd->blc", fusion_feat, text_classifier)
-            
+            fusion_feat = encoder_out["encoder_hidden_states"] # H'*W', bs, D
+            fusion_feat = fusion_feat.permute(1,0,2) # bs, H'*W', D
             if self.use_cos_sim:
-                e_logit_scale = self.encoder_logit_scale.exp()
-                e_logit_scale = torch.clamp(e_logit_scale, max=100.0)
-                encoder_logits = encoder_logits * e_logit_scale + self.encoder_logit_bias
-            else:
-                encoder_logits = encoder_logits / (fusion_feat.shape[-1] ** 0.5) + self.encoder_logit_bias
+                fusion_feat = F.normalize(fusion_feat, dim=-1)
 
-
-            encoder_logits = aggregate_name_to_class_logits(encoder_logits, num_templates)
-
-            encoder_score = encoder_logits.max(-1).values # [bs, HW]
-            k_selected = self.num_encoder_query
-            topk_values, topk_indices = torch.topk(encoder_score, k_selected, dim=1) # [bs, k]
-            topk_indices_unsqueezed = topk_indices.unsqueeze(-1).repeat(1, 1, fusion_feat.shape[-1])
-            topK_fusion_feat = torch.gather(fusion_feat, 1, topk_indices_unsqueezed) # [bs, k, D]
-            num_classes = encoder_logits.shape[-1]
-            encoder_cls_logits = torch.gather(
-                encoder_logits, 
-                1, 
-                topk_indices.unsqueeze(-1).expand(-1, -1, num_classes)
-            )
-
-
-        out = {
-            "encoder_hidden_states": encoder_out["encoder_hidden_states"],
-            "prev_encoder_out": {
-                "encoder_out": encoder_out,
-                "backbone_out": backbone_out,
-            },
-        }
-        # print("keys of out before decoder:", out.keys()) # s(['encoder_hidden_states', 'prev_encoder_out'])
-        # Run the decoder
-        with torch.profiler.record_function("SAM3Image._run_decoder"):            
-            # out, hs = self.detector._run_decoder(
-            #     memory=out["encoder_hidden_states"],
-            #     pos_embed=encoder_out["pos_embed"],
-            #     src_mask=encoder_out["padding_mask"],
-            #     out=out,
-            #     prompt=prompt,
-            #     prompt_mask=prompt_mask,
-            #     encoder_out=encoder_out,
-            # )
-            if self.DynamicQuery:
-                # ---------------- Relative Offset Prediction 修改开始 ----------------
-                
-                # 1. 获取全图的网格锚点 (Grid Anchors)
-                # encoder_out["spatial_shapes"] 包含了特征图的高宽
-                # grid_anchors shape: [1, Total_HW, 2] -> (x, y)
-                grid_anchors = get_grid_reference_points(
-                    encoder_out["spatial_shapes"], 
-                    device=self.device
-                )
-                
-                # 2. 扩展到 Batch 维度
-                # grid_anchors shape: [bs, Total_HW, 2]
-                grid_anchors = grid_anchors.expand(bs, -1, -1)
-                
-                # 3. 根据 TopK 索引提取对应的锚点
-                # topk_indices shape: [bs, k]
-                # 我们需要 gather 最后一个维度 (x, y)，所以要扩展 indices
-                gather_idx = topk_indices.unsqueeze(-1).repeat(1, 1, 2) # [bs, k, 2]
-                
-                # topk_anchors_xy shape: [bs, k, 2]
-                topk_anchors_xy = torch.gather(grid_anchors, 1, gather_idx)
-                
-                # 4. 构建完整的 4D 锚点 (x, y, w, h)
-                # x, y 来自网格，w, h 初始化为一个较小的先验值 (例如 0.05)
-                # 这样 inverse_sigmoid 不会溢出，且符合物体初始尺寸较小的假设
-                anchor_wh_prior = torch.full_like(topk_anchors_xy, 0.05)
-                topk_anchors = torch.cat([topk_anchors_xy, anchor_wh_prior], dim=-1) # [bs, k, 4]
-                
-                # 5. 计算偏移量 (Logit Space)
-                # encoder_box_head 输出的是相对于锚点的偏移修正量
-                delta_box_logits = self.encoder_box_head(topK_fusion_feat)
-                
-                # 6. 核心公式：Box = Sigmoid( Delta + InverseSigmoid(Anchor) )
-                # 将锚点转换到 logit 域，加上偏移量，再转回 [0, 1] 域
-                anchor_logits = inverse_sigmoid(topk_anchors)
-                encoder_box = (delta_box_logits + anchor_logits).sigmoid() # [bs, k, 4]
-                
-                # ---------------- Relative Offset Prediction 修改结束 ----------------
-
-                hs, reference_boxes, dec_presence_out, dec_presence_feats = (
-                    self.detector.transformer.decoder(
-
-                        tgt=topK_fusion_feat.permute(1,0,2).detach(), # TopK fusion feat
-
-                        memory=out["encoder_hidden_states"],
-                        memory_key_padding_mask=encoder_out["padding_mask"],
-                        pos=encoder_out["pos_embed"],
-
-                        reference_boxes=encoder_box.permute(1,0,2).detach(),
-
-                        level_start_index=encoder_out["level_start_index"],
-                        spatial_shapes=encoder_out["spatial_shapes"],
-                        valid_ratios=encoder_out["valid_ratios"],
-                        tgt_mask=None,
-                        memory_text=prompt,
-                        text_attention_mask=prompt_mask,
-                        apply_dac=False,
-                    )
-                )
-
-            else:
-                query_embed = self.detector.transformer.decoder.query_embed.weight
-                query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
-
-                hs, reference_boxes, dec_presence_out, dec_presence_feats = (
-                    self.detector.transformer.decoder(
-                        tgt=query_embed,
-                        memory=out["encoder_hidden_states"],
-                        memory_key_padding_mask=encoder_out["padding_mask"],
-                        pos=encoder_out["pos_embed"],
-                        reference_boxes=None,
-                        level_start_index=encoder_out["level_start_index"],
-                        spatial_shapes=encoder_out["spatial_shapes"],
-                        valid_ratios=encoder_out["valid_ratios"],
-                        tgt_mask=None,
-                        memory_text=prompt,
-                        text_attention_mask=prompt_mask,
-                        apply_dac=False,
-                    )
-                )
-            hs = hs.transpose(1, 2)  # seq-first to batch-first
-            reference_boxes = reference_boxes.transpose(1, 2)  # seq-first to batch-first
-            if dec_presence_out is not None:
-                # seq-first to batch-first
-                dec_presence_out = dec_presence_out.transpose(1, 2)
-
-            out["presence_feats"] = dec_presence_feats
-            self.detector._update_scores_and_boxes(
-                out,
-                hs,
-                reference_boxes,
-                prompt,
-                prompt_mask,
-                dec_presence_out=dec_presence_out,
-            )
-
-
-        # print("keys of out after decoder:", out.keys()) # (['encoder_hidden_states', 'prev_encoder_out', 'presence_feats', 'queries', 'presence_logit_dec', 'pred_logits', 'pred_boxes', 'pred_boxes_xyxy'])
-        # Run segmentation heads
-        with torch.profiler.record_function("SAM3Image._run_segmentation_heads"):
-            self.detector._run_segmentation_heads(
-                out=out,
-                backbone_out=backbone_out,
-                img_ids=find_input.img_ids,
-                vis_feat_sizes=encoder_out["vis_feat_sizes"],
-                encoder_hidden_states=out["encoder_hidden_states"],
-                prompt=prompt,
-                prompt_mask=prompt_mask,
-                hs=hs,
-                aux_masks=True,
-            )
-        
-        # if self.detector.training or self.detector.num_interactive_steps_val > 0:
-        #     self.detector._compute_matching(out, self.detector.back_convert(find_target))
-
-        #========================================
-        outputs = out
-        # print("outputs keys:", outputs.keys())
-        # print('aux:',outputs['aux_outputs'][0].keys())
-        # print('aux box:',outputs['aux_outputs'][0]['pred_boxes'].shape)
-        # print('aux pred_boxes_xyxy:',outputs['aux_outputs'][0]['pred_boxes_xyxy'].shape)
-
-        if self.training:
-            # mask classification target
-            if "instances" in batched_inputs[0]:
-                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-                targets = self.prepare_targets(gt_instances, images, batched_inputs)
-            else:
-                targets = None
-
-        out_masks = outputs["pred_masks"].clone()
-
-        out_masks = out_masks.sigmoid()
-
-        # presence_score = outputs["presence_logit_dec"].sigmoid().unsqueeze(1) # 在多类别情况下认为失效
-
-        # out_semseg = outputs["semantic_seg"] # 原语义分割头输出，舍去
-        # out_semseg = F.interpolate(
-        #     out_semseg,
-        #     size=(img_h, img_w),
-        #     mode="bilinear",
-        #     align_corners=False,
-        # ).sigmoid()
-
-
-        # print("out_masks shape:", out_masks.shape, "out_probs shape:", out_probs.shape, "out_semseg shape:", out_semseg.shape, "presence_score shape:", presence_score.shape)
-        # out_masks shape: torch.Size([1, 200, 1008, 1008]) out_probs shape: torch.Size([1, 200]) out_semseg shape: torch.Size([1, 1, 1008, 1008]) presence_score shape: torch.Size([1, 1, 1])
-        pred_boxes = outputs['pred_boxes']
-        pred_boxes_xyxy = outputs['pred_boxes_xyxy']
-        # print("pred_boxes:",pred_boxes.shape)
-        # print("pred_boxes_xyxy:",pred_boxes_xyxy.shape)
-        
-
-        bs, N, H, W = out_masks.shape
-        C_ = text_classifier.shape[0] # num_names 
-
-        queries_masks = out_masks # out_probs是通过与池化prompt投影卷积实现的，多类别下失效，直接用原始mask_logits
-
-        queries = outputs["obj_queries"] # 6, bs, N, D
-        
-        # instance_embeds = outputs["instance_embeds"] 
-
-        use_aux = self.use_aux and self.training
-        aux_outputs = []
-
-        obj_logits = None
-        if self.new_score_head:
-            obj_logits = self.score_head(queries).squeeze(-1)
-
-    
-
-        for i in range(6):
-            assert queries.shape[0] == 6
-            assert queries.shape[2] == N
-            if use_aux or i == 5 :
-                tp_queries = queries[i,:,:,:].clone() 
-
-                if self.add_pixelfeat:
-                    pixel_embed = outputs["pixel_embed"] # bs, D, H', W'
-
-                    pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"] if i ==5 else outputs['aux_outputs'][i]["pred_masks"])
-                    tp_queries = tp_queries + pooled_pixel_embed
-
-                cur_obj_logits = obj_logits[i] if obj_logits is not None else None
-
-                if self.use_query_proj:
-                    tp_queries = self.query_proj(tp_queries)
-
-
-                if self.use_cos_sim:
-                    tp_queries = F.normalize(tp_queries, dim=-1, p=2)
-
-
+            if self.encoder_loss:
                 if self.use_cdt:
-                    query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, text_classifier) # bs, N, C
+                    encoder_logits = torch.einsum("bld,bcd->blc", fusion_feat, text_classifier)
                 else:
-                    query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier) # bs, N, C
+                    encoder_logits = torch.einsum("bld,cd->blc", fusion_feat, text_classifier)
+                
+                if self.use_cos_sim:
+                    e_logit_scale = self.encoder_logit_scale.exp()
+                    e_logit_scale = torch.clamp(e_logit_scale, max=100.0)
+                    encoder_logits = encoder_logits * e_logit_scale + self.encoder_logit_bias
+                else:
+                    encoder_logits = encoder_logits / (fusion_feat.shape[-1] ** 0.5) + self.encoder_logit_bias
+
+
+                encoder_logits = aggregate_name_to_class_logits(encoder_logits, num_templates)
+
+                encoder_score = encoder_logits.max(-1).values # [bs, HW]
+                k_selected = self.num_encoder_query
+                topk_values, topk_indices = torch.topk(encoder_score, k_selected, dim=1) # [bs, k]
+                topk_indices_unsqueezed = topk_indices.unsqueeze(-1).repeat(1, 1, fusion_feat.shape[-1])
+                topK_fusion_feat = torch.gather(fusion_feat, 1, topk_indices_unsqueezed) # [bs, k, D]
+                num_classes = encoder_logits.shape[-1]
+                encoder_cls_logits = torch.gather(
+                    encoder_logits, 
+                    1, 
+                    topk_indices.unsqueeze(-1).expand(-1, -1, num_classes)
+                )
+
+
+            out = {
+                "encoder_hidden_states": encoder_out["encoder_hidden_states"],
+                "prev_encoder_out": {
+                    "encoder_out": encoder_out,
+                    "backbone_out": backbone_out,
+                },
+            }
+            # print("keys of out before decoder:", out.keys()) # s(['encoder_hidden_states', 'prev_encoder_out'])
+            # Run the decoder
+            with torch.profiler.record_function("SAM3Image._run_decoder"):            
+                # out, hs = self.detector._run_decoder(
+                #     memory=out["encoder_hidden_states"],
+                #     pos_embed=encoder_out["pos_embed"],
+                #     src_mask=encoder_out["padding_mask"],
+                #     out=out,
+                #     prompt=prompt,
+                #     prompt_mask=prompt_mask,
+                #     encoder_out=encoder_out,
+                # )
+                if self.DynamicQuery:
+                    # ---------------- Relative Offset Prediction 修改开始 ----------------
+                    
+                    # 1. 获取全图的网格锚点 (Grid Anchors)
+                    # encoder_out["spatial_shapes"] 包含了特征图的高宽
+                    # grid_anchors shape: [1, Total_HW, 2] -> (x, y)
+                    grid_anchors = get_grid_reference_points(
+                        encoder_out["spatial_shapes"], 
+                        device=self.device
+                    )
+                    
+                    # 2. 扩展到 Batch 维度
+                    # grid_anchors shape: [bs, Total_HW, 2]
+                    grid_anchors = grid_anchors.expand(bs, -1, -1)
+                    
+                    # 3. 根据 TopK 索引提取对应的锚点
+                    # topk_indices shape: [bs, k]
+                    # 我们需要 gather 最后一个维度 (x, y)，所以要扩展 indices
+                    gather_idx = topk_indices.unsqueeze(-1).repeat(1, 1, 2) # [bs, k, 2]
+                    
+                    # topk_anchors_xy shape: [bs, k, 2]
+                    topk_anchors_xy = torch.gather(grid_anchors, 1, gather_idx)
+                    
+                    # 4. 构建完整的 4D 锚点 (x, y, w, h)
+                    # x, y 来自网格，w, h 初始化为一个较小的先验值 (例如 0.05)
+                    # 这样 inverse_sigmoid 不会溢出，且符合物体初始尺寸较小的假设
+                    anchor_wh_prior = torch.full_like(topk_anchors_xy, 0.05)
+                    topk_anchors = torch.cat([topk_anchors_xy, anchor_wh_prior], dim=-1) # [bs, k, 4]
+                    
+                    # 5. 计算偏移量 (Logit Space)
+                    # encoder_box_head 输出的是相对于锚点的偏移修正量
+                    delta_box_logits = self.encoder_box_head(topK_fusion_feat)
+                    
+                    # 6. 核心公式：Box = Sigmoid( Delta + InverseSigmoid(Anchor) )
+                    # 将锚点转换到 logit 域，加上偏移量，再转回 [0, 1] 域
+                    anchor_logits = inverse_sigmoid(topk_anchors)
+                    encoder_box = (delta_box_logits + anchor_logits).sigmoid() # [bs, k, 4]
+                    
+                    # ---------------- Relative Offset Prediction 修改结束 ----------------
+
+                    hs, reference_boxes, dec_presence_out, dec_presence_feats = (
+                        self.detector.transformer.decoder(
+
+                            tgt=topK_fusion_feat.permute(1,0,2).detach(), # TopK fusion feat
+
+                            memory=out["encoder_hidden_states"],
+                            memory_key_padding_mask=encoder_out["padding_mask"],
+                            pos=encoder_out["pos_embed"],
+
+                            reference_boxes=encoder_box.permute(1,0,2).detach(),
+
+                            level_start_index=encoder_out["level_start_index"],
+                            spatial_shapes=encoder_out["spatial_shapes"],
+                            valid_ratios=encoder_out["valid_ratios"],
+                            tgt_mask=None,
+                            memory_text=prompt,
+                            text_attention_mask=prompt_mask,
+                            apply_dac=False,
+                        )
+                    )
+
+                else:
+                    query_embed = self.detector.transformer.decoder.query_embed.weight
+                    query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+
+                    hs, reference_boxes, dec_presence_out, dec_presence_feats = (
+                        self.detector.transformer.decoder(
+                            tgt=query_embed,
+                            memory=out["encoder_hidden_states"],
+                            memory_key_padding_mask=encoder_out["padding_mask"],
+                            pos=encoder_out["pos_embed"],
+                            reference_boxes=None,
+                            level_start_index=encoder_out["level_start_index"],
+                            spatial_shapes=encoder_out["spatial_shapes"],
+                            valid_ratios=encoder_out["valid_ratios"],
+                            tgt_mask=None,
+                            memory_text=prompt,
+                            text_attention_mask=prompt_mask,
+                            apply_dac=False,
+                        )
+                    )
+                hs = hs.transpose(1, 2)  # seq-first to batch-first
+                reference_boxes = reference_boxes.transpose(1, 2)  # seq-first to batch-first
+                if dec_presence_out is not None:
+                    # seq-first to batch-first
+                    dec_presence_out = dec_presence_out.transpose(1, 2)
+
+                out["presence_feats"] = dec_presence_feats
+                self.detector._update_scores_and_boxes(
+                    out,
+                    hs,
+                    reference_boxes,
+                    prompt,
+                    prompt_mask,
+                    dec_presence_out=dec_presence_out,
+                )
+
+
+            # print("keys of out after decoder:", out.keys()) # (['encoder_hidden_states', 'prev_encoder_out', 'presence_feats', 'queries', 'presence_logit_dec', 'pred_logits', 'pred_boxes', 'pred_boxes_xyxy'])
+            # Run segmentation heads
+            with torch.profiler.record_function("SAM3Image._run_segmentation_heads"):
+                self.detector._run_segmentation_heads(
+                    out=out,
+                    backbone_out=backbone_out,
+                    img_ids=find_input.img_ids,
+                    vis_feat_sizes=encoder_out["vis_feat_sizes"],
+                    encoder_hidden_states=out["encoder_hidden_states"],
+                    prompt=prompt,
+                    prompt_mask=prompt_mask,
+                    hs=hs,
+                    aux_masks=True,
+                )
+            
+            # if self.detector.training or self.detector.num_interactive_steps_val > 0:
+            #     self.detector._compute_matching(out, self.detector.back_convert(find_target))
+
+            #========================================
+            outputs = out
+            # print("outputs keys:", outputs.keys())
+            # print('aux:',outputs['aux_outputs'][0].keys())
+            # print('aux box:',outputs['aux_outputs'][0]['pred_boxes'].shape)
+            # print('aux pred_boxes_xyxy:',outputs['aux_outputs'][0]['pred_boxes_xyxy'].shape)
+
+            if self.training:
+                # mask classification target
+                if "instances" in batched_inputs[0]:
+                    gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                    targets = self.prepare_targets(gt_instances, images, batched_inputs)
+                else:
+                    targets = None
+
+            out_masks = outputs["pred_masks"].clone()
+
+            out_masks = out_masks.sigmoid()
+
+            # presence_score = outputs["presence_logit_dec"].sigmoid().unsqueeze(1) # 在多类别情况下认为失效
+
+            # out_semseg = outputs["semantic_seg"] # 原语义分割头输出，舍去
+            # out_semseg = F.interpolate(
+            #     out_semseg,
+            #     size=(img_h, img_w),
+            #     mode="bilinear",
+            #     align_corners=False,
+            # ).sigmoid()
+
+
+            # print("out_masks shape:", out_masks.shape, "out_probs shape:", out_probs.shape, "out_semseg shape:", out_semseg.shape, "presence_score shape:", presence_score.shape)
+            # out_masks shape: torch.Size([1, 200, 1008, 1008]) out_probs shape: torch.Size([1, 200]) out_semseg shape: torch.Size([1, 1, 1008, 1008]) presence_score shape: torch.Size([1, 1, 1])
+            pred_boxes = outputs['pred_boxes']
+            pred_boxes_xyxy = outputs['pred_boxes_xyxy']
+            # print("pred_boxes:",pred_boxes.shape)
+            # print("pred_boxes_xyxy:",pred_boxes_xyxy.shape)
             
 
-                if self.use_cos_sim:
-                    cur_logit_scale = self.logit_scale.exp()
-                    cur_logit_scale = torch.clamp(cur_logit_scale, max=100.0)
-                    query_names_results = cur_logit_scale * query_names_results
-                    if self.logit_bias is not None:
-                        cur_logit_bias = self.logit_bias
-                        query_names_results = query_names_results + cur_logit_bias
-                else:
-                    if self.logit_bias is not None:
-                        cur_logit_bias = self.logit_bias
-                        query_names_results = query_names_results + self.logit_bias
+            bs, N, H, W = out_masks.shape
+            C_ = text_classifier.shape[0] # num_names 
 
-                query_cls_results= []
-                cur_idx = 0
+            queries_masks = out_masks # out_probs是通过与池化prompt投影卷积实现的，多类别下失效，直接用原始mask_logits
 
-                tp_num_templates = num_templates
+            queries = outputs["obj_queries"] # 6, bs, N, D
+            
+            # instance_embeds = outputs["instance_embeds"] 
 
-                for num_t in tp_num_templates: 
-                    query_cls_results.append(query_names_results[:,:, cur_idx: cur_idx + num_t].max(-1).values)
-                    cur_idx += num_t
-                if self.void_embedding is not None:
-                    query_cls_results.append(query_names_results[:,:, -1])
-                query_cls_results = torch.stack(query_cls_results, dim=-1) # bs, N, num_classes
-                # print(f"aux query_cls_results[{i}] shape:", query_cls_results.shape)
-                    
-                if i<5:
-                    aux_out = {
-                        'pred_logits': query_cls_results, 
-                        'pred_masks': outputs['aux_outputs'][i]["pred_masks"], 
-                        'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'],
-                        'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"],
-                    }
-                    if cur_obj_logits is not None:
-                        aux_out['pred_objectness_logits'] = cur_obj_logits
+            use_aux = self.use_aux and self.training
+            aux_outputs = []
 
-                    
-                    aux_outputs.append(aux_out)
-                else:
-                    query_cls_results_final = query_cls_results
-                    obj_logits_final = cur_obj_logits
+            obj_logits = None
+            if self.new_score_head:
+                obj_logits = self.score_head(queries).squeeze(-1)
+
+        
+
+            for i in range(6):
+                assert queries.shape[0] == 6
+                assert queries.shape[2] == N
+                if use_aux or i == 5 :
+                    tp_queries = queries[i,:,:,:].clone() 
+
+                    if self.add_pixelfeat:
+                        pixel_embed = outputs["pixel_embed"] # bs, D, H', W'
+
+                        pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"] if i ==5 else outputs['aux_outputs'][i]["pred_masks"])
+                        tp_queries = tp_queries + pooled_pixel_embed
+
+                    cur_obj_logits = obj_logits[i] if obj_logits is not None else None
+
+                    if self.use_query_proj:
+                        tp_queries = self.query_proj(tp_queries)
+
+
+                    if self.use_cos_sim:
+                        tp_queries = F.normalize(tp_queries, dim=-1, p=2)
+
+
+                    if self.use_cdt:
+                        query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, text_classifier) # bs, N, C
+                    else:
+                        query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, text_classifier) # bs, N, C
+                
+
+                    if self.use_cos_sim:
+                        cur_logit_scale = self.logit_scale.exp()
+                        cur_logit_scale = torch.clamp(cur_logit_scale, max=100.0)
+                        query_names_results = cur_logit_scale * query_names_results
+                        if self.logit_bias is not None:
+                            cur_logit_bias = self.logit_bias
+                            query_names_results = query_names_results + cur_logit_bias
+                    else:
+                        if self.logit_bias is not None:
+                            cur_logit_bias = self.logit_bias
+                            query_names_results = query_names_results + self.logit_bias
+
+                    query_cls_results= []
+                    cur_idx = 0
+
+                    tp_num_templates = num_templates
+
+                    for num_t in tp_num_templates: 
+                        query_cls_results.append(query_names_results[:,:, cur_idx: cur_idx + num_t].max(-1).values)
+                        cur_idx += num_t
+                    if self.void_embedding is not None:
+                        query_cls_results.append(query_names_results[:,:, -1])
+                    query_cls_results = torch.stack(query_cls_results, dim=-1) # bs, N, num_classes
+                    # print(f"aux query_cls_results[{i}] shape:", query_cls_results.shape)
+                        
+                    if i<5:
+                        aux_out = {
+                            'pred_logits': query_cls_results, 
+                            'pred_masks': outputs['aux_outputs'][i]["pred_masks"], 
+                            'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'],
+                            'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"],
+                        }
+                        if cur_obj_logits is not None:
+                            aux_out['pred_objectness_logits'] = cur_obj_logits
+
+                        
+                        aux_outputs.append(aux_out)
+                    else:
+                        query_cls_results_final = query_cls_results
+                        obj_logits_final = cur_obj_logits
 
 
         if self.training:
+            losses = {}
 
-            criterion_pred = {
-                'pred_logits': query_cls_results_final,
-                'pred_masks': outputs["pred_masks"],
-                'pred_boxes': outputs['pred_boxes'],
-                'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
-                'aux_outputs': aux_outputs if use_aux is True else None,
-            }
-            if obj_logits_final is not None:
-                criterion_pred['pred_objectness_logits'] = obj_logits_final
+            if self.train_mask:
+                criterion_pred = {
+                    'pred_logits': query_cls_results_final,
+                    'pred_masks': outputs["pred_masks"],
+                    'pred_boxes': outputs['pred_boxes'],
+                    'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
+                    'aux_outputs': aux_outputs if use_aux is True else None,
+                }
+                if obj_logits_final is not None:
+                    criterion_pred['pred_objectness_logits'] = obj_logits_final
 
 
-            losses = self.criterion(criterion_pred, targets)
+                fcclip_losses = self.criterion(criterion_pred, targets)
 
+
+                for k in list(fcclip_losses.keys()):
+                    # print("loss:", k, losses[k].item())
+                    if k in self.criterion.weight_dict:
+                        fcclip_losses[k] *= self.criterion.weight_dict[k]
+                    else:
+                        # remove this loss if not specified in `weight_dict`
+                        fcclip_losses.pop(k)
+
+                losses.update(fcclip_losses)
+
+            if self.use_MaskAdapter:
+                mask_adapter_losses = {}
+
+                img_feat_for_pool = backbone_out_vision['vit_feature']
+                # print("img_feat_for_pool shape:", img_feat_for_pool.shape)
+                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                targets, masks, labels = self.prepare_targets_for_maskadapter(gt_instances, images)
+
+                mask_pred_results = outputs["pred_masks"]
+                mask_cls_results = query_cls_results_final
+
+                src_masks, target_masks, mask_labels = self.match_via_iou(mask_pred_results, mask_cls_results, targets, iou_threshold=self.iou_threshold,max_matches=self.num_pred_masks)
+                binary_src_masks = src_masks.sigmoid() > self.mask_threshold
+                binary_src_masks = binary_src_masks.float()
+
+                binary_src_masks = F.interpolate(binary_src_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+                target_masks = F.interpolate(target_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+
+                mask_pred = torch.cat((masks, binary_src_masks, target_masks),dim=1)
+                all_labels = torch.cat((labels, mask_labels, mask_labels),dim=1)
+                    
+                # maps_for_pooling = self.mask_adapter(img_feat_for_pool, mask_pred)
+                maps_for_pooling = []
+                for i in range(bs):
+                    maps_for_pooling_batch = self.mask_adapter(img_feat_for_pool[i:i+1, :, :, :], mask_pred[i:i+1, :, :, :])
+                    maps_for_pooling.append(maps_for_pooling_batch)
+                maps_for_pooling = torch.cat(maps_for_pooling, dim=0)
                 
-                                                
+                maps_for_pooling = F.interpolate(maps_for_pooling, size=img_feat_for_pool.shape[-2:],
+                                                    mode='bilinear', align_corners=False)
 
-            for k in list(losses.keys()):
-                # print("loss:", k, losses[k].item())
-                if k in self.criterion.weight_dict:
-                    losses[k] *= self.criterion.weight_dict[k]
-                else:
-                    # remove this loss if not specified in `weight_dict`
-                    losses.pop(k)
+            
+                N = maps_for_pooling.size(1)
+                num_instances = N // self.num_output_maps
+                maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N,-1), dim=-1)
+                pooled_img_feature = torch.bmm(maps_for_pooling, img_feat_for_pool.view(bs, img_feat_for_pool.size(1), -1).permute(0, 2, 1))
+                pooled_img_feature = (pooled_img_feature.reshape(bs, num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
+
+                loss_cosine_similarity = self.cosine_similarity_loss(pooled_img_feature[:, 16:24, :], pooled_img_feature[:, 24:, :])
+
+                # text_classifier, num_templates = self.get_text_classifier(dataname)
+                mask_cls_results = get_classification_logits(pooled_img_feature, text_classifier, self.dino().clip_model.logit_scale, num_templates)
+
+                loss_mask_cls = self.cross_entropy_loss(mask_cls_results, all_labels)
+
+                mask_adapter_losses.update(loss_cosine_similarity)
+                mask_adapter_losses.update(loss_mask_cls)
+
+                for k in list(mask_adapter_losses.keys()):
+                    # print("loss:", k, losses[k].item())
+                    if k in self.mask_adapter_weight_dict:
+                        mask_adapter_losses[k] *= self.mask_adapter_weight_dict[k]
+                    else:
+                        # remove this loss if not specified in `weight_dict`
+                        mask_adapter_losses.pop(k)
+
+                losses.update(mask_adapter_losses)
             
             if self.encoder_loss:
                 encoder_outputs = {'pred_logits': encoder_cls_logits, 'pred_boxes': encoder_box}
@@ -1176,94 +1393,104 @@ class DINOSAM(nn.Module):
             # ==========================================
             # 2. 提取特征
             # ==========================================
-
+            # 释放不再需要的显存大户
+            if 'backbone_out' in locals(): del backbone_out
+            if 'encoder_out' in locals(): del encoder_out
+            if 'fusion_feat' in locals(): del fusion_feat
+            if 'backbone_fpn' in locals(): del backbone_fpn
+            # 强制清理 CUDA 缓存（虽然有开销，但能有效防止 OOM）
+            torch.cuda.empty_cache()
 
             if self.use_MaskAdapter:
-                raise NotImplementedError("Mask Adapter 逻辑尚未实现，后续版本将提供支持。")
-                # binary_masks = outputs["pred_masks"] > 0
-                # maps_for_pooling = self.mask_adapter(clip_vis_dense, binary_masks)
-                # maps_for_pooling = F.interpolate(maps_for_pooling, size=clip_vis_dense.shape[-2:],
-                #                             mode='bilinear', align_corners=False)
-                # N_maps = maps_for_pooling.size(1)
-                # num_instances = N_maps // self.num_output_maps
-                # maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N_maps,-1), dim=-1)
-                # pooled_clip_feature = torch.bmm(maps_for_pooling, clip_feature.view(bs, clip_feature.size(1), -1).permute(0, 2, 1))
-                # pooled_clip_feature = self.backbone2.visual_prediction_forward(pooled_clip_feature)
-                # pooled_clip_feature = (pooled_clip_feature.reshape(bs,num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
-                # pooled_img_feat = pooled_clip_feature
-                # pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
+                mask_cls_results = outputs["pred_logits"]
+                mask_pred_results = outputs["pred_masks"]
+
+                img_feat_for_pool = backbone_out_vision['vit_feature']
+
+                binary_masks = mask_pred_results.sigmoid() > self.mask_threshold
+                
+                # maps_for_pooling = self.mask_adapter(img_feat_for_pool, binary_masks)
+                adapter_batchsize = 32
+                maps_for_pooling_list = []
+                for i in range(0, mask_pred_results.shape[1], adapter_batchsize):
+                    batch_binary_masks = binary_masks[:, i:i+adapter_batchsize, :, :]
+                    maps_for_pooling_batch = self.mask_adapter(img_feat_for_pool, batch_binary_masks)
+                    maps_for_pooling_list.append(maps_for_pooling_batch)
+                maps_for_pooling = torch.cat(maps_for_pooling_list, dim=1)
+
+                maps_for_pooling = F.interpolate(maps_for_pooling, size=img_feat_for_pool.shape[-2:],
+                                            mode='bilinear', align_corners=False)
+                N_maps = maps_for_pooling.size(1)
+                num_instances = N_maps // self.num_output_maps
+                maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N_maps,-1), dim=-1)
+                pooled_img_feature = torch.bmm(maps_for_pooling, img_feat_for_pool.view(bs, img_feat_for_pool.size(1), -1).permute(0, 2, 1))
+                pooled_img_feature = (pooled_img_feature.reshape(bs,num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
+                pooled_img_feat = pooled_img_feature
+                pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
+
+
             else:
                 img_feat_for_pool = backbone_out_vision['vit_feature']
-                
+                mask_for_pool = F.interpolate(outputs["pred_masks"], size=img_feat_for_pool.shape[-2:],
+                                                    mode='bilinear', align_corners=False)
+                pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
+                pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
 
-                # mask_for_pool = F.interpolate(outputs["pred_masks"], size=img_feat_for_pool.shape[-2:],
-                #                                     mode='bilinear', align_corners=False)
-                # pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
-                # pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
+            # text_classifier, num_templates = self.get_text_classifier(dataname)
 
-                text_classifier, num_templates = self.get_text_classifier(dataname)
+            maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier, pooled_img_feat) 
 
-                img_feat_for_pool = F.normalize(img_feat_for_pool, dim=1, p=2)
+            maskpool_name_logits = maskpool_name_logits * torch.clamp(self.dino().clip_model.logit_scale.exp(), max=100)
+            
+            maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
+                            
+            
+            if self.use_softmax:
+                is_void_prob = F.softmax(query_cls_results_final, dim=-1)[..., -1:]
+                in_vocab_cls_results = query_cls_results_final[..., :-1] 
+                in_vocab_cls_probs = in_vocab_cls_results.softmax(-1)
+                out_vocab_cls_probs = maskpool_cls_logits[..., :-1].softmax(-1)
+            else:
+                in_vocab_cls_probs = torch.sigmoid(query_cls_results_final)
+                out_vocab_cls_probs = F.softmax(maskpool_cls_logits, dim=-1)
+            category_overlapping_mask = self.category_overlapping_mask.to(self.device)
+            alpha = self.alpha
+            beta = self.beta
+            # 为了数值稳定性，加一个小 epsilon
+            eps = 1e-7 
 
-                zs_semseg = torch.einsum("bdhw, cd->bhwc", img_feat_for_pool, text_classifier) # bs, H', W', C
+            # 计算 Seen 类的加权几何平均概率
+            probs_seen = (
+                (in_vocab_cls_probs + eps) ** (1 - alpha) * 
+                (out_vocab_cls_probs + eps) ** alpha
+            )
+            
+            # 计算 Unseen 类的加权几何平均概率
+            probs_unseen = (
+                (in_vocab_cls_probs + eps) ** (1 - beta) * 
+                (out_vocab_cls_probs + eps) ** beta
+            )
 
-                zs_semseg = aggregate_name_to_class_logits(zs_semseg, num_templates) # bs, H', W', num_classes
+            ensemble_logits = (
+                probs_seen.log() * category_overlapping_mask + 
+                probs_unseen.log() * (1 - category_overlapping_mask)
+            )
 
-                # maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier, pooled_img_feat) 
+            final_probs = torch.cat([
+                ensemble_logits.softmax(-1) * (1.0 - is_void_prob), 
+                is_void_prob
+            ], dim=-1)
 
-                # maskpool_name_logits = maskpool_name_logits * torch.clamp(self.detector.backbone.vision_backbone.trunk.dino.clip_model.logit_scale.exp(), max=100)
-                
-                # maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
-                                
-                
-                # if self.use_softmax:
-                #     is_void_prob = F.softmax(query_cls_results_final, dim=-1)[..., -1:]
-                #     in_vocab_cls_results = query_cls_results_final[..., :-1] 
-                #     in_vocab_cls_probs = in_vocab_cls_results.softmax(-1)
-                #     out_vocab_cls_probs = maskpool_cls_logits.softmax(-1)
-                # else:
-                #     in_vocab_cls_probs = torch.sigmoid(query_cls_results_final)
-                #     out_vocab_cls_probs = F.softmax(maskpool_cls_logits, dim=-1)
-                # category_overlapping_mask = self.category_overlapping_mask.to(self.device)
-                # alpha = self.alpha
-                # beta = self.beta
-                # # 为了数值稳定性，加一个小 epsilon
-                # eps = 1e-7 
-
-                # # 计算 Seen 类的加权几何平均概率
-                # probs_seen = (
-                #     (in_vocab_cls_probs + eps) ** (1 - alpha) * 
-                #     (out_vocab_cls_probs + eps) ** alpha
-                # )
-                
-                # # 计算 Unseen 类的加权几何平均概率
-                # probs_unseen = (
-                #     (in_vocab_cls_probs + eps) ** (1 - beta) * 
-                #     (out_vocab_cls_probs + eps) ** beta
-                # )
-
-                # ensemble_logits = (
-                #     probs_seen.log() * category_overlapping_mask + 
-                #     probs_unseen.log() * (1 - category_overlapping_mask)
-                # )
-
-                # final_probs = torch.cat([
-                #     ensemble_logits.softmax(-1) * (1.0 - is_void_prob), 
-                #     is_void_prob
-                # ], dim=-1)
-
-                # query_cls_results_final = torch.log(final_probs + 1e-8)
+            query_cls_results_final = torch.log(final_probs + 1e-8)
 
 
 
             # ====================== Oracle 逻辑 ====================== 
-            self.OracleSelect_on = False# 你可以从cfg配置中读取此开关
 
             if self.OracleSelect_on:
                 # 临时构造 outputs 字典，用于传递给 oracle 函数
                 temp_outputs = {
                     "pred_masks": outputs["pred_masks"],
-                    # pred_logits 仅用于获取形状，其内容不参与计算
                     "pred_logits": query_cls_results_final 
                 }
                 
@@ -1273,25 +1500,25 @@ class DINOSAM(nn.Module):
                     batched_inputs, 
                     images
                 )
+
+                oracle_probs = F.softmax(oracle_logits, dim=-1)
                 
-                # 直接用 oracle logits 替换模型原来的分类结果
-                query_cls_results_final = oracle_logits
+                final_oracle_probs = oracle_probs * (1.0 - is_void_prob)
+                final_oracle_probs[..., -1] += is_void_prob.squeeze(-1)
 
-
-            zs_semseg = zs_semseg.permute(0, 3, 1, 2) 
-            print("zs_semseg shape after permute:", zs_semseg.shape) # bs, num_classes, H', W'
+                query_cls_results_final = torch.log(final_oracle_probs + 1e-8)
         # =======================================================
         
-            # mask_cls_logits = query_cls_results_final # 保持 Logits 状态
-            # mask_pred_logits = outputs["pred_masks"]  # 保持 Logits 状态
+            mask_cls_logits = query_cls_results_final # 保持 Logits 状态
+            mask_pred_logits = outputs["pred_masks"]  # 保持 Logits 状态
 
 
             results = []
             
             for i in range(bs):
                 # 获取单张图数据
-                # mask_cls_i = mask_cls_logits[i]       # [Q, C]
-                # mask_pred_i = mask_pred_logits[i]     # [Q, H, W]
+                mask_cls_i = mask_cls_logits[i]       # [Q, C]
+                mask_pred_i = mask_pred_logits[i]     # [Q, H, W]
                 
                 # 获取原始图像尺寸
                 img_h_orig = batched_inputs[i]["height"]
@@ -1299,25 +1526,22 @@ class DINOSAM(nn.Module):
                 
                 # 上采样 Mask 到原始图像尺寸 (非常重要)
                 # 使用 bilinear 插值 logits
-                # mask_pred_i = F.interpolate(
-                #     mask_pred_i.unsqueeze(0), 
-                #     size=(img_h_orig, img_w_orig), 
-                #     mode="bilinear", 
-                #     align_corners=False
-                # ).squeeze(0)
+                mask_pred_i = F.interpolate(
+                    mask_pred_i.unsqueeze(0), 
+                    size=(img_h_orig, img_w_orig), 
+                    mode="bilinear", 
+                    align_corners=False
+                ).squeeze(0)
 
                 res = {}
 
                 # --- A. 语义分割 (Semantic Segmentation) ---
                 if self.semantic_on:
-                    # # 使用你原来的逻辑，但注意输入变成了 logits
-                    # mask_cls_prob = F.softmax(mask_cls_i, dim=-1)[..., :-1]
-                    # mask_pred_prob = mask_pred_i.sigmoid()
-                    # semseg = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_prob)
-                    # res["sem_seg"] = semseg
-                    current_zs_logits = zs_semseg[i]
-
-                    
+                    # 使用你原来的逻辑，但注意输入变成了 logits
+                    mask_cls_prob = F.softmax(mask_cls_i, dim=-1)[..., :-1]
+                    mask_pred_prob = mask_pred_i.sigmoid()
+                    semseg = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_prob)
+                    res["sem_seg"] = semseg
 
                     # =========== 修改开始：为可视化准备 Square 数据 ===========
                     
@@ -1327,26 +1551,17 @@ class DINOSAM(nn.Module):
                     
                     # 2. 将 Logits 插值到 Tensor 尺寸 (而不是原图尺寸)
                     # 注意：这里要用原始的 mask_pred_logits[i]，不要用已经 resize 过的 mask_pred_i
-                    logits_square = F.interpolate(
-                        current_zs_logits.unsqueeze(0), # [1, C, H, W]
+                    mask_pred_i_square = F.interpolate(
+                        mask_pred_logits[i].unsqueeze(0), 
                         size=(tensor_h, tensor_w), 
                         mode="bilinear", 
                         align_corners=False
-                    ).squeeze(0) # [C, tensor_h, tensor_w]
-
-
-
-                    res["sem_seg"] =  F.interpolate(
-                        logits_square.unsqueeze(0), # [1, C, H, W]
-                        size=(img_h_orig, img_w_orig),
-                        mode="bilinear",
-                        align_corners=False
-                    ).squeeze(0)
+                    ).squeeze(0).sigmoid()
                     
                     # 3. 计算 Square 的语义分割结果
-                    # semseg_square = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_i_square)
-                    # pred_result_square = semseg_square.argmax(0).cpu()
-                    pred_result_square = logits_square.argmax(0).cpu()
+                    semseg_square = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_i_square)
+                    pred_result_square = semseg_square.argmax(0).cpu()
+
                     # 5. 准备 Image (它本身就是 Square 的)
                     img_tensor_square = batched_inputs[i]["image"]
 
@@ -1364,7 +1579,7 @@ class DINOSAM(nn.Module):
 
                     # 7. 绘图 (全部传入 Square 的数据)
                     visualize_semantic = False
-                    visualize_semantic = True
+                    # visualize_semantic = True
 
                     if visualize_semantic:
                         visualize_segmentation(
@@ -1376,22 +1591,22 @@ class DINOSAM(nn.Module):
                         )
                 #     # =========== 修改结束 ===========
 
-                # # --- B. 全景分割 (Panoptic Segmentation) ---
-                # if self.panoptic_on:
-                #     excluded_datasets = ["lvis_v1_val", "lvis_v1_train"]
+                # --- B. 全景分割 (Panoptic Segmentation) ---
+                if self.panoptic_on:
+                    excluded_datasets = ["lvis_v1_val", "lvis_v1_train"]
                     
-                #     if dataname not in excluded_datasets:
-                #         panoptic_seg, segments_info = self.panoptic_inference(
-                #             mask_cls_i, mask_pred_i, dataname
-                #         )
-                #         res["panoptic_seg"] = (panoptic_seg, segments_info)
+                    if dataname not in excluded_datasets:
+                        panoptic_seg, segments_info = self.panoptic_inference(
+                            mask_cls_i, mask_pred_i, dataname
+                        )
+                        res["panoptic_seg"] = (panoptic_seg, segments_info)
                 
-                # # --- C. 实例分割 (Instance Segmentation) ---
-                # if self.instance_on:
-                #     instances = self.instance_inference(
-                #         mask_cls_i, mask_pred_i, dataname
-                #     )
-                #     res["instances"] = instances
+                # --- C. 实例分割 (Instance Segmentation) ---
+                if self.instance_on:
+                    instances = self.instance_inference(
+                        mask_cls_i, mask_pred_i, dataname
+                    )
+                    res["instances"] = instances
 
                 results.append(res)
 
@@ -1689,62 +1904,32 @@ class DINOSAM(nn.Module):
         return result
 
 
-    @torch.no_grad()
-    def match_via_iou(self, mask_pred_results, targets, extra_pred_info=None, extra_gt_info=None, iou_threshold=0.7, max_matches=8):
-        """
-        Args:
-            mask_pred_results: [B, Q, H, W] 预测的掩码
-            targets: List[Dict], 包含 'labels', 'masks'
-            
-            extra_pred_info: Dict[str, Tensor]
-                             Tensor 形状为 [B, Q, ...] (例如 Query Embeddings)
-                             
-            extra_gt_info:   Dict[str, List[Tensor]]
-                             List 长度为 B。每个元素是 Tensor，形状为 [Num_GTs_in_image, ...]
-                             (例如 GT 的 CLIP 特征，或 OCR 文本特征)
-            
-            iou_threshold:   IoU 阈值
-            max_matches:     每张图保留的最大匹配对数
-        """
+    @torch.no_grad()                            
+    def match_via_iou(self, mask_pred_results, mask_cls_results, targets, iou_threshold=0.7, max_matches=8):
         batch_size = mask_pred_results.shape[0]
-        
-        # --- 初始化输出容器 ---
         matched_src_masks = []
         matched_target_masks = []
         matched_labels = []
+
         
-        # 初始化额外信息的输出字典
-        # 结构: {"key": [Tensor_B1, Tensor_B2, ...]} -> 最后 stack
-        matched_pred_out = {}
-        if extra_pred_info is not None:
-            for k in extra_pred_info.keys():
-                matched_pred_out[k] = []
-
-        matched_gt_out = {}
-        if extra_gt_info is not None:
-            for k in extra_gt_info.keys():
-                matched_gt_out[k] = []
-
         for b in range(batch_size):
-            # --- 1. 获取当前 Batch 的基础数据 ---
-            tgt_label = targets[b]["labels"]
-            tgt_mask = targets[b]["masks"].to(mask_pred_results.device)
+            tgt_label = targets[b]["labels"] 
+            tgt_mask = targets[b]["masks"].to(mask_pred_results.device)  
             num_tgt_masks = tgt_mask.shape[0]
 
-            pred_mask = mask_pred_results[b]  # [Q, H, W]
-            
-            # --- 2. 计算 IoU ---
-            # 对齐尺寸
-            tgt_mask_interp = F.interpolate(tgt_mask[:, None].float(), size=pred_mask.shape[-2:], mode='bilinear', align_corners=False).squeeze(1)
-            
+            pred_mask = mask_pred_results[b] 
+            pred_cls = mask_cls_results[b]  
+            num_pred_masks = pred_mask.shape[0]
+
+            tgt_mask = F.interpolate(tgt_mask[:, None].float(), size=pred_mask.shape[-2:], mode='bilinear', align_corners=False).squeeze(1)
+
             pred_mask_flat = pred_mask.flatten(1)
-            tgt_mask_flat = tgt_mask_interp.flatten(1)
+            tgt_mask_flat = tgt_mask.flatten(1)
 
             with torch.no_grad():
                 ious = compute_mask_iou(pred_mask_flat, tgt_mask_flat)
 
-            # --- 3. 筛选与匹配逻辑 ---
-            matched_pred_idx = [] 
+            matched_pred_idx = []
             matched_tgt_idx = []
             
             for j in range(num_tgt_masks):
@@ -1755,77 +1940,37 @@ class DINOSAM(nn.Module):
                     matched_pred_idx.append(best_pred_idx.item())
                     matched_tgt_idx.append(j)
 
-            # --- 4. 截断逻辑 (不能超过 max_matches) ---
+
             if len(matched_pred_idx) > max_matches:
                 selected_indices = torch.randperm(len(matched_pred_idx))[:max_matches]
                 matched_pred_idx = [matched_pred_idx[i] for i in selected_indices]
                 matched_tgt_idx = [matched_tgt_idx[i] for i in selected_indices]
 
-            # 准备 Tensor 类型的索引，用于切片
-            idx_p = torch.as_tensor(matched_pred_idx, dtype=torch.long, device=pred_mask.device)
-            idx_t = torch.as_tensor(matched_tgt_idx, dtype=torch.long, device=tgt_mask.device)
-            
-            num_current = len(matched_pred_idx)
-            num_to_add = max_matches - num_current
+            if len(matched_pred_idx) < max_matches:
+                num_to_add = max_matches - len(matched_pred_idx)
+                
+                matched_src_masks.append(
+                    torch.cat([pred_mask[matched_pred_idx], 
+                            torch.zeros((num_to_add, *pred_mask.shape[1:]), device=pred_mask.device)], dim=0)
+                )
+                matched_target_masks.append(
+                    torch.cat([tgt_mask[matched_tgt_idx], 
+                            torch.zeros((num_to_add, *tgt_mask.shape[1:]), device=tgt_mask.device)], dim=0)
+                )
+                matched_labels.append(
+                    torch.cat([tgt_label[matched_tgt_idx], 
+                            torch.full((num_to_add,), -1, dtype=tgt_label.dtype, device=tgt_label.device)], dim=0)
+                )
+            else:
+                matched_src_masks.append(pred_mask[matched_pred_idx])
+                matched_target_masks.append(tgt_mask[matched_tgt_idx])
+                matched_labels.append(tgt_label[matched_tgt_idx])
 
-            # --- 5. 填充与组合 (Padding & Concatenation) ---
-            
-            # Helper: 如果不够 max_matches，生成 padding 并拼接；否则直接切片
-            def process_tensor(tensor_data, indices, pad_value=0):
-                # tensor_data: [N, ...]
-                selected = tensor_data[indices] # [K, ...]
-                if num_to_add > 0:
-                    pad_shape = (num_to_add, *tensor_data.shape[1:])
-                    # 处理 padding 值 (通常是0，label是-1)
-                    if pad_value == 0:
-                        padding = torch.zeros(pad_shape, dtype=tensor_data.dtype, device=tensor_data.device)
-                    else:
-                        padding = torch.full(pad_shape, pad_value, dtype=tensor_data.dtype, device=tensor_data.device)
-                    return torch.cat([selected, padding], dim=0)
-                return selected
-
-            # A. 基础 mask 和 label
-            matched_src_masks.append(process_tensor(pred_mask, idx_p, pad_value=0))
-            matched_target_masks.append(process_tensor(tgt_mask, idx_t, pad_value=0))
-            matched_labels.append(process_tensor(tgt_label, idx_t, pad_value=-1))
-
-            # B. 处理 Pred Info (形状 [Q, ...])
-            if extra_pred_info is not None:
-                for k, v in extra_pred_info.items():
-                    # v[b] 是当前图片的 Pred 特征
-                    matched_pred_out[k].append(process_tensor(v[b], idx_p, pad_value=0))
-            
-            # C. 处理 GT Info (形状 [Num_GT, ...])
-            if extra_gt_info is not None:
-                for k, v_list in extra_gt_info.items():
-                    # v_list[b] 是当前图片的 GT 特征
-                    curr_gt_feat = v_list[b].to(mask_pred_results.device) # 确保设备一致
-                    matched_gt_out[k].append(process_tensor(curr_gt_feat, idx_t, pad_value=0))
-
-        # --- 6. 堆叠 (Stacking) ---
         matched_src_masks = torch.stack(matched_src_masks, dim=0) 
         matched_target_masks = torch.stack(matched_target_masks, dim=0)
         matched_labels = torch.stack(matched_labels, dim=0)
         
-        final_pred_dict = {}
-        if extra_pred_info is not None:
-            for k, v_list in matched_pred_out.items():
-                final_pred_dict[k] = torch.stack(v_list, dim=0)
-
-        final_gt_dict = {}
-        if extra_gt_info is not None:
-            for k, v_list in matched_gt_out.items():
-                final_gt_dict[k] = torch.stack(v_list, dim=0)
-
-        return matched_src_masks, matched_target_masks, matched_labels, final_pred_dict, final_gt_dict
-
-    def cosine_similarity_loss(self, pred_features, gt_features):
-    
-        cosine_similarity_loss = {}
-        
-        cosine_sim = F.cosine_similarity(pred_features, gt_features, dim=-1)
-        cosine_similarity_loss[f"loss_cosine"] = 1 - cosine_sim.mean()
-        return cosine_similarity_loss
+        return matched_src_masks, matched_target_masks, matched_labels
 
     def cross_entropy_loss(self, mask_cls_results, labels):
         
@@ -1837,27 +1982,58 @@ class DINOSAM(nn.Module):
         losses = {"loss_ce": loss_ce}
         return losses
     
+    def cosine_similarity_loss(self, pred_features, gt_features):
+    
+        cosine_similarity_loss = {}
+        
+        cosine_sim = F.cosine_similarity(pred_features, gt_features, dim=-1)
+        cosine_similarity_loss[f"loss_cosine"] = 1 - cosine_sim.mean()
+        return cosine_similarity_loss
 
 def aggregate_name_to_class_logits(query_names_results, num_templates):
     """
     将包含同义词/模板的 name logits 转化为唯一类别的 class logits。
     
+    兼容情况：如果 query_names_results 比 num_templates 总和多一位，
+    则视为最后一位是 void/background 类，并将其保留在输出中。
+    
     参数:
         query_names_results (torch.Tensor): 形状为 [bs, N, total_names] 的张量
-        num_templates (list[int]): 每个类别包含的名称/模板数量列表，长度为 num_classes
+        num_templates (list[int]): 每个类别包含的名称/模板数量列表
         
     返回:
-        query_cls_results (torch.Tensor): 形状为 [bs, N, num_classes] 的张量
+        query_cls_results (torch.Tensor): 形状为 [bs, N, num_classes (+1 if void exists)]
     """
-    # 使用 torch.split 根据每个类别的模板数量对最后一维进行拆分
-    # 这会返回一个包含多个张量的 list，每个张量形状为 [bs, N, num_t]
-    name_splits = torch.split(query_names_results, num_templates, dim=-1)
+    input_dim = query_names_results.shape[-1]
+    expected_dim = sum(num_templates)
     
-    # 对每个分块取最大值 (max pooling over synonyms/templates)
-    # s.max(-1).values 得到形状为 [bs, N] 的张量
+    # 复制一份 list，避免修改原处的 num_templates
+    split_sections = list(num_templates)
+    
+    # 逻辑判断：是否多出一位 (void class)
+    if input_dim == expected_dim + 1:
+        # 如果输入维度比模板总数多 1，说明末尾包含了 void logit
+        # 我们在切分方案中追加一个 [1]，把它单独切出来
+        split_sections.append(1)
+    elif input_dim != expected_dim:
+        # 如果维度既不相等，也不是只差 1，则抛出异常（可能是其他逻辑错误）
+        raise RuntimeError(
+            f"Dimension mismatch in aggregate_name_to_class_logits: "
+            f"Tensor last dim is {input_dim}, but sum(num_templates) is {expected_dim}. "
+            "Expected equal or +1 (for void class)."
+        )
+
+    # 1. 使用 torch.split 进行切分
+    # 如果有 void，split_sections 最后一位是 1，正好把 void logit 单独切成一个 tensor
+    name_splits = torch.split(query_names_results, split_sections, dim=-1)
+    
+    # 2. 对每个分块取最大值 (max pooling)
+    # 对于正常的类别：[bs, N, k] -> max -> [bs, N]
+    # 对于 void 类别：[bs, N, 1] -> max -> [bs, N] (值不变，只是降维)
     cls_logits_list = [s.max(dim=-1).values for s in name_splits]
     
-    # 在最后一维堆叠，得到 [bs, N, num_classes]
+    # 3. 在最后一维堆叠
+    # 结果形状: [bs, N, num_classes] 或 [bs, N, num_classes + 1]
     query_cls_results = torch.stack(cls_logits_list, dim=-1)
     
     return query_cls_results

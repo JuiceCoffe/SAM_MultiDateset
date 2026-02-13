@@ -103,12 +103,12 @@ class TextTower(nn.Module):
 
     def forward(self, token_indices: torch.Tensor) -> torch.Tensor:
         text_tokens = self.backbone(token_indices)
-        text_tokens = self.head(text_tokens)
+        text_tokens = self.head(text_tokens) # 128, 77, 2048
         if self.tokens_pooler_type == "first":
             features = text_tokens[:, 0]
         elif self.tokens_pooler_type == "last":
             features = text_tokens[:, -1]
-        elif self.tokens_pooler_type == "argmax":
+        elif self.tokens_pooler_type == "argmax": # 走的是这一条
             assert token_indices is not None
             features = text_tokens[
                 torch.arange(text_tokens.shape[0]), token_indices.argmax(dim=-1)
