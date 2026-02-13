@@ -50,7 +50,7 @@ SOLVER:
   LR_SCHEDULER_NAME: WarmupPolyLR
   STEPS: (30000, 60000)
   MAX_ITER: 90000
-  CHECKPOINT_PERIOD: 3750
+  CHECKPOINT_PERIOD: 7500
   
 
   CLASS_WEIGHT: 2.0
@@ -99,7 +99,7 @@ DATALOADER:
   USE_DIFF_BS_SIZE: True
 
 TEST:
-  EVAL_PERIOD: 50
+  EVAL_PERIOD: 7500
   INSTANCE_ON: True   
   PANOPTIC_ON: True   
   SEMANTIC_ON: True   
@@ -107,6 +107,6 @@ TEST:
 # 修改输出目录名称以区分实验
 VERSION: 2
 
-OUTPUT_DIR: ./out/test/
-# OUTPUT_DIR: ./out/DINOSAM/copa_SAMtext_box_oracle
+# OUTPUT_DIR: ./out/test/
+OUTPUT_DIR: ./out/DINOSAM/copa_DINOtext_oracle
   
