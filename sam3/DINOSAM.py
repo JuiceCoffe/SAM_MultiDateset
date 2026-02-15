@@ -1652,7 +1652,7 @@ class DINOSAM(nn.Module):
             results = []
 
             VISUALIZE_ATTENTION = False
-            # VISUALIZE_ATTENTION = True
+            VISUALIZE_ATTENTION = True
             VIS_SAVE_ROOT = "./attnmap"
     
             
@@ -2323,7 +2323,7 @@ class DINOSAM(nn.Module):
                 q_fg_prob = curr_fg_probs[q_idx].item()
                 
                 # 过滤逻辑
-                if q_iou < 0.1 and q_fg_prob < 0.1 and rank > 50: 
+                if q_fg_prob < 0.2: 
                     continue
                 
                 # 获取 Query 分类信息
@@ -2355,19 +2355,41 @@ class DINOSAM(nn.Module):
                 # 绘图
                 fig, ax = plt.subplots(1, 2, figsize=(16, 8))
                 
+                # 调整子图布局，为顶部的文本框留出空间
+                fig.subplots_adjust(top=0.88)
+
+                # 左图：预测的 Mask
                 ax[0].imshow(mask_vis)
-                title_str = f"Rank: {rank} | IoU: {q_iou:.2f} | FG Prob: {q_fg_prob:.2f}\n{cls_str}"
-                ax[0].set_title(title_str, loc='left', fontsize=12, fontweight='bold')
+                # 将 Rank 和 Top-5 分类信息放在左上角标题
+                title_str = f"Rank: {rank}\nTop-5 Classes:\n{cls_str.strip()}"
+                ax[0].set_title(title_str, loc='left', fontsize=11, fontweight='bold')
                 ax[0].axis('off')
                 
+                # 右图：Cross Attention Map
                 ax[1].imshow(attn_vis[:, :, ::-1])
                 ax[1].set_title("Cross Attention Map", fontsize=15)
                 ax[1].axis('off')
                 
+                # --- 修改后的代码：在 Figure 的右上角添加文本框 ---
+                # 准备要显示的文本和样式
+                info_text = f"IoU: {q_iou:.3f}\nFG Prob: {q_fg_prob:.3f}"
+                bbox_props = dict(boxstyle="round,pad=0.4", fc="ivory", ec="black", lw=1, alpha=0.9)
+
+                # 使用 fig.text() 在 Figure 坐标系中添加文本
+                # (0,0) 是画布左下角, (1,1) 是画布右上角
+                fig.text(0.98, 0.97, info_text,         # 坐标 (x, y)
+                         transform=fig.transFigure,     # 指定使用 Figure 坐标系
+                         fontsize=10,
+                         fontweight='bold',
+                         color='black',
+                         verticalalignment='top',       # 垂直对齐方式
+                         horizontalalignment='right',   # 水平对齐方式
+                         bbox=bbox_props)               # 应用文本框样式
+                # --- 修改结束 ---
+                
                 save_name = f"{rank:03d}_iou_{q_iou:.2f}_prob_{q_fg_prob:.2f}_query_{q_idx}.jpg"
-                plt.tight_layout()
                 plt.savefig(os.path.join(save_dir, save_name))
-                plt.close()
+                plt.close(fig) # 确保关闭 figure 释放内存
                 
         print(f"Visualization saved to {save_root}")
 
