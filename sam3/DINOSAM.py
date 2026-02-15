@@ -2146,6 +2146,7 @@ class DINOSAM(nn.Module):
         import numpy as np
         from torch.nn import functional as F
         import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle # 用于绘制图例
         
         os.makedirs(save_root, exist_ok=True)
         
@@ -2155,7 +2156,7 @@ class DINOSAM(nn.Module):
         
         # 获取 Attention weights
         if cross_attn_weights is not None:
-            print("cross_attn_weights:",cross_attn_weights.shape)
+            # print("cross_attn_weights:",cross_attn_weights.shape)
             attn_weights = cross_attn_weights[-1] # 取最后一层
         else:
             print("cross_attn_weights is None.")
@@ -2165,7 +2166,7 @@ class DINOSAM(nn.Module):
         
         # 推断 Feature map 尺寸
         num_patches = attn_weights.shape[-1]
-        feat_h ,feat_w = dino_pixel_feat.
+        feat_h ,feat_w = dino_pixel_feat.shape[-2:]
 
         # 获取数据集信息和类别名
         dataname = get_dataname(batched_inputs[0])
@@ -2180,14 +2181,14 @@ class DINOSAM(nn.Module):
             class_names = meta.thing_classes
             
         # 准备逐像素预测所需的文本分类器
-        # 注意：这里需要在循环外获取，避免重复计算
         text_classifier, num_templates = self.get_text_classifier(dataname)
         text_classifier = text_classifier.to(self.device)
 
-        # 生成一个固定的随机颜色调色板用于逐像素预测可视化
+        # 生成颜色调色板
         # size: [num_classes + 1, 3]
         np.random.seed(42)
-        color_palette = np.random.randint(0, 255, size=(len(class_names) + 1, 3), dtype=np.uint8)
+        # 确保颜色鲜艳，避免过暗
+        color_palette = np.random.randint(50, 255, size=(len(class_names) + 1, 3), dtype=np.uint8)
 
         for b in range(batch_size):
             file_name = batched_inputs[b]["file_name"].split('/')[-1].split('.')[0]
@@ -2197,64 +2198,42 @@ class DINOSAM(nn.Module):
             os.makedirs(save_dir)
 
             # --- A. 准备原图 ---
-            # permute [C, H, W] -> [H, W, C] & denormalize
             img_tensor = images.tensor[b].clone()
             img_tensor = (img_tensor * self.pixel_std + self.pixel_mean) * 255.0
             img_np = img_tensor.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
             img_h, img_w = img_np.shape[:2]
 
             # --- B. 计算逐像素预测 (Pixel-wise Prediction) ---
-            # 1. 取出当前 batch 的 feature: [C, H_feat, W_feat] (假设输入是这个形状)
             curr_feat = dino_pixel_feat[b] 
-            
-            # 2. 调整形状以进行矩阵乘法: [H_feat, W_feat, C]
-            # 如果输入已经是 HWC，则不需要 permute，请根据实际情况调整
-            if curr_feat.shape[0] == text_classifier.shape[1]: # C在第一维
+            if curr_feat.shape[0] == text_classifier.shape[1]: 
                 curr_feat = curr_feat.permute(1, 2, 0)
             
-            # 3. 归一化特征 (Cosine Similarity 前置步骤)
             curr_feat = F.normalize(curr_feat, dim=-1)
-            
-            # 4. 计算 Logits: [H_feat, W_feat, num_templates_total]
-            # text_classifier: [num_templates_total, C]
             pixel_logits = torch.einsum("hwc,nc->hwn", curr_feat, text_classifier)
-            
-            # 5. 聚合模版 (Aggregating templates to classes)
-            # aggregate 函数通常需要 batch 维度，unsqueeze 一下
-            pixel_logits = pixel_logits.unsqueeze(0) # [1, H, W, N_t]
+            pixel_logits = pixel_logits.unsqueeze(0) 
             pixel_cls_logits = aggregate_name_to_class_logits(pixel_logits, num_templates)
-            pixel_cls_logits = pixel_cls_logits.squeeze(0) # [H, W, N_classes]
+            pixel_cls_logits = pixel_cls_logits.squeeze(0)
             
-            # 6. Argmax 获取类别索引 [H_feat, W_feat]
             pixel_pred_idx = pixel_cls_logits.argmax(dim=-1).cpu().numpy().astype(np.uint8)
-            
-            # 7. Resize 到原图大小 (使用最近邻插值保持类别索引整数)
             pixel_pred_idx_resized = cv2.resize(pixel_pred_idx, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
-            
-            # 8. 映射颜色
-            # 如果索引超过颜色盘大小，取模防止越界
             pixel_vis = color_palette[pixel_pred_idx_resized % len(color_palette)]
 
             # --- C. 计算每个 Query 与 GT 的最大 IoU ---
-            # pred_masks[b]: [Q, H, W]
-            # targets[b]["masks"]: [G, H, W]
             tgt_masks = targets[b]["masks"].float()
+            tgt_labels = targets[b]["labels"].cpu().numpy() # 获取 GT Labels
+            
             curr_pred_masks = pred_masks[b]
             
-            # 对齐尺寸用于计算 IoU
             if tgt_masks.shape[-2:] != curr_pred_masks.shape[-2:]:
                 tgt_masks_resized = F.interpolate(tgt_masks.unsqueeze(1), size=curr_pred_masks.shape[-2:], mode='nearest').squeeze(1)
             else:
                 tgt_masks_resized = tgt_masks
 
             if len(tgt_masks) > 0:
-                # 将布尔类型转换为浮点型，否则 torch.mm 会报错
-                flat_pred = (curr_pred_masks > 0.5).flatten(1).float() # 修改这里
-                flat_tgt = (tgt_masks_resized > 0.5).flatten(1).float() # 修改这里
+                flat_pred = (curr_pred_masks > 0.5).flatten(1).float()
+                flat_tgt = (tgt_masks_resized > 0.5).flatten(1).float()
                 
-                # 现在执行的是 float 类型的矩阵乘法，结果是 intersection 的像素个数
                 intersection = torch.mm(flat_pred, flat_tgt.t())
-                
                 area_pred = flat_pred.sum(1, keepdim=True)
                 area_tgt = flat_tgt.sum(1, keepdim=True)
                 union = area_pred + area_tgt.t() - intersection
@@ -2265,8 +2244,23 @@ class DINOSAM(nn.Module):
             else:
                 max_ious = torch.zeros(curr_pred_masks.shape[0], device=self.device)
 
-            # --- 排序 ---
-            sorted_indices = torch.argsort(max_ious, descending=True)
+            # --- D. 综合排序逻辑 ---
+            # 这里的 is_void_prob 应该是 logits 或者 probability
+            # 如果是 logits，记得 sigmoid。假设传入前已经处理或者直接读取
+            # 这里假设 is_void_prob 是 [B, Q, 1] 或 [B, Q] 的概率值 (0-1)
+            # 如果是 Logits: curr_void_prob = is_void_prob[b].sigmoid()
+            
+            # 安全起见，做一次 squeeze 和 sigmoid 检查 (根据你传入的数据类型调整)
+            curr_void_prob = is_void_prob[b].squeeze()
+            if curr_void_prob.max() > 1.0 or curr_void_prob.min() < 0.0: # 假设是 logits
+                 curr_void_prob = curr_void_prob.sigmoid()
+            
+            curr_fg_probs = 1.0 - curr_void_prob
+            
+            # 排序指标：IoU + Foreground_Prob (权重可以自己调，比如 0.7 * iou + 0.3 * prob)
+            # 这样既能排上来 IoU 高的（匹配对的），也能排上来 Prob 高的（模型自信的）
+            sort_metric = max_ious + curr_fg_probs.to(max_ious.device)
+            sorted_indices = torch.argsort(sort_metric, descending=True)
 
             # =================================================
             # 1. 绘制总览图 (Overview)
@@ -2275,23 +2269,48 @@ class DINOSAM(nn.Module):
             
             # Subplot 1: Original
             ax[0].imshow(img_np)
-            ax[0].set_title("Original Image")
+            ax[0].set_title("Original Image", fontsize=15)
             ax[0].axis('off')
             
-            # Subplot 2: GT Masks
+            # Subplot 2: GT Masks (带图例的彩色版)
             gt_vis = img_np.copy()
+            legend_elements = []
+            present_classes = set()
+            
             if len(tgt_masks) > 0:
+                # 为了可视化美观，创建一个全白的 mask canvas 或者直接在原图上叠加
+                # 这里选择在原图上叠加半透明 mask
                 tgt_masks_orig = F.interpolate(tgt_masks.unsqueeze(1), size=(img_h, img_w), mode='nearest').squeeze(1)
-                combined_mask = tgt_masks_orig.sum(0) > 0
-                # Green overlay for GT
-                gt_vis[combined_mask.cpu().numpy()] = gt_vis[combined_mask.cpu().numpy()] * 0.5 + np.array([0, 255, 0]) * 0.5
+                tgt_masks_bool = tgt_masks_orig > 0.5
+                
+                # 遍历每个 GT Mask 进行绘制
+                for i in range(len(tgt_masks)):
+                    mask_i = tgt_masks_bool[i].cpu().numpy()
+                    label_i = tgt_labels[i]
+                    present_classes.add(label_i)
+                    
+                    color = color_palette[label_i % len(color_palette)]
+                    # 混合颜色: 0.6 原图 + 0.4 Mask颜色
+                    gt_vis[mask_i] = gt_vis[mask_i] * 0.6 + color * 0.4
+
+                # 生成图例
+                for label_i in sorted(list(present_classes)):
+                    color_norm = color_palette[label_i % len(color_palette)] / 255.0
+                    class_name = class_names[label_i] if label_i < len(class_names) else f"Class {label_i}"
+                    legend_elements.append(
+                        Rectangle((0, 0), 1, 1, color=color_norm, label=f"{class_name}")
+                    )
+
             ax[1].imshow(gt_vis)
-            ax[1].set_title("GT Masks")
+            ax[1].set_title("GT Masks", fontsize=15)
             ax[1].axis('off')
+            # 添加 GT 图例
+            if legend_elements:
+                ax[1].legend(handles=legend_elements, loc='lower right', fontsize='small', framealpha=0.6)
 
             # Subplot 3: Pixel-wise Classification
             ax[2].imshow(pixel_vis)
-            ax[2].set_title("DINO Pixel-wise Prediction (Argmax)")
+            ax[2].set_title("DINO Pixel-wise Prediction", fontsize=15)
             ax[2].axis('off')
             
             plt.tight_layout()
@@ -2301,13 +2320,16 @@ class DINOSAM(nn.Module):
             # =================================================
             # 2. 逐 Query 绘制
             # =================================================
-            for rank, q_idx in enumerate(sorted_indices):
+            for i, q_idx in enumerate(sorted_indices):
+                rank = i + 1 # Rank 从 1 开始
                 q_iou = max_ious[q_idx].item()
-                # 过滤逻辑：IoU太低且排名靠后的不画
-                if q_iou < 0.1 and rank > 50: 
+                q_fg_prob = curr_fg_probs[q_idx].item()
+                
+                # 过滤逻辑：IoU太低 且 置信度太低 且 排名靠后
+                if q_iou < 0.1 and q_fg_prob < 0.1 and rank > 50: 
                     continue
                 
-                # --- 获取该 Query 的信息 ---
+                # --- 获取该 Query 的分类信息 ---
                 probs = out_vocab_cls_probs[b, q_idx] # [K]
 
                 # Top K classes
@@ -2323,7 +2345,7 @@ class DINOSAM(nn.Module):
                 mask_bin = mask_map > 0.5
                 
                 mask_vis = img_np.copy()
-                # Red overlay for Prediction
+                # 红色叠加显示预测 (Red)
                 mask_vis[mask_bin.cpu().numpy()] = mask_vis[mask_bin.cpu().numpy()] * 0.5 + np.array([255, 0, 0]) * 0.5
                 
                 # --- Attention Map 可视化 ---
@@ -2342,22 +2364,23 @@ class DINOSAM(nn.Module):
                 
                 # Left: Pred Mask
                 ax[0].imshow(mask_vis)
-                title_str = f"Rank: {rank} | IoU: {q_iou:.4f}\n{cls_str}"
-                ax[0].set_title(title_str, loc='left', fontsize=10)
+                # 标题包含：Rank, IoU, FG Prob, TopK Classes
+                title_str = f"Rank: {rank} | IoU: {q_iou:.2f} | FG Prob: {q_fg_prob:.2f}\n{cls_str}"
+                ax[0].set_title(title_str, loc='left', fontsize=12, fontweight='bold')
                 ax[0].axis('off')
                 
                 # Right: Cross Attention
                 ax[1].imshow(attn_vis[:, :, ::-1]) # OpenCV BGR -> RGB
-                ax[1].set_title("Cross Attention Map")
+                ax[1].set_title("Cross Attention Map", fontsize=15)
                 ax[1].axis('off')
                 
-                save_name = f"{rank:03d}_iou_{q_iou:.2f}_query_{q_idx}.jpg"
+                # 文件名增加 Prob 信息方便查看
+                save_name = f"{rank:03d}_iou_{q_iou:.2f}_prob_{q_fg_prob:.2f}_query_{q_idx}.jpg"
                 plt.tight_layout()
                 plt.savefig(os.path.join(save_dir, save_name))
                 plt.close()
                 
         print(f"Visualization saved to {save_root}")
-
 def aggregate_name_to_class_logits(query_names_results, num_templates):
     """
     将包含同义词/模板的 name logits 转化为唯一类别的 class logits。
