@@ -15,6 +15,7 @@ from detectron2.utils.memory import retry_if_cuda_oom
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.patches import Rectangle
+import matplotlib.cm as cm
 
 import os
 import numpy as np
@@ -1246,7 +1247,7 @@ class DINOSAM(nn.Module):
                     query_embed = self.detector.transformer.decoder.query_embed.weight
                     query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
 
-                    hs, reference_boxes, dec_presence_out, dec_presence_feats = (
+                    hs, reference_boxes, dec_presence_out, dec_presence_feats, cross_attn_weights = (
                         self.detector.transformer.decoder(
                             tgt=query_embed,
                             memory=out["encoder_hidden_states"],
@@ -1311,6 +1312,8 @@ class DINOSAM(nn.Module):
                     targets = self.prepare_targets(gt_instances, images, batched_inputs)
                 else:
                     targets = None
+            else:
+                targets = self._prepare_targets_from_sem_seg(batched_inputs, images)
 
             out_masks = outputs["pred_masks"].clone()
 
@@ -1645,12 +1648,30 @@ class DINOSAM(nn.Module):
 
 
             results = []
+
+            VISUALIZE_ATTENTION = True
+            VIS_SAVE_ROOT = "./attnmap"
+    
             
             for i in range(bs):
-                # 获取单张图数据
+
+                if VISUALIZE_ATTENTION:
+                    self.visualize_query_attention(
+                        batched_inputs=batched_inputs,
+                        images=images,
+                        outputs=outputs,
+                        targets=targets,
+                        is_void_prob=is_void_prob, 
+                        out_vocab_cls_probs=out_vocab_cls_probs,
+                        cross_attn_weights = cross_attn_weights,
+                        dino_pixel_feat = img_feat_for_pool,
+                        save_root=VIS_SAVE_ROOT
+                    )
+
+
                 mask_cls_i = mask_cls_logits[i]       # [Q, C]
                 mask_pred_i = mask_pred_logits[i]     # [Q, H, W]
-                
+                             
                 # 获取原始图像尺寸
                 img_h_orig = batched_inputs[i]["height"]
                 img_w_orig = batched_inputs[i]["width"]
@@ -1693,9 +1714,6 @@ class DINOSAM(nn.Module):
                     semseg_square = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_i_square)
                     pred_result_square = semseg_square.argmax(0).cpu()
 
-                    # 5. 准备 Image (它本身就是 Square 的)
-                    img_tensor_square = batched_inputs[i]["image"]
-
                     # 6. 获取类别名称
                     current_dataname = batched_inputs[i]["meta"]["dataname"]
                     if current_dataname in self.test_metadata:
@@ -1717,7 +1735,7 @@ class DINOSAM(nn.Module):
                             pred_result=pred_result_square,       # 修改点：传入 Square 预测
                             gt_result= batched_inputs[i]["sem_seg"].to(self.device),           # 本身就是 Square
                             class_names=current_class_names + ['background'],
-                            original_image_tensor=img_tensor_square, # 本身就是 Square
+                            original_image_tensor=batched_inputs[i]["image"], # 本身就是 Square
                             save_path=f"./show_semantic/{batched_inputs[i]['file_name'].split('/')[-1].split('.')[0]}.png"
                         )
                 #     # =========== 修改结束 ===========
@@ -2121,7 +2139,224 @@ class DINOSAM(nn.Module):
         cosine_similarity_loss[f"loss_cosine"] = 1 - cosine_sim.mean()
         return cosine_similarity_loss
 
-    
+    @torch.no_grad()
+    def visualize_query_attention(self, batched_inputs, images, outputs, targets, is_void_prob, out_vocab_cls_probs, cross_attn_weights, dino_pixel_feat, save_root):
+        import shutil
+        import cv2
+        import numpy as np
+        from torch.nn import functional as F
+        import matplotlib.pyplot as plt
+        
+        os.makedirs(save_root, exist_ok=True)
+        
+        # 1. 获取模型输出
+        # [B, Q, H_mask, W_mask]
+        pred_masks = outputs["pred_masks"].sigmoid() 
+        
+        # 获取 Attention weights
+        if cross_attn_weights is not None:
+            print("cross_attn_weights:",cross_attn_weights.shape)
+            attn_weights = cross_attn_weights[-1] # 取最后一层
+        else:
+            print("cross_attn_weights is None.")
+            return
+
+        batch_size = pred_masks.shape[0]
+        
+        # 推断 Feature map 尺寸
+        num_patches = attn_weights.shape[-1]
+        feat_h ,feat_w = dino_pixel_feat.
+
+        # 获取数据集信息和类别名
+        dataname = get_dataname(batched_inputs[0])
+        if dataname in self.test_metadata:
+            meta = self.test_metadata[dataname]
+        else:
+            meta = MetadataCatalog.get(dataname)
+        
+        try:
+            class_names = meta.stuff_classes
+        except:
+            class_names = meta.thing_classes
+            
+        # 准备逐像素预测所需的文本分类器
+        # 注意：这里需要在循环外获取，避免重复计算
+        text_classifier, num_templates = self.get_text_classifier(dataname)
+        text_classifier = text_classifier.to(self.device)
+
+        # 生成一个固定的随机颜色调色板用于逐像素预测可视化
+        # size: [num_classes + 1, 3]
+        np.random.seed(42)
+        color_palette = np.random.randint(0, 255, size=(len(class_names) + 1, 3), dtype=np.uint8)
+
+        for b in range(batch_size):
+            file_name = batched_inputs[b]["file_name"].split('/')[-1].split('.')[0]
+            save_dir = os.path.join(save_root, file_name)
+            if os.path.exists(save_dir):
+                shutil.rmtree(save_dir)
+            os.makedirs(save_dir)
+
+            # --- A. 准备原图 ---
+            # permute [C, H, W] -> [H, W, C] & denormalize
+            img_tensor = images.tensor[b].clone()
+            img_tensor = (img_tensor * self.pixel_std + self.pixel_mean) * 255.0
+            img_np = img_tensor.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+            img_h, img_w = img_np.shape[:2]
+
+            # --- B. 计算逐像素预测 (Pixel-wise Prediction) ---
+            # 1. 取出当前 batch 的 feature: [C, H_feat, W_feat] (假设输入是这个形状)
+            curr_feat = dino_pixel_feat[b] 
+            
+            # 2. 调整形状以进行矩阵乘法: [H_feat, W_feat, C]
+            # 如果输入已经是 HWC，则不需要 permute，请根据实际情况调整
+            if curr_feat.shape[0] == text_classifier.shape[1]: # C在第一维
+                curr_feat = curr_feat.permute(1, 2, 0)
+            
+            # 3. 归一化特征 (Cosine Similarity 前置步骤)
+            curr_feat = F.normalize(curr_feat, dim=-1)
+            
+            # 4. 计算 Logits: [H_feat, W_feat, num_templates_total]
+            # text_classifier: [num_templates_total, C]
+            pixel_logits = torch.einsum("hwc,nc->hwn", curr_feat, text_classifier)
+            
+            # 5. 聚合模版 (Aggregating templates to classes)
+            # aggregate 函数通常需要 batch 维度，unsqueeze 一下
+            pixel_logits = pixel_logits.unsqueeze(0) # [1, H, W, N_t]
+            pixel_cls_logits = aggregate_name_to_class_logits(pixel_logits, num_templates)
+            pixel_cls_logits = pixel_cls_logits.squeeze(0) # [H, W, N_classes]
+            
+            # 6. Argmax 获取类别索引 [H_feat, W_feat]
+            pixel_pred_idx = pixel_cls_logits.argmax(dim=-1).cpu().numpy().astype(np.uint8)
+            
+            # 7. Resize 到原图大小 (使用最近邻插值保持类别索引整数)
+            pixel_pred_idx_resized = cv2.resize(pixel_pred_idx, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+            
+            # 8. 映射颜色
+            # 如果索引超过颜色盘大小，取模防止越界
+            pixel_vis = color_palette[pixel_pred_idx_resized % len(color_palette)]
+
+            # --- C. 计算每个 Query 与 GT 的最大 IoU ---
+            # pred_masks[b]: [Q, H, W]
+            # targets[b]["masks"]: [G, H, W]
+            tgt_masks = targets[b]["masks"].float()
+            curr_pred_masks = pred_masks[b]
+            
+            # 对齐尺寸用于计算 IoU
+            if tgt_masks.shape[-2:] != curr_pred_masks.shape[-2:]:
+                tgt_masks_resized = F.interpolate(tgt_masks.unsqueeze(1), size=curr_pred_masks.shape[-2:], mode='nearest').squeeze(1)
+            else:
+                tgt_masks_resized = tgt_masks
+
+            if len(tgt_masks) > 0:
+                # 将布尔类型转换为浮点型，否则 torch.mm 会报错
+                flat_pred = (curr_pred_masks > 0.5).flatten(1).float() # 修改这里
+                flat_tgt = (tgt_masks_resized > 0.5).flatten(1).float() # 修改这里
+                
+                # 现在执行的是 float 类型的矩阵乘法，结果是 intersection 的像素个数
+                intersection = torch.mm(flat_pred, flat_tgt.t())
+                
+                area_pred = flat_pred.sum(1, keepdim=True)
+                area_tgt = flat_tgt.sum(1, keepdim=True)
+                union = area_pred + area_tgt.t() - intersection
+                iou_matrix = intersection / (union + 1e-6)
+                
+                # 每个 Query 对应的最大 IoU
+                max_ious, _ = iou_matrix.max(dim=1) # [Q]
+            else:
+                max_ious = torch.zeros(curr_pred_masks.shape[0], device=self.device)
+
+            # --- 排序 ---
+            sorted_indices = torch.argsort(max_ious, descending=True)
+
+            # =================================================
+            # 1. 绘制总览图 (Overview)
+            # =================================================
+            fig, ax = plt.subplots(1, 3, figsize=(24, 8))
+            
+            # Subplot 1: Original
+            ax[0].imshow(img_np)
+            ax[0].set_title("Original Image")
+            ax[0].axis('off')
+            
+            # Subplot 2: GT Masks
+            gt_vis = img_np.copy()
+            if len(tgt_masks) > 0:
+                tgt_masks_orig = F.interpolate(tgt_masks.unsqueeze(1), size=(img_h, img_w), mode='nearest').squeeze(1)
+                combined_mask = tgt_masks_orig.sum(0) > 0
+                # Green overlay for GT
+                gt_vis[combined_mask.cpu().numpy()] = gt_vis[combined_mask.cpu().numpy()] * 0.5 + np.array([0, 255, 0]) * 0.5
+            ax[1].imshow(gt_vis)
+            ax[1].set_title("GT Masks")
+            ax[1].axis('off')
+
+            # Subplot 3: Pixel-wise Classification
+            ax[2].imshow(pixel_vis)
+            ax[2].set_title("DINO Pixel-wise Prediction (Argmax)")
+            ax[2].axis('off')
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, "00_overview.jpg"))
+            plt.close()
+
+            # =================================================
+            # 2. 逐 Query 绘制
+            # =================================================
+            for rank, q_idx in enumerate(sorted_indices):
+                q_iou = max_ious[q_idx].item()
+                # 过滤逻辑：IoU太低且排名靠后的不画
+                if q_iou < 0.1 and rank > 50: 
+                    continue
+                
+                # --- 获取该 Query 的信息 ---
+                probs = out_vocab_cls_probs[b, q_idx] # [K]
+
+                # Top K classes
+                topk_vals, topk_inds = torch.topk(probs, k=5)
+                cls_str = ""
+                for val, ind in zip(topk_vals, topk_inds):
+                    c_name = class_names[ind] if ind < len(class_names) else "Void"
+                    cls_str += f"{c_name}: {val:.2f}\n"
+                
+                # --- Mask 可视化 ---
+                mask_map = curr_pred_masks[q_idx]
+                mask_map = F.interpolate(mask_map.view(1, 1, *mask_map.shape), size=(img_h, img_w), mode='bilinear').squeeze()
+                mask_bin = mask_map > 0.5
+                
+                mask_vis = img_np.copy()
+                # Red overlay for Prediction
+                mask_vis[mask_bin.cpu().numpy()] = mask_vis[mask_bin.cpu().numpy()] * 0.5 + np.array([255, 0, 0]) * 0.5
+                
+                # --- Attention Map 可视化 ---
+                attn = attn_weights[b, q_idx] # [S]
+                attn_map = attn.view(feat_h, feat_w)
+                attn_map = F.interpolate(attn_map.view(1, 1, feat_h, feat_w), size=(img_h, img_w), mode='bilinear').squeeze()
+                attn_map = attn_map.cpu().numpy()
+                
+                # Normalize & Heatmap
+                attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
+                attn_heatmap = cv2.applyColorMap((attn_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
+                attn_vis = cv2.addWeighted(img_np, 0.5, attn_heatmap, 0.5, 0)
+                
+                # --- 绘图 ---
+                fig, ax = plt.subplots(1, 2, figsize=(16, 8))
+                
+                # Left: Pred Mask
+                ax[0].imshow(mask_vis)
+                title_str = f"Rank: {rank} | IoU: {q_iou:.4f}\n{cls_str}"
+                ax[0].set_title(title_str, loc='left', fontsize=10)
+                ax[0].axis('off')
+                
+                # Right: Cross Attention
+                ax[1].imshow(attn_vis[:, :, ::-1]) # OpenCV BGR -> RGB
+                ax[1].set_title("Cross Attention Map")
+                ax[1].axis('off')
+                
+                save_name = f"{rank:03d}_iou_{q_iou:.2f}_query_{q_idx}.jpg"
+                plt.tight_layout()
+                plt.savefig(os.path.join(save_dir, save_name))
+                plt.close()
+                
+        print(f"Visualization saved to {save_root}")
 
 def aggregate_name_to_class_logits(query_names_results, num_templates):
     """

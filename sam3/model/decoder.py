@@ -161,7 +161,7 @@ class TransformerDecoderLayer(nn.Module):
             )  # (bs*nheads, 1+nq, hw)
 
         # Cross attention to image
-        tgt2 = self.cross_attn(
+        tgt2, cross_attn_weights = self.cross_attn(
             query=self.with_pos_embed(tgt, tgt_query_pos),
             key=self.with_pos_embed(memory, memory_pos),
             value=memory,
@@ -171,7 +171,8 @@ class TransformerDecoderLayer(nn.Module):
                 if memory_key_padding_mask is not None
                 else None
             ),
-        )[0]
+            need_weights=True,
+        )
 
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
@@ -184,7 +185,7 @@ class TransformerDecoderLayer(nn.Module):
             presence_token_out = tgt[:1]
             tgt = tgt[1:]
 
-        return tgt, presence_token_out
+        return tgt, presence_token_out, cross_attn_weights
 
 
 class TransformerDecoder(nn.Module):
@@ -471,6 +472,8 @@ class TransformerDecoder(nn.Module):
         intermediate_presence_logits = []
         presence_feats = None
 
+        intermediate_attention_maps = []
+
         if self.box_refine:
             if reference_boxes is None:
                 # In this case, we're in a one-stage model, so we generate the reference boxes
@@ -526,7 +529,7 @@ class TransformerDecoder(nn.Module):
                 assert (
                     self.use_act_checkpoint
                 ), "Activation checkpointing not enabled in the decoder"
-            output, presence_out = activation_ckpt_wrapper(layer)(
+            output, presence_out, cross_attn_weights = activation_ckpt_wrapper(layer)(
                 tgt=output,
                 tgt_query_pos=query_pos,
                 tgt_query_sine_embed=query_sine_embed,
@@ -549,7 +552,12 @@ class TransformerDecoder(nn.Module):
                 # ROI memory bank
                 obj_roi_memory_feat=obj_roi_memory_feat,
                 obj_roi_memory_mask=obj_roi_memory_mask,
+
+                return_attn_weights=True, 
             )
+
+            if cross_attn_weights is not None:
+                intermediate_attention_maps.append(cross_attn_weights) # <--- 3. 收集权重
 
             # iter update
             if self.box_refine:
@@ -608,6 +616,8 @@ class TransformerDecoder(nn.Module):
                 else None
             ),
             presence_feats,
+
+            torch.stack(intermediate_attention_maps) if intermediate_attention_maps else None, # <--- 4. 返回堆叠后的 attention maps
         )
 
 

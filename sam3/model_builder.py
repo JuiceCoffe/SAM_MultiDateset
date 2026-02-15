@@ -183,7 +183,8 @@ def _create_transformer_decoder() -> TransformerDecoder:
         d_model=256,
         dim_feedforward=2048,
         dropout=0.1,
-        cross_attention=MultiheadAttention(
+        cross_attention=nn.MultiheadAttention(
+        # cross_attention=MultiheadAttention(
             num_heads=8,
             dropout=0.1,
             embed_dim=256,
