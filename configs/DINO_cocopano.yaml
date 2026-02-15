@@ -18,7 +18,7 @@ MODEL:
 
     ALPHA: 1.0
     BETA: 1.0
-    ORACLE_SELECT: True
+    # ORACLE_SELECT: True
 
   # TEACHER: CONVCLIP
   # TEACHER_MASKPOOL: True

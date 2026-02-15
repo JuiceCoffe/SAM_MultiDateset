@@ -16,6 +16,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.patches import Rectangle
 import matplotlib.cm as cm
+import shutil
+import cv2
 
 import os
 import numpy as np
@@ -1649,7 +1651,8 @@ class DINOSAM(nn.Module):
 
             results = []
 
-            VISUALIZE_ATTENTION = True
+            VISUALIZE_ATTENTION = False
+            # VISUALIZE_ATTENTION = True
             VIS_SAVE_ROOT = "./attnmap"
     
             
@@ -2141,12 +2144,6 @@ class DINOSAM(nn.Module):
 
     @torch.no_grad()
     def visualize_query_attention(self, batched_inputs, images, outputs, targets, is_void_prob, out_vocab_cls_probs, cross_attn_weights, dino_pixel_feat, save_root):
-        import shutil
-        import cv2
-        import numpy as np
-        from torch.nn import functional as F
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Rectangle
         
         os.makedirs(save_root, exist_ok=True)
         
@@ -2208,9 +2205,7 @@ class DINOSAM(nn.Module):
             
             curr_feat = F.normalize(curr_feat, dim=-1)
             pixel_logits = torch.einsum("hwc,nc->hwn", curr_feat, text_classifier)
-            pixel_logits = pixel_logits.unsqueeze(0) 
             pixel_cls_logits = aggregate_name_to_class_logits(pixel_logits, num_templates)
-            pixel_cls_logits = pixel_cls_logits.squeeze(0)
             
             pixel_pred_idx = pixel_cls_logits.argmax(dim=-1).cpu().numpy().astype(np.uint8)
             pixel_pred_idx_resized = cv2.resize(pixel_pred_idx, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
@@ -2246,9 +2241,9 @@ class DINOSAM(nn.Module):
             else:
                  curr_void_prob = is_void_prob[b]
                  
-            # 确保是概率值
-            if curr_void_prob.max() > 1.0 or curr_void_prob.min() < 0.0: 
-                 curr_void_prob = curr_void_prob.sigmoid()
+            # # 确保是概率值
+            # if curr_void_prob.max() > 1.0 or curr_void_prob.min() < 0.0: 
+            #      curr_void_prob = curr_void_prob.sigmoid()
             
             curr_fg_probs = 1.0 - curr_void_prob
             sort_metric = max_ious + curr_fg_probs.to(max_ious.device)
@@ -2366,7 +2361,7 @@ class DINOSAM(nn.Module):
                 ax[0].axis('off')
                 
                 ax[1].imshow(attn_vis[:, :, ::-1])
-                ax[1].set_title("Cross Attention Map (Edge Focus)", fontsize=15)
+                ax[1].set_title("Cross Attention Map", fontsize=15)
                 ax[1].axis('off')
                 
                 save_name = f"{rank:03d}_iou_{q_iou:.2f}_prob_{q_fg_prob:.2f}_query_{q_idx}.jpg"
@@ -2375,7 +2370,7 @@ class DINOSAM(nn.Module):
                 plt.close()
                 
         print(f"Visualization saved to {save_root}")
-        
+
 def aggregate_name_to_class_logits(query_names_results, num_templates):
     """
     将包含同义词/模板的 name logits 转化为唯一类别的 class logits。
