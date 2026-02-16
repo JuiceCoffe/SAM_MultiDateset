@@ -125,6 +125,7 @@ class Sam3Image(torch.nn.Module):
                 torch._assert_async((img_ids >= 0).all())
 
             vis_feats = backbone_out["backbone_fpn"][-self.num_feature_levels :]
+            
             vis_pos_enc = backbone_out["vision_pos_enc"][-self.num_feature_levels :]
             vis_feat_sizes = [x.shape[-2:] for x in vis_pos_enc]  # (H, W) shapes
             # index and flatten visual features NxCxHxW => HWxNxC (batch-first => seq-first)

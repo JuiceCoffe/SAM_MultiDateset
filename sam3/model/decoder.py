@@ -159,7 +159,6 @@ class TransformerDecoderLayer(nn.Module):
             cross_attn_mask = torch.cat(
                 [presence_token_mask, cross_attn_mask], dim=1
             )  # (bs*nheads, 1+nq, hw)
-
         # Cross attention to image
         tgt2, cross_attn_weights = self.cross_attn(
             query=self.with_pos_embed(tgt, tgt_query_pos),

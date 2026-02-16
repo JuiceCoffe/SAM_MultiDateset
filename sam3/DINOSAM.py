@@ -1652,7 +1652,7 @@ class DINOSAM(nn.Module):
             results = []
 
             VISUALIZE_ATTENTION = False
-            VISUALIZE_ATTENTION = True
+            # VISUALIZE_ATTENTION = True
             VIS_SAVE_ROOT = "./attnmap"
     
             
@@ -2152,7 +2152,7 @@ class DINOSAM(nn.Module):
         
         # 获取 Attention weights
         if cross_attn_weights is not None:
-            attn_weights = cross_attn_weights[-1] # 取最后一层
+            attn_weights = cross_attn_weights[1] # 取最后一层
         else:
             print("cross_attn_weights is None.")
             return
