@@ -22,6 +22,7 @@ import cv2
 import os
 import numpy as np
 import torchvision
+import logging
 
 from sam3.model_builder import (
     _create_vision_backbone,
@@ -115,8 +116,8 @@ class RADIOSAM(nn.Module):
             self.detector.eval()
         print("SAM3创建成功!")
 
-        radio_model = load_radio_model("c-radio_v4-h", device=self.detector.device, vitdet=None)
-        self.detector, self.radio_adaptor = replace_sam3_encoder(self.detector, radio_model, device=self.detector.device)
+        radio_model = load_radio_model("c-radio_v4-h", device=self.pixel_mean.device, vitdet=None)
+        self.detector, self.radio_adaptor = replace_sam3_encoder(self.detector, radio_model, device=self.pixel_mean.device)
 
         # -------------------------------------------------------
         # 新增模块
@@ -362,59 +363,42 @@ class RADIOSAM(nn.Module):
 
         self._freeze()
 
-    # def _freeze(self, ):
-    #     for name, param in self.named_parameters():
-    #         if 'dino' in name:
-    #             param.requires_grad = False
-    #         elif 'language_backbone' in name:
-    #             param.requires_grad = False
-    #         elif 'geometry_encoder' in name:
-    #             param.requires_grad = False
-    #         else:
-    #             param.requires_grad = True
-        
-    #     print('='*10,'Parameters to be trained', '='*10)
-    #     for name, param in self.named_parameters():
-    #         if param.requires_grad == True:
-    #             print(name)
-    #     # exit()
     def _freeze(self):
-            # 1. 定义需要冻结的关键字
-            # 'language_backbone': 处理语言的主干及其 256 维 resizer
-            # 'text_model': DINO 内部的文本编码器分支
-            # 'text_feat_resizer': 顶层的 1024->256 投影层
-            freeze_keywords = [
-                'dino',
-                'geometry_encoder',
-                'language_backbone', 
-                'text_model', 
-                'radio_adaptor'
-            ]
+        # 获取 detectron2 的 logger
+        logger = logging.getLogger("detectron2") 
 
-            # 2. 遍历参数并设置 requires_grad
-            for name, param in self.named_parameters():
-                # 检查参数名是否包含上述任何一个关键字
-                if any(key in name for key in freeze_keywords):
-                    param.requires_grad = False
-                else:
-                    # 其他部分（如 vision_backbone 的视觉部分、transformer 训练层等）保持开启
-                    param.requires_grad = True
-            
-            # 特殊处理：如果您希望整个 DINO (包括视觉分支) 也冻结，请取消下面注释
-            # for name, param in self.named_parameters():
-            #     if 'detector.backbone.vision_backbone.trunk.dino' in name:
-            #         param.requires_grad = False
+        # 1. 定义需要冻结的关键字
+        freeze_keywords = [
+            'geometry_encoder',
+            'language_backbone', 
+            'text_model', 
+            'sig2_adaptor',
+            "student"
+        ]
 
-            # 3. 打印结果以供校验
-            print('='*10, 'Parameters to be TRAINED (requires_grad=True)', '='*10)
-            trainable_count = 0
-            for name, param in self.named_parameters():
-                if param.requires_grad:
-                    print(f"TRAINABLE: {name}")
-                    trainable_count += 1
-            
-            print(f"\nTotal trainable parameter groups: {trainable_count}")
-            print('='*40)
+        # 2. 遍历参数并设置 requires_grad
+        for name, param in self.named_parameters():
+            if any(key in name for key in freeze_keywords):
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+        
+        # 3. 使用 logger 输出结果
+        logger.info('='*10 + ' Parameters to be TRAINED (requires_grad=True) ' + '='*10)
+        
+        trainable_count = 0
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                # 使用 logger.info 代替 print
+                logger.info(f"TRAINABLE: {name}")
+                trainable_count += 1
+            else:
+                logger.info(f"FROZEN: {name}")
+        
+        logger.info(f"Total trainable parameter groups: {trainable_count}")
+        logger.info('='*40)
+        
+
     # def prepare_targets(self, targets, images):
     #     h_pad, w_pad = images.tensor.shape[-2:]
     #     new_targets = []
@@ -448,8 +432,6 @@ class RADIOSAM(nn.Module):
     #         )
     #     return new_targets
 
-    def dino(self):
-        return self.detector.backbone.vision_backbone.trunk.dino
 
     def prepare_targets(self, targets, images, batched_inputs):
         h_pad, w_pad = images.tensor.shape[-2:]
@@ -1436,7 +1418,7 @@ class RADIOSAM(nn.Module):
                 loss_cosine_similarity = self.cosine_similarity_loss(pooled_img_feature[:, 16:24, :], pooled_img_feature[:, 24:, :])
 
                 text_classifier, num_templates = self.get_text_classifier(dataname)
-                mask_cls_results = get_classification_logits(pooled_img_feature, text_classifier, self.dino().clip_model.logit_scale, num_templates)
+                mask_cls_results = get_classification_logits(pooled_img_feature, text_classifier, 100, num_templates)
 
                 loss_mask_cls = self.cross_entropy_loss(mask_cls_results, all_labels)
 
@@ -1517,7 +1499,7 @@ class RADIOSAM(nn.Module):
 
             maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier, pooled_img_feat) 
 
-            maskpool_name_logits = maskpool_name_logits * torch.clamp(self.dino().clip_model.logit_scale.exp(), max=100)
+            maskpool_name_logits = maskpool_name_logits * 100
             
             maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
 

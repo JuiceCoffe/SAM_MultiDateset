@@ -65,8 +65,7 @@ class RADIO_Adaptor(nn.Module):
         with torch.autocast('cuda', dtype=torch.bfloat16):
             student_output = self.student(images)
             if isinstance(student_output, dict):
-                student_output = student_output['sam3']
-            features = student_output[1]
+                features = student_output['sam3'][1]
             
             _, backbone_features = student_output['backbone']
             sig2_vis_features = self.sig2_adaptor.head_mlp(backbone_features)
