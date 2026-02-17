@@ -5,8 +5,6 @@ from torch.nn import functional as F
 from torchvision.transforms.functional import pil_to_tensor
 model_version="c-radio_v4-h" # for C-RADIOv3-H model (ViT-H/16)
 
-import torch
-
 # # 相对路径指向你的源码文件夹
 # local_path = './NVlabs_RADIO_main'
 

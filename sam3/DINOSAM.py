@@ -217,6 +217,11 @@ class DINOSAM(nn.Module):
  
         self.mask_pooling = MaskPooling()
 
+        self.Teacher_MaskPool = cfg.MODEL.TEACHER_MASKPOOL
+        if self.Teacher_MaskPool:
+            from.RADIOwrapper import RADIOwrapper
+            self.backbone2 = RADIOwrapper()
+
         self.use_MaskAdapter = cfg.MODEL.USE_MASKADAPTER
         if self.use_MaskAdapter:
             from .mask_adapter_head import load_mask_adapter_standalone
@@ -255,6 +260,8 @@ class DINOSAM(nn.Module):
         self.SAM_test_dataname = None
         self.text_encoder_cache = {} 
         self.SAM_text_encoder_cache = {}
+        self.train_dataname_teacher = None
+        self.test_dataname_teacher = None
 
         self.test_metadata = {i: MetadataCatalog.get(i) for i in cfg.DATASETS.TEST}
         self.train_metadata_dict = {name: MetadataCatalog.get(name) for name in cfg.DATASETS.TRAIN}
@@ -995,6 +1002,50 @@ class DINOSAM(nn.Module):
                 self.SAM_test_dataname = dataname
             return self.SAM_test_text_classifier.clone(), self.SAM_test_num_templates
 
+    @torch.no_grad()
+    def get_teacher_text_classifier(self, dataname, prompt_teacher):
+        if self.training:
+            if self.train_dataname_teacher != dataname or self.text_classifier2 is None:
+                self.category_overlapping_mask_teacher, self.train_num_templates_teacher, self.train_class_names_teacher = self.prepare_class_names_from_metadata(
+                    self.train_metadata_dict.get(dataname, MetadataCatalog.get(dataname)), 
+                    self.train_metadata, 
+                    prompt_teacher
+                    )
+                text_classifier = []
+                bs = 128
+                print("Generating text classifier for", dataname, "with", len(self.train_class_names), "classes.")
+                for idx in range(0, len(self.train_class_names_teacher), bs):
+                    text_classifier.append(self.backbone2.get_text_classifier(self.train_class_names_teacher[idx:idx+bs], self.device).detach())
+                text_classifier = torch.cat(text_classifier, dim=0)
+                print("text_classifier shape before normalize:", text_classifier.shape)
+
+                text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
+                print("text_classifier shape before reshape:", text_classifier.shape)
+                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(prompt_teacher), len(prompt_teacher), text_classifier.shape[-1]).mean(1) 
+                text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
+                self.text_classifier2 = text_classifier
+                self.train_dataname_teacher = dataname
+            return self.text_classifier2, self.train_num_templates_teacher
+
+        else:
+            if self.test_dataname_teacher != dataname or self.text_classifier2 is None:
+                self.category_overlapping_mask_teacher, self.test_num_templates_teacher, self.test_class_names_teacher = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata, prompt_teacher)
+                text_classifier = []
+                bs = 128
+                print("Generating text classifier for", dataname, "with", len(self.test_class_names_teacher), "classes.")
+                for idx in range(0, len(self.test_class_names_teacher), bs):
+                    text_classifier.append(self.backbone2.get_text_classifier(self.test_class_names_teacher[idx:idx+bs], self.device).detach())
+                text_classifier = torch.cat(text_classifier, dim=0)
+                print("text_classifier shape before normalize:", text_classifier.shape)
+
+                text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
+                print("text_classifier shape before reshape:", text_classifier.shape)
+                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(prompt_teacher), len(prompt_teacher), text_classifier.shape[-1]).mean(1) 
+                text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
+                self.text_classifier2 = text_classifier
+                self.test_dataname_teacher = dataname
+            return self.text_classifier2, self.test_num_templates_teacher
+
     @property
     def device(self):
         return self.pixel_mean.device
@@ -1572,15 +1623,55 @@ class DINOSAM(nn.Module):
                 pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
                 pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
 
-            text_classifier, num_templates = self.get_text_classifier(dataname)
 
-            maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier, pooled_img_feat) 
-
-            maskpool_name_logits = maskpool_name_logits * torch.clamp(self.dino().clip_model.logit_scale.exp(), max=100)
-            
-            maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
                             
-            
+            if self.Teacher_MaskPool:
+                
+                model = self.backbone2.model
+
+                imgs_bb2 = (images.tensor * self.pixel_std + self.pixel_mean) # * 255.0 radio本身也要除就不管了
+                nearest_res = model.get_nearest_supported_resolution(*imgs_bb2.shape[-2:])
+                imgs_bb2 = F.interpolate(imgs_bb2, size=nearest_res, mode='bilinear', align_corners=False)
+
+                vis_output = model(imgs_bb2)
+                backbone_summary, backbone_features = vis_output['backbone']
+
+                sig2_adaptor = model.adaptors['siglip2-g']
+
+                clip_vis_dense = sig2_adaptor.head_mlp(backbone_features.to(next(sig2_adaptor.parameters()).dtype)).to(dtype=backbone_features.dtype)
+                clip_vis_dense = clip_vis_dense.permute(0, 2, 1)
+                img_h, img_w = imgs_bb2.shape[-2:]
+                print("img_h, img_w:", img_h, img_w)
+
+                patch_size = 16
+                
+                feat_h = img_h // patch_size
+                feat_w = img_w // patch_size
+
+                img_feat_for_pool = clip_vis_dense.view(clip_vis_dense.shape[0], clip_vis_dense.shape[1], feat_h, feat_w)
+
+                mask_for_pool = F.interpolate(outputs["pred_masks"], size=img_feat_for_pool.shape[-2:],
+                                                    mode='bilinear', align_corners=False)
+                pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
+                pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)   
+
+                text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], VILD_PROMPT)
+
+                maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier2, pooled_img_feat) 
+
+                maskpool_name_logits = maskpool_name_logits * 10
+                
+                maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates_teacher)
+
+            else:
+                text_classifier, num_templates = self.get_text_classifier(dataname)
+
+                maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier, pooled_img_feat) 
+
+                maskpool_name_logits = maskpool_name_logits * torch.clamp(self.dino().clip_model.logit_scale.exp(), max=100)
+                
+                maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
+
             if self.use_softmax:
                 is_void_prob = F.softmax(query_cls_results_final, dim=-1)[..., -1:]
                 in_vocab_cls_results = query_cls_results_final[..., :-1] 
@@ -1589,7 +1680,7 @@ class DINOSAM(nn.Module):
             else:
                 in_vocab_cls_probs = torch.sigmoid(query_cls_results_final)
                 out_vocab_cls_probs = F.softmax(maskpool_cls_logits, dim=-1)
-            category_overlapping_mask = self.category_overlapping_mask.to(self.device)
+            category_overlapping_mask = self.SAM_category_overlapping_mask.to(self.device)
             alpha = self.alpha
             beta = self.beta
             # 为了数值稳定性，加一个小 epsilon
