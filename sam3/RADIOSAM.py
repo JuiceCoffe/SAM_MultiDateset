@@ -44,7 +44,6 @@ from sam3.model.model_misc import (
 )
 
 from maft.utils.text_templetes import VILD_PROMPT
-from .dinov3txt import DINO_PROMPT_TEMPLATES
 
 
 from .loss.matcher import HungarianMatcher
@@ -59,68 +58,10 @@ import random
 
 import math
 
-from .dinov3txt import DINOv3TXT
 from .mask_adapter_head import build_mask_adapter
 
-class DINOv3Shim(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # 实例化你提供的类
-        self.dino = DINOv3TXT()
-        
-        # 双重保险：确保它是 eval 模式且不更新梯度
-        self.dino.eval()
-        for p in self.dino.parameters():
-            p.requires_grad = False
 
-    def train(self, mode=True):
-        # 强制始终处于 eval 模式，防止 BN/Dropout 状态改变
-        super().train(False)
-
-    def forward(self, x):
-        # SAM3 Neck 传入的是 [B, 3, H, W] 的 tensor
-        
-        # 1. 调用你的类提取特征
-        # DINOv3TXT.forward 调用了 extract_features，返回字典
-        out_dict = self.dino(x) 
-        
-        # 2. 拆包字典，取出核心特征
-        # 你的类中 key 是 "clip_vis_dense"
-        features = out_dict["clip_vis_dense"] # [B, 1024, H/16, W/16]
-
-        return [features] # 适配neck期望的多维度特征
-
-def create_DINO_backbone(compile_mode=None, enable_inst_interactivity=False, cfg=None):
-    # 1. 构建原始的 SAM3 视觉主干 (包含 ViT + Neck)
-    # 这会加载原始权重
-    print("Building original SAM3 backbone...")
-    full_backbone =  _create_vision_backbone(
-            compile_mode=compile_mode, 
-            enable_inst_interactivity=cfg.MODEL.SAM3.ENABLE_INST_INTERACTIVITY
-        )
-    
-    # 2. 替换 trunk (ViT) 部分
-    print("Replacing SAM3 Trunk (ViT) with DINOv3TXT...")
-    
-    # 根据你提供的结构图，full_backbone 是 Sam3DualViTDetNeck
-    # 它的子模块名为 'trunk' (即原始的 ViT)
-    if hasattr(full_backbone, 'trunk'):
-        # 释放旧 ViT 的显存
-        del full_backbone.trunk 
-        
-        # 装入我们的垫片
-        full_backbone.trunk = DINOv3Shim()
-        
-        print("Success: Backbone trunk replaced. DINOv3 is frozen.")
-    else:
-        AttributeError("Could not find 'trunk' in backbone to replace.")
-
-    # 3. 编译 (可选)
-    if compile_mode:
-        # 注意：DINOv3 有些算子可能不支持 torch.compile，如果报错请关闭 compile
-        full_backbone = torch.compile(full_backbone, mode=compile_mode)
-        
-    return full_backbone
+from.RADIOwrapper import RADIOwrapper, replace_sam3_encoder
 
 @META_ARCH_REGISTRY.register()
 class DINOSAM(nn.Module):
@@ -175,8 +116,11 @@ class DINOSAM(nn.Module):
             self.detector.eval()
         print("SAM3创建成功!")
 
+        radio_model = load_radio_model("c-radio_v4-h", device=args.device, vitdet=args.vitdet)
+
         self.PROMPT = DINO_PROMPT_TEMPLATES
         self.SAM_PROMPT = ['{}']
+
         # -------------------------------------------------------
         # 新增模块
         # -------------------------------------------------------
@@ -219,7 +163,6 @@ class DINOSAM(nn.Module):
 
         self.Teacher_MaskPool = cfg.MODEL.TEACHER_MASKPOOL
         if self.Teacher_MaskPool:
-            from.RADIOwrapper import RADIOwrapper
             self.backbone2 = RADIOwrapper()
 
         self.use_MaskAdapter = cfg.MODEL.USE_MASKADAPTER
@@ -1658,7 +1601,7 @@ class DINOSAM(nn.Module):
 
                 maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier2, pooled_img_feat) 
 
-                maskpool_name_logits = maskpool_name_logits * 100
+                maskpool_name_logits = maskpool_name_logits * 10
                 
                 maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates_teacher)
 

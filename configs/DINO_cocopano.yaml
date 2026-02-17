@@ -100,9 +100,9 @@ DATALOADER:
 
 TEST:
   EVAL_PERIOD: 3750
-  INSTANCE_ON: True   
+  # INSTANCE_ON: True   
   PANOPTIC_ON: True   
-  SEMANTIC_ON: True   
+  # SEMANTIC_ON: True   
 
 # 修改输出目录名称以区分实验
 VERSION: 2
