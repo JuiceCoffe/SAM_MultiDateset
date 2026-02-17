@@ -61,10 +61,10 @@ import math
 from .mask_adapter_head import build_mask_adapter
 
 
-from.RADIOwrapper import RADIOwrapper, replace_sam3_encoder
+from.RADIOwrapper import replace_sam3_encoder, load_radio_model
 
 @META_ARCH_REGISTRY.register()
-class DINOSAM(nn.Module):
+class RADIOSAM(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.device_type = cfg.MODEL.DEVICE
@@ -76,10 +76,9 @@ class DINOSAM(nn.Module):
         # -------------------------------------------------------       
         compile_mode = "default" if cfg.MODEL.SAM3.COMPILE else None
         
-        vision_encoder = create_DINO_backbone(
+        vision_encoder = _create_vision_backbone(
             compile_mode=compile_mode, 
-            enable_inst_interactivity=cfg.MODEL.SAM3.ENABLE_INST_INTERACTIVITY,
-            cfg=cfg 
+            enable_inst_interactivity=cfg.MODEL.SAM3.ENABLE_INST_INTERACTIVITY
         )
         text_encoder = _create_text_encoder(cfg.MODEL.SAM3.BPE_PATH)
         backbone = _create_vl_backbone(vision_encoder, text_encoder)
@@ -116,10 +115,8 @@ class DINOSAM(nn.Module):
             self.detector.eval()
         print("SAM3创建成功!")
 
-        radio_model = load_radio_model("c-radio_v4-h", device=args.device, vitdet=args.vitdet)
-
-        self.PROMPT = DINO_PROMPT_TEMPLATES
-        self.SAM_PROMPT = ['{}']
+        radio_model = load_radio_model("c-radio_v4-h", device=self.detector.device, vitdet=None)
+        self.detector, self.radio_adaptor = replace_sam3_encoder(self.detector, radio_model, device=self.detector.device)
 
         # -------------------------------------------------------
         # 新增模块
@@ -161,9 +158,6 @@ class DINOSAM(nn.Module):
  
         self.mask_pooling = MaskPooling()
 
-        self.Teacher_MaskPool = cfg.MODEL.TEACHER_MASKPOOL
-        if self.Teacher_MaskPool:
-            self.backbone2 = RADIOwrapper()
 
         self.use_MaskAdapter = cfg.MODEL.USE_MASKADAPTER
         if self.use_MaskAdapter:
@@ -188,6 +182,9 @@ class DINOSAM(nn.Module):
         # -------------------------------------------------------
         # 计算逻辑
         # -------------------------------------------------------
+        self.PROMPT = VILD_PROMPT
+        self.SAM_PROMPT = ['{}']
+
         self.add_pixelfeat = cfg.MODEL.SAM3.ADD_PIXELFEAT
         self.alpha = cfg.MODEL.SAM3.ALPHA
         self.beta = cfg.MODEL.SAM3.BETA
@@ -203,8 +200,7 @@ class DINOSAM(nn.Module):
         self.SAM_test_dataname = None
         self.text_encoder_cache = {} 
         self.SAM_text_encoder_cache = {}
-        self.train_dataname_teacher = None
-        self.test_dataname_teacher = None
+
 
         self.test_metadata = {i: MetadataCatalog.get(i) for i in cfg.DATASETS.TEST}
         self.train_metadata_dict = {name: MetadataCatalog.get(name) for name in cfg.DATASETS.TRAIN}
@@ -236,7 +232,6 @@ class DINOSAM(nn.Module):
         mask_weight = cfg.SOLVER.MASK_WEIGHT
         bbox_weight = cfg.SOLVER.BBOX_WEIGHT
         giou_weight = cfg.SOLVER.GIOU_WEIGHT
-        contrast_weight = cfg.SOLVER.CONTRAST_WEIGHT
 
         objectness_weight = cfg.SOLVER.OBJECT_WEIGHT
 
@@ -262,7 +257,6 @@ class DINOSAM(nn.Module):
             "loss_dice": dice_weight,
             'loss_bbox':bbox_weight, 
             'loss_giou':giou_weight,
-            'loss_contrast': contrast_weight,
         }
         if self.new_score_head:
             criterion_weight_dict["loss_objectness"] = objectness_weight
@@ -394,7 +388,7 @@ class DINOSAM(nn.Module):
                 'geometry_encoder',
                 'language_backbone', 
                 'text_model', 
-
+                'radio_adaptor'
             ]
 
             # 2. 遍历参数并设置 requires_grad
@@ -714,7 +708,7 @@ class DINOSAM(nn.Module):
                     bs = 128
                     print("Generating text classifier for", dataname, "with", len(self.train_class_names), "classes.")
                     for idx in range(0, len(self.train_class_names), bs):
-                        batch_text_feat = self.detector.backbone.vision_backbone.trunk.dino.get_text_classifier(self.train_class_names[idx:idx+bs], device=self.device)
+                        batch_text_feat = self.radio_adaptor.get_text_classifier(self.train_class_names[idx:idx+bs], device=self.device)
                         text_classifier.append(batch_text_feat)
                     text_classifier = torch.cat(text_classifier, dim=0)
                     text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.PROMPT), len(self.PROMPT), -1, text_classifier.shape[-1]) # num_names, self.PROMPT, L, D
@@ -751,7 +745,7 @@ class DINOSAM(nn.Module):
                 bs = 128
                 print("Generating text classifier for", dataname, "with", len(self.test_class_names), "classes.")
                 for idx in range(0, len(self.test_class_names), bs):
-                    batch_text_feat = self.detector.backbone.vision_backbone.trunk.dino.get_text_classifier(self.test_class_names[idx:idx+bs], device=self.device)
+                    batch_text_feat = self.radio_adaptor.get_text_classifier(self.test_class_names[idx:idx+bs], device=self.device)
                     text_classifier.append(batch_text_feat)
                 text_classifier = torch.cat(text_classifier, dim=0)
                 text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.PROMPT), len(self.PROMPT), -1, text_classifier.shape[-1]) # num_names, self.PROMPT, L, D
@@ -945,49 +939,6 @@ class DINOSAM(nn.Module):
                 self.SAM_test_dataname = dataname
             return self.SAM_test_text_classifier.clone(), self.SAM_test_num_templates
 
-    @torch.no_grad()
-    def get_teacher_text_classifier(self, dataname, prompt_teacher):
-        if self.training:
-            if self.train_dataname_teacher != dataname or self.text_classifier2 is None:
-                self.category_overlapping_mask_teacher, self.train_num_templates_teacher, self.train_class_names_teacher = self.prepare_class_names_from_metadata(
-                    self.train_metadata_dict.get(dataname, MetadataCatalog.get(dataname)), 
-                    self.train_metadata, 
-                    prompt_teacher
-                    )
-                text_classifier = []
-                bs = 128
-                print("Generating text classifier for", dataname, "with", len(self.train_class_names), "classes.")
-                for idx in range(0, len(self.train_class_names_teacher), bs):
-                    text_classifier.append(self.backbone2.get_text_classifier(self.train_class_names_teacher[idx:idx+bs], self.device).detach())
-                text_classifier = torch.cat(text_classifier, dim=0)
-                print("text_classifier shape before normalize:", text_classifier.shape)
-
-                text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
-                print("text_classifier shape before reshape:", text_classifier.shape)
-                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(prompt_teacher), len(prompt_teacher), text_classifier.shape[-1]).mean(1) 
-                text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
-                self.text_classifier2 = text_classifier
-                self.train_dataname_teacher = dataname
-            return self.text_classifier2, self.train_num_templates_teacher
-
-        else:
-            if self.test_dataname_teacher != dataname or self.text_classifier2 is None:
-                self.category_overlapping_mask_teacher, self.test_num_templates_teacher, self.test_class_names_teacher = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata, prompt_teacher)
-                text_classifier = []
-                bs = 128
-                print("Generating text classifier for", dataname, "with", len(self.test_class_names_teacher), "classes.")
-                for idx in range(0, len(self.test_class_names_teacher), bs):
-                    text_classifier.append(self.backbone2.get_text_classifier(self.test_class_names_teacher[idx:idx+bs], self.device).detach())
-                text_classifier = torch.cat(text_classifier, dim=0)
-                print("text_classifier shape before normalize:", text_classifier.shape)
-
-                text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
-                print("text_classifier shape before reshape:", text_classifier.shape)
-                text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(prompt_teacher), len(prompt_teacher), text_classifier.shape[-1]).mean(1) 
-                text_classifier /= text_classifier.norm(dim=-1, keepdim=True)
-                self.text_classifier2 = text_classifier
-                self.test_dataname_teacher = dataname
-            return self.text_classifier2, self.test_num_templates_teacher
 
     @property
     def device(self):
@@ -997,7 +948,7 @@ class DINOSAM(nn.Module):
 
         images = [x["image"].to(self.device) for x in batched_inputs]
         # print("shape of first image:", images[0].shape)
-        images = [(x / 255.0 - self.pixel_mean) / self.pixel_std for x in images]
+        images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, 16)
         # print("shape of images.tensor:", images.tensor.shape)
         img_h, img_w = images.tensor.shape[-2:]
@@ -1033,12 +984,6 @@ class DINOSAM(nn.Module):
             for k in range(len(backbone_fpn)):
                 backbone_fpn[k] = backbone_fpn[k].detach()
 
-
-            # 语言特征
-            # text_classifier:[num_names, dim] 
-            # language_features:[num_names, num_templates, L, dim] language_mask:[num_names, num_templates, L]
-            
-            # text_classifier, num_templates = self.get_text_classifier(meta['dataname'])
             SAM_text_classifier, SAM_num_templates = self.get_SAM_text_classifier(dataname)
             if self.void_embedding is not None:
                 SAM_text_classifier = torch.cat([SAM_text_classifier, F.normalize(self.void_embedding.weight, dim=-1)], dim=0)
@@ -1560,7 +1505,7 @@ class DINOSAM(nn.Module):
 
 
             else:
-                img_feat_for_pool = backbone_out_vision['vit_feature']
+                img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
                 mask_for_pool = F.interpolate(outputs["pred_masks"], size=img_feat_for_pool.shape[-2:],
                                                     mode='bilinear', align_corners=False)
                 pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
@@ -1568,51 +1513,13 @@ class DINOSAM(nn.Module):
 
 
                             
-            if self.Teacher_MaskPool:
-                
-                model = self.backbone2.model
+            text_classifier, num_templates = self.get_text_classifier(dataname)
 
-                imgs_bb2 = (images.tensor * self.pixel_std + self.pixel_mean) # * 255.0 radio本身也要除就不管了
-                nearest_res = model.get_nearest_supported_resolution(*imgs_bb2.shape[-2:])
-                imgs_bb2 = F.interpolate(imgs_bb2, size=nearest_res, mode='bilinear', align_corners=False)
+            maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier, pooled_img_feat) 
 
-                vis_output = model(imgs_bb2)
-                backbone_summary, backbone_features = vis_output['backbone']
-
-                sig2_adaptor = model.adaptors['siglip2-g']
-
-                clip_vis_dense = sig2_adaptor.head_mlp(backbone_features.to(next(sig2_adaptor.parameters()).dtype)).to(dtype=backbone_features.dtype)
-                clip_vis_dense = clip_vis_dense.permute(0, 2, 1)
-                img_h, img_w = imgs_bb2.shape[-2:]
-
-                patch_size = 16
-                
-                feat_h = img_h // patch_size
-                feat_w = img_w // patch_size
-
-                img_feat_for_pool = clip_vis_dense.view(clip_vis_dense.shape[0], clip_vis_dense.shape[1], feat_h, feat_w)
-
-                mask_for_pool = F.interpolate(outputs["pred_masks"], size=img_feat_for_pool.shape[-2:],
-                                                    mode='bilinear', align_corners=False)
-                pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
-                pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)   
-
-                text_classifier2, num_templates_teacher = self.get_teacher_text_classifier(meta['dataname'], VILD_PROMPT)
-
-                maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier2, pooled_img_feat) 
-
-                maskpool_name_logits = maskpool_name_logits * 10
-                
-                maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates_teacher)
-
-            else:
-                text_classifier, num_templates = self.get_text_classifier(dataname)
-
-                maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier, pooled_img_feat) 
-
-                maskpool_name_logits = maskpool_name_logits * torch.clamp(self.dino().clip_model.logit_scale.exp(), max=100)
-                
-                maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
+            maskpool_name_logits = maskpool_name_logits * torch.clamp(self.dino().clip_model.logit_scale.exp(), max=100)
+            
+            maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
 
             if self.use_softmax:
                 is_void_prob = F.softmax(query_cls_results_final, dim=-1)[..., -1:]

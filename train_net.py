@@ -69,6 +69,7 @@ from sam3.SAM3_teacher import SAM3_TEACHER
 from sam3.SAM3CLIP import SAM3CLIP
 from sam3.DINOSAM import DINOSAM
 from sam3.DINOTXTSAM import DINOTXTSAM
+from sam3.RADIOSAM import RADIOSAM
 
 from sam3.mask_adapter_head import MASKAdapterHead
 

@@ -18,8 +18,6 @@ from timm.layers.helpers import to_2tuple
 
 from sam3.model.sam3_image_processor import Sam3Processor
 
-
-DEFAULT_NECK_NAME = 'sam3'
 DEFAULT_RADIO_RESOLUTION = 1008 * 16 // 14  # RADIO uses 16x16 patches vs SAM3's 14x14
 
 
@@ -30,16 +28,22 @@ class RADIO_Adaptor(nn.Module):
                  student: nn.Module,
                  input_size: int,
                  output_channels: int,
-                 student_neck_name: str = DEFAULT_NECK_NAME,
     ):
         super().__init__()
 
         self.student = student
         self.input_size = to_2tuple(input_size)
-        self.student_neck_name = student_neck_name
 
         # SAM3's ViT has a channel_list attribute that the neck uses
         self.channel_list = [output_channels]
+
+        self.sig2_adaptor = self.student.adaptors['siglip2-g']
+
+    @torch.no_grad()
+    def get_text_classifier(self, text_list, device):
+        text_input = self.sig2_adaptor.tokenizer(text_list).to(device)
+        text_tokens = self.sig2_adaptor.encode_text(text_input, normalize=True)
+        return text_tokens
 
     @torch.no_grad()
     def forward(self, images: torch.Tensor):
@@ -61,8 +65,12 @@ class RADIO_Adaptor(nn.Module):
         with torch.autocast('cuda', dtype=torch.bfloat16):
             student_output = self.student(images)
             if isinstance(student_output, dict):
-                student_output = student_output[self.student_neck_name]
+                student_output = student_output['sam3']
             features = student_output[1]
+            
+            _, backbone_features = student_output['backbone']
+            sig2_vis_features = self.sig2_adaptor.head_mlp(backbone_features)
+
 
         patch_size = int(round(math.sqrt(images.shape[-2] * images.shape[-1] / features.shape[1])))
 
@@ -72,8 +80,14 @@ class RADIO_Adaptor(nn.Module):
         # Reshape from [B, N, C] to [B, C, H, W] to match ViT output format
         features = rearrange(features, 'b (r c) d -> b d r c', r=rows, c=cols)
 
+        sig2_vis_features = rearrange(sig2_vis_features, 'b (r c) d -> b d r c', r=rows, c=cols)
+        other_output={
+            "siglip2-g":{
+                "features": sig2_vis_features.float(),
+            }
+        }
         # Return as a list (ViT returns list of outputs from global attention blocks)
-        return [features.float()]
+        return [other_output, features.float()]
 
 
 def load_radio_model(model_version: str, device: str = 'cuda', vitdet: Optional[int] = None):
@@ -96,7 +110,7 @@ def load_radio_model(model_version: str, device: str = 'cuda', vitdet: Optional[
         'NVlabs/RADIO',
         'radio_model',
         model_version,
-        adaptor_names='sam3',
+        adaptor_names=['sam3','siglip2-g'],
         **extra,
     )
     model = model.to(device)
@@ -130,14 +144,13 @@ def replace_sam3_encoder(sam3_model, radio_model, device: str = 'cuda'):
         student=radio_model,
         input_size=input_size,
         output_channels=sam3_dim,
-        student_neck_name=DEFAULT_NECK_NAME,
     )
 
     # Replace the trunk in SAM3's vision encoder
     sam3_model.backbone.vision_backbone.trunk = adaptor
 
     print("Vision encoder replaced successfully!")
-    return sam3_model
+    return sam3_model, adaptor
 
 
 def create_sam3_radio_processor(sam3_model,
@@ -171,25 +184,25 @@ def create_sam3_radio_processor(sam3_model,
     return processor
 
 
-class RADIOwrapper(nn.Module):
-    def __init__(self): 
-        super().__init__()
+# class RADIOwrapper(nn.Module):
+#     def __init__(self): 
+#         super().__init__()
 
-        self.model = torch.hub.load('NVlabs/RADIO', 
-            'radio_model', 
-            version="c-radio_v4-h", 
-            progress=True, 
-            skip_validation=True, 
-            adaptor_names=['siglip2-g']
-        )
+#         self.model = torch.hub.load('NVlabs/RADIO', 
+#             'radio_model', 
+#             version="c-radio_v4-h", 
+#             progress=True, 
+#             skip_validation=True, 
+#             adaptor_names=['siglip2-g']
+#         )
 
-        self.sig2_adaptor = self.model.adaptors['siglip2-g']
+#         self.sig2_adaptor = self.model.adaptors['siglip2-g']
 
 
-    def forward(self, x):
-        return x
+#     def forward(self, x):
+#         return x
 
-    def get_text_classifier(self, text_list, device):
-        text_input = self.sig2_adaptor.tokenizer(text_list).to(device)
-        text_tokens = self.sig2_adaptor.encode_text(text_input, normalize=True)
-        return text_tokens
+#     def get_text_classifier(self, text_list, device):
+#         text_input = self.sig2_adaptor.tokenizer(text_list).to(device)
+#         text_tokens = self.sig2_adaptor.encode_text(text_input, normalize=True)
+#         return text_tokens
