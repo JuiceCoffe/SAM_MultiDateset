@@ -384,7 +384,6 @@ class RADIOSAM(nn.Module):
                 param.requires_grad = True
         
         # 3. 使用 logger 输出结果
-        logger.info('='*10 + ' Parameters to be TRAINED (requires_grad=True) ' + '='*10)
         
         trainable_count = 0
         for name, param in self.named_parameters():
