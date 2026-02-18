@@ -432,6 +432,9 @@ class TransformerDecoder(nn.Module):
         obj_roi_memory_feat=None,
         obj_roi_memory_mask=None,
         box_head_trk=None,
+
+        use_presence_token = True,
+        fixed_reference_boxes = False,
     ):
         """
         Input:
@@ -490,7 +493,7 @@ class TransformerDecoder(nn.Module):
 
         output = tgt
         presence_out = None
-        if self.presence_token is not None and is_instance_prompt is False:
+        if self.presence_token is not None and is_instance_prompt is False and use_presence_token:
             # expand to batch dim
             presence_out = self.presence_token.weight[None].expand(1, bs, -1)
 
@@ -559,7 +562,7 @@ class TransformerDecoder(nn.Module):
                 intermediate_attention_maps.append(cross_attn_weights) # <--- 3. 收集权重
 
             # iter update
-            if self.box_refine:
+            if self.box_refine and not fixed_reference_boxes:
                 reference_before_sigmoid = inverse_sigmoid(reference_boxes)
                 if box_head_trk is None:
                     # delta_unsig = self.bbox_embed(output)
@@ -580,11 +583,11 @@ class TransformerDecoder(nn.Module):
                 reference_boxes = new_reference_points.detach()
                 if layer_idx != self.num_layers - 1:
                     intermediate_ref_boxes.append(new_reference_points)
-            else:
-                raise NotImplementedError("not implemented yet")
+            # else:
+            #     raise NotImplementedError("not implemented yet")
 
             intermediate.append(out_norm(output))
-            if self.presence_token is not None and is_instance_prompt is False:
+            if self.presence_token is not None and is_instance_prompt is False and use_presence_token:
                 # norm, mlp head
                 intermediate_layer_presence_logits = self.presence_token_head(
                     self.presence_token_out_norm(presence_out)
@@ -611,7 +614,7 @@ class TransformerDecoder(nn.Module):
             torch.stack(intermediate_ref_boxes),
             (
                 torch.stack(intermediate_presence_logits)
-                if self.presence_token is not None and is_instance_prompt is False
+                if self.presence_token is not None and is_instance_prompt is False and use_presence_token
                 else None
             ),
             presence_feats,

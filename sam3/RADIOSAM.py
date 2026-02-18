@@ -277,41 +277,6 @@ class RADIOSAM(nn.Module):
             for i in range (5):
                 for k in criterion_weight_dict.keys():
                     weight_dict[f"{k}_{i}"] = criterion_weight_dict[k]
-        
-        self.encoder_loss = cfg.MODEL.SAM3.ENCODER_LOSS or cfg.MODEL.SAM3.DYNAMIC_QUERY
-        if self.encoder_loss:
-            self.num_encoder_query = cfg.MODEL.SAM3.NUM_ENCODER_QUERY
-            encoder_losses = ["labels", "boxes",]
-            encoder_weight_dict = {
-                "loss_focal": class_weight,  
-                'loss_bbox':bbox_weight, 
-                'loss_giou':giou_weight
-            }
-
-            encoder_matcher = HungarianMatcher(
-                cost_class=class_weight,
-                cost_mask=mask_weight,
-                cost_dice=dice_weight,
-                num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
-                use_mask = False,
-            )
-
-            self.encoder_criterion = SetCriterion(
-                matcher=encoder_matcher,
-                weight_dict=encoder_weight_dict,
-                losses=encoder_losses,
-                num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
-                oversample_ratio=cfg.SOLVER.OVERSAMPLE_RATIO,
-                importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
-            )
-
-            
-            prior_prob = 0.01
-            bias_value = -np.log((1 - prior_prob) / prior_prob)
-            self.encoder_logit_bias = nn.Parameter(torch.ones([]) * bias_value)
-
-            if self.use_cos_sim:
-                self.encoder_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
         # building criterion
         if self.use_softmax:
@@ -1065,34 +1030,6 @@ class RADIOSAM(nn.Module):
             if self.use_cos_sim:
                 fusion_feat = F.normalize(fusion_feat, dim=-1)
 
-            if self.encoder_loss:
-                if self.use_cdt:
-                    encoder_logits = torch.einsum("bld,bcd->blc", fusion_feat, text_classifier)
-                else:
-                    encoder_logits = torch.einsum("bld,cd->blc", fusion_feat, text_classifier)
-                
-                if self.use_cos_sim:
-                    e_logit_scale = self.encoder_logit_scale.exp()
-                    e_logit_scale = torch.clamp(e_logit_scale, max=100.0)
-                    encoder_logits = encoder_logits * e_logit_scale + self.encoder_logit_bias
-                else:
-                    encoder_logits = encoder_logits / (fusion_feat.shape[-1] ** 0.5) + self.encoder_logit_bias
-
-
-                encoder_logits = aggregate_name_to_class_logits(encoder_logits, num_templates)
-
-                encoder_score = encoder_logits.max(-1).values # [bs, HW]
-                k_selected = self.num_encoder_query
-                topk_values, topk_indices = torch.topk(encoder_score, k_selected, dim=1) # [bs, k]
-                topk_indices_unsqueezed = topk_indices.unsqueeze(-1).repeat(1, 1, fusion_feat.shape[-1])
-                topK_fusion_feat = torch.gather(fusion_feat, 1, topk_indices_unsqueezed) # [bs, k, D]
-                num_classes = encoder_logits.shape[-1]
-                encoder_cls_logits = torch.gather(
-                    encoder_logits, 
-                    1, 
-                    topk_indices.unsqueeze(-1).expand(-1, -1, num_classes)
-                )
-
 
             out = {
                 "encoder_hidden_states": encoder_out["encoder_hidden_states"],
@@ -1113,111 +1050,29 @@ class RADIOSAM(nn.Module):
                 #     prompt_mask=prompt_mask,
                 #     encoder_out=encoder_out,
                 # )
-                if self.DynamicQuery:
-                    # ---------------- Relative Offset Prediction 修改开始 ----------------
-                    
-                    # 1. 获取全图的网格锚点 (Grid Anchors)
-                    # encoder_out["spatial_shapes"] 包含了特征图的高宽
-                    # grid_anchors shape: [1, Total_HW, 2] -> (x, y)
-                    grid_anchors = get_grid_reference_points(
-                        encoder_out["spatial_shapes"], 
-                        device=self.device
+                
+                query_embed = self.detector.transformer.decoder.query_embed.weight
+                query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+
+                hs, reference_boxes, dec_presence_out, dec_presence_feats, _ = (
+                    self.detector.transformer.decoder(
+                        tgt=query_embed,
+                        memory=out["encoder_hidden_states"],
+                        memory_key_padding_mask=encoder_out["padding_mask"],
+                        pos=encoder_out["pos_embed"],
+                        reference_boxes=None,
+                        level_start_index=encoder_out["level_start_index"],
+                        spatial_shapes=encoder_out["spatial_shapes"],
+                        valid_ratios=encoder_out["valid_ratios"],
+                        tgt_mask=None,
+                        memory_text=prompt,
+                        text_attention_mask=prompt_mask,
+                        apply_dac=False,
+
+                        use_presence_token = False,
                     )
-                    
-                    # 2. 扩展到 Batch 维度
-                    # grid_anchors shape: [bs, Total_HW, 2]
-                    grid_anchors = grid_anchors.expand(bs, -1, -1)
-                    
-                    # 3. 根据 TopK 索引提取对应的锚点
-                    # topk_indices shape: [bs, k]
-                    # 我们需要 gather 最后一个维度 (x, y)，所以要扩展 indices
-                    gather_idx = topk_indices.unsqueeze(-1).repeat(1, 1, 2) # [bs, k, 2]
-                    
-                    # topk_anchors_xy shape: [bs, k, 2]
-                    topk_anchors_xy = torch.gather(grid_anchors, 1, gather_idx)
-                    
-                    # 4. 构建完整的 4D 锚点 (x, y, w, h)
-                    # x, y 来自网格，w, h 初始化为一个较小的先验值 (例如 0.05)
-                    # 这样 inverse_sigmoid 不会溢出，且符合物体初始尺寸较小的假设
-                    anchor_wh_prior = torch.full_like(topk_anchors_xy, 0.05)
-                    topk_anchors = torch.cat([topk_anchors_xy, anchor_wh_prior], dim=-1) # [bs, k, 4]
-                    
-                    # 5. 计算偏移量 (Logit Space)
-                    # encoder_box_head 输出的是相对于锚点的偏移修正量
-                    delta_box_logits = self.encoder_box_head(topK_fusion_feat)
-                    
-                    # 6. 核心公式：Box = Sigmoid( Delta + InverseSigmoid(Anchor) )
-                    # 将锚点转换到 logit 域，加上偏移量，再转回 [0, 1] 域
-                    anchor_logits = inverse_sigmoid(topk_anchors)
-                    encoder_box = (delta_box_logits + anchor_logits).sigmoid() # [bs, k, 4]
-                    
-                    # ---------------- Relative Offset Prediction 修改结束 ----------------
+                )
 
-                    hs, reference_boxes, dec_presence_out, dec_presence_feats = (
-                        self.detector.transformer.decoder(
-
-                            tgt=topK_fusion_feat.permute(1,0,2).detach(), # TopK fusion feat
-
-                            memory=out["encoder_hidden_states"],
-                            memory_key_padding_mask=encoder_out["padding_mask"],
-                            pos=encoder_out["pos_embed"],
-
-                            reference_boxes=encoder_box.permute(1,0,2).detach(),
-
-                            level_start_index=encoder_out["level_start_index"],
-                            spatial_shapes=encoder_out["spatial_shapes"],
-                            valid_ratios=encoder_out["valid_ratios"],
-                            tgt_mask=None,
-                            memory_text=prompt,
-                            text_attention_mask=prompt_mask,
-                            apply_dac=False,
-                        )
-                    )
-
-                else:
-                    query_embed = self.detector.transformer.decoder.query_embed.weight
-                    query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
-
-                    if self.add_radio_feat:
-                        radio_img_feat = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
-                        radio_img_feat = radio_img_feat.view(bs, 1536, -1).permute(0,2,1)
-                        decoder_img_feat = radio_img_feat + self.fusion_feat_proj(out["encoder_hidden_states"].permute(1,0,2))
-                        decoder_img_feat = self.radio_feat_proj(decoder_img_feat)
-                        decoder_img_feat = decoder_img_feat.permute(1,0,2)
-
-                        hs, reference_boxes, dec_presence_out, dec_presence_feats, cross_attn_weights = (
-                            self.detector.transformer.decoder(
-                                tgt=query_embed,
-                                memory=decoder_img_feat,
-                                memory_key_padding_mask=encoder_out["padding_mask"],
-                                pos=encoder_out["pos_embed"],
-                                reference_boxes=None,
-                                level_start_index=encoder_out["level_start_index"],
-                                spatial_shapes=encoder_out["spatial_shapes"],
-                                valid_ratios=encoder_out["valid_ratios"],
-                                tgt_mask=None,
-                                memory_text=prompt,
-                                text_attention_mask=prompt_mask,
-                                apply_dac=False,
-                            )
-                        )
-                    else:
-                        hs, reference_boxes, dec_presence_out, dec_presence_feats, cross_attn_weights = (
-                            self.detector.transformer.decoder(
-                                tgt=query_embed,
-                                memory=out["encoder_hidden_states"],
-                                memory_key_padding_mask=encoder_out["padding_mask"],
-                                pos=encoder_out["pos_embed"],
-                                reference_boxes=None,
-                                level_start_index=encoder_out["level_start_index"],
-                                spatial_shapes=encoder_out["spatial_shapes"],
-                                valid_ratios=encoder_out["valid_ratios"],
-                                tgt_mask=None,
-                                memory_text=prompt,
-                                text_attention_mask=prompt_mask,
-                                apply_dac=False,
-                            )
-                        )
                 hs = hs.transpose(1, 2)  # seq-first to batch-first
                 reference_boxes = reference_boxes.transpose(1, 2)  # seq-first to batch-first
                 if dec_presence_out is not None:
@@ -1273,6 +1128,7 @@ class RADIOSAM(nn.Module):
             out_masks = outputs["pred_masks"].clone()
 
             out_masks = out_masks.sigmoid()
+            bs, N, H, W = out_masks.shape
 
             # presence_score = outputs["presence_logit_dec"].sigmoid().unsqueeze(1) # 在多类别情况下认为失效
 
@@ -1289,11 +1145,7 @@ class RADIOSAM(nn.Module):
             # out_masks shape: torch.Size([1, 200, 1008, 1008]) out_probs shape: torch.Size([1, 200]) out_semseg shape: torch.Size([1, 1, 1008, 1008]) presence_score shape: torch.Size([1, 1, 1])
             pred_boxes = outputs['pred_boxes']
             pred_boxes_xyxy = outputs['pred_boxes_xyxy']
-            # print("pred_boxes:",pred_boxes.shape)
-            # print("pred_boxes_xyxy:",pred_boxes_xyxy.shape)
-            
 
-            bs, N, H, W = out_masks.shape
             C_ = SAM_text_classifier.shape[0] # num_names 
 
             queries_masks = out_masks # out_probs是通过与池化prompt投影卷积实现的，多类别下失效，直接用原始mask_logits
@@ -1309,7 +1161,34 @@ class RADIOSAM(nn.Module):
             if self.new_score_head:
                 obj_logits = self.score_head(queries).squeeze(-1)
 
-        
+            if self.add_radio_feat:
+                radio_img_feat = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
+                radio_img_feat = radio_img_feat.view(bs, 1536, -1).permute(0,2,1)
+                decoder_img_feat = radio_img_feat + self.fusion_feat_proj(out["encoder_hidden_states"].permute(1,0,2))
+                decoder_img_feat = self.radio_feat_proj(decoder_img_feat)
+                decoder_img_feat = decoder_img_feat.permute(1,0,2)
+
+                class_tokens, _, _, _, cross_attn_weights = (
+                    self.detector.transformer.decoder(
+                        tgt=self.detector.transformer.decoder.presence_token.weight.unsqueeze(1).expand(N, bs, -1),
+                        memory=decoder_img_feat,
+                        memory_key_padding_mask=encoder_out["padding_mask"],
+                        pos=encoder_out["pos_embed"],
+                        reference_boxes=pred_boxes.permute(1, 0, 2),
+                        level_start_index=encoder_out["level_start_index"],
+                        spatial_shapes=encoder_out["spatial_shapes"],
+                        valid_ratios=encoder_out["valid_ratios"],
+                        tgt_mask=None,
+                        memory_text=prompt,
+                        text_attention_mask=prompt_mask,
+                        apply_dac=False,
+
+                        use_presence_token = False,
+                        fixed_reference_boxes = True
+                    )
+                )
+
+                queries = class_tokens.permute(0,2,1,3)
 
             for i in range(6):
                 assert queries.shape[0] == 6
