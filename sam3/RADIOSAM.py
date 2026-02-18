@@ -163,11 +163,16 @@ class RADIOSAM(nn.Module):
         self.use_attnpool = cfg.MODEL.ATTNPOOL.ENABLE
         if self.use_attnpool:
             self.attnpool_weight_dict = {"loss_attn_ce": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT}
+            self.num_gt_masks = cfg.MODEL.ATTNPOOL.NUM_GT_MASKS
+            self.iou_threshold = cfg.MODEL.ATTNPOOL.IOU_THRESHOLD
+            self.num_pred_masks = cfg.MODEL.ATTNPOOL.NUM_PRED_MASKS
             self.aux_attn_pool = cfg.MODEL.ATTNPOOL.USE_AUX
             if self.aux_attn_pool:
-                for i in range(5):
-                     for k in self.attnpool_weight_dict.keys():
-                        self.attnpool_weight_dict[f"{k}_{i}"] = self.attnpool_weight_dict[k]
+                attnpool_weight_dict_aux = {}
+                for i in range (5):
+                    for k in self.attnpool_weight_dict.keys():
+                        attnpool_weight_dict_aux[f"{k}_{i}"] = self.attnpool_weight_dict[k]
+                self.attnpool_weight_dict.update(attnpool_weight_dict_aux) 
             self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         else:
             self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(100))
@@ -1383,18 +1388,20 @@ class RADIOSAM(nn.Module):
                 img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
                 text_classifier, num_templates = self.get_text_classifier(dataname)
 
-                assert query_attn_weights.shape[0] == 6
+                assert cross_attn_weights.shape[0] == 6
                 for i in range(6):
                     if self.aux_attn_pool or i == 5:
-                        attn_weights = query_attn_weights[i]
+                        attn_weights = cross_attn_weights[i]
 
                         pooled_img_feat = torch.einsum("bdl, bnl->bnd", img_feat_for_pool.view(bs, img_feat_for_pool.shape[1],-1), attn_weights)
 
                         attn_cls_results = get_classification_logits(pooled_img_feat, text_classifier, self.out_vocab_logit_scale, num_templates)
+
+                        mask_pred_results = outputs['aux_outputs'][i]["pred_masks"] if i < 5 else outputs["pred_masks"]
                         
                         _, matched_src_cls, _, mask_labels = self.match_via_iou(mask_pred_results, attn_cls_results, targets, iou_threshold=self.iou_threshold,max_matches=self.num_pred_masks)
 
-                        loss_attn_ce = self.cross_entropy_loss(attn_cls_results, mask_labels)["loss_ce"]
+                        loss_attn_ce = self.cross_entropy_loss(matched_src_cls, mask_labels)["loss_ce"]
                         if i == 5:
                             attnpool_losses["loss_attn_ce"] = loss_attn_ce
                         else:
@@ -1408,7 +1415,19 @@ class RADIOSAM(nn.Module):
 
                 losses.update(attnpool_losses)
 
-            return losses
+            # loss排序
+            all_keys = list(losses.keys())
+            aux_suffixes = [f"_{i}" for i in range(5)]
+            main_keys = sorted([k for k in all_keys if not any(k.endswith(s) for s in aux_suffixes)])
+            aux_keys = sorted([k for k in all_keys if any(k.endswith(s) for s in aux_suffixes)])
+
+            ordered_losses = {}
+            for k in main_keys:
+                ordered_losses[k] = losses[k]
+            for k in aux_keys:
+                ordered_losses[k] = losses[k]
+
+            return ordered_losses
         
         else:
                 
@@ -1427,7 +1446,7 @@ class RADIOSAM(nn.Module):
                 img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
                 text_classifier, num_templates = self.get_text_classifier(dataname)
                 
-                attn_weights = query_attn_weights[-1]
+                attn_weights = cross_attn_weights[-1]
 
                 pooled_img_feat = torch.einsum("bdl, bnl->bnd", img_feat_for_pool.view(bs, img_feat_for_pool.shape[1],-1), attn_weights)
 
@@ -1996,6 +2015,7 @@ class RADIOSAM(nn.Module):
         matched_src_masks = torch.stack(matched_src_masks, dim=0) 
         matched_target_masks = torch.stack(matched_target_masks, dim=0)
         matched_labels = torch.stack(matched_labels, dim=0)
+        matched_src_cls = torch.stack(matched_src_cls, dim=0) 
         
         # 返回值增加了 matched_src_cls
         return matched_src_masks, matched_src_cls, matched_target_masks, matched_labels
