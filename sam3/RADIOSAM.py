@@ -169,7 +169,8 @@ class RADIOSAM(nn.Module):
             self.aux_attn_pool = cfg.MODEL.ATTNPOOL.USE_AUX
             self.add_radio_feat = cfg.MODEL.ATTNPOOL.ADD_RADIO_FEAT
             if self.add_radio_feat:
-                self.radio_feat_proj =  MLP(1280, 512, 256, 3)
+                self.fusion_feat_proj = MLP(256, 512, 1536, 3)
+                self.radio_feat_proj =  MLP(1536, 512, 256, 3)
             if self.aux_attn_pool:
                 attnpool_weight_dict_aux = {}
                 for i in range (5):
@@ -1178,14 +1179,16 @@ class RADIOSAM(nn.Module):
                     query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
 
                     if self.add_radio_feat:
-                        radio_img_feat = backbone_out_vision['vit_feature'][0]["backbone"]["features"]
-                        radio_img_feat = self.radio_feat_proj(radio_img_feat)
-                        radio_img_feat = radio_img_feat.permute(1,0,2)
+                        radio_img_feat = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
+                        radio_img_feat = radio_img_feat.view(bs, 1536, -1).permute(0,2,1)
+                        decoder_img_feat = radio_img_feat + self.fusion_feat_proj(out["encoder_hidden_states"].permute(1,0,2))
+                        decoder_img_feat = self.radio_feat_proj(decoder_img_feat)
+                        decoder_img_feat = decoder_img_feat.permute(1,0,2)
 
                         hs, reference_boxes, dec_presence_out, dec_presence_feats, cross_attn_weights = (
                             self.detector.transformer.decoder(
                                 tgt=query_embed,
-                                memory=out["encoder_hidden_states"] + radio_img_feat,
+                                memory=decoder_img_feat,
                                 memory_key_padding_mask=encoder_out["padding_mask"],
                                 pos=encoder_out["pos_embed"],
                                 reference_boxes=None,
