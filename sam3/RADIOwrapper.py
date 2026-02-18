@@ -83,6 +83,9 @@ class RADIO_Adaptor(nn.Module):
         other_output={
             "siglip2-g":{
                 "features": sig2_vis_features.float(),
+            },
+            "backbone":{
+                "features": backbone_features.float(),
             }
         }
         # Return as a list (ViT returns list of outputs from global attention blocks)

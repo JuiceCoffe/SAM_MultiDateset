@@ -167,6 +167,9 @@ class RADIOSAM(nn.Module):
             self.iou_threshold = cfg.MODEL.ATTNPOOL.IOU_THRESHOLD
             self.num_pred_masks = cfg.MODEL.ATTNPOOL.NUM_PRED_MASKS
             self.aux_attn_pool = cfg.MODEL.ATTNPOOL.USE_AUX
+            self.add_radio_feat = cfg.MODEL.ATTNPOOL.ADD_RADIO_FEAT
+            if self.add_radio_feat:
+                self.radio_feat_proj =  MLP(1280, 512, 256, 3)
             if self.aux_attn_pool:
                 attnpool_weight_dict_aux = {}
                 for i in range (5):
@@ -1174,22 +1177,44 @@ class RADIOSAM(nn.Module):
                     query_embed = self.detector.transformer.decoder.query_embed.weight
                     query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
 
-                    hs, reference_boxes, dec_presence_out, dec_presence_feats, cross_attn_weights = (
-                        self.detector.transformer.decoder(
-                            tgt=query_embed,
-                            memory=out["encoder_hidden_states"],
-                            memory_key_padding_mask=encoder_out["padding_mask"],
-                            pos=encoder_out["pos_embed"],
-                            reference_boxes=None,
-                            level_start_index=encoder_out["level_start_index"],
-                            spatial_shapes=encoder_out["spatial_shapes"],
-                            valid_ratios=encoder_out["valid_ratios"],
-                            tgt_mask=None,
-                            memory_text=prompt,
-                            text_attention_mask=prompt_mask,
-                            apply_dac=False,
+                    if self.add_radio_feat:
+                        radio_img_feat = backbone_out_vision['vit_feature'][0]["backbone"]["features"]
+                        radio_img_feat = self.radio_feat_proj(radio_img_feat)
+                        radio_img_feat = radio_img_feat.permute(1,0,2)
+
+                        hs, reference_boxes, dec_presence_out, dec_presence_feats, cross_attn_weights = (
+                            self.detector.transformer.decoder(
+                                tgt=query_embed,
+                                memory=out["encoder_hidden_states"] + radio_img_feat,
+                                memory_key_padding_mask=encoder_out["padding_mask"],
+                                pos=encoder_out["pos_embed"],
+                                reference_boxes=None,
+                                level_start_index=encoder_out["level_start_index"],
+                                spatial_shapes=encoder_out["spatial_shapes"],
+                                valid_ratios=encoder_out["valid_ratios"],
+                                tgt_mask=None,
+                                memory_text=prompt,
+                                text_attention_mask=prompt_mask,
+                                apply_dac=False,
+                            )
                         )
-                    )
+                    else:
+                        hs, reference_boxes, dec_presence_out, dec_presence_feats, cross_attn_weights = (
+                            self.detector.transformer.decoder(
+                                tgt=query_embed,
+                                memory=out["encoder_hidden_states"],
+                                memory_key_padding_mask=encoder_out["padding_mask"],
+                                pos=encoder_out["pos_embed"],
+                                reference_boxes=None,
+                                level_start_index=encoder_out["level_start_index"],
+                                spatial_shapes=encoder_out["spatial_shapes"],
+                                valid_ratios=encoder_out["valid_ratios"],
+                                tgt_mask=None,
+                                memory_text=prompt,
+                                text_attention_mask=prompt_mask,
+                                apply_dac=False,
+                            )
+                        )
                 hs = hs.transpose(1, 2)  # seq-first to batch-first
                 reference_boxes = reference_boxes.transpose(1, 2)  # seq-first to batch-first
                 if dec_presence_out is not None:
