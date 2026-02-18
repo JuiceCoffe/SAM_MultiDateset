@@ -160,18 +160,18 @@ class RADIOSAM(nn.Module):
         self.mask_pooling = MaskPooling()
 
 
-        self.use_MaskAdapter = cfg.MODEL.USE_MASKADAPTER
-        if self.use_MaskAdapter:
-            from .mask_adapter_head import load_mask_adapter_standalone
-            self.mask_adapter = build_mask_adapter(cfg, cfg.MODEL.MASK_ADAPTER.NAME)
-            self.num_output_maps = cfg.MODEL.MASK_ADAPTER.NUM_OUTPUT_MAPS
-            self.iou_threshold = cfg.MODEL.MASK_ADAPTER.IOU_THRESHOLD
-            self.mask_threshold = cfg.MODEL.MASK_ADAPTER.MASK_THRESHOLD
-            self.num_gt_masks = cfg.MODEL.MASK_ADAPTER.NUM_GT_MASKS
-            self.num_pred_masks = cfg.MODEL.MASK_ADAPTER.NUM_PRED_MASKS
+        self.use_attnpool = cfg.MODEL.ATTNPOOL.ENABLE
+        if self.use_attnpool:
+            self.attnpool_weight_dict = {"loss_attn_ce": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT}
+            self.aux_attn_pool = cfg.MODEL.ATTNPOOL.USE_AUX
+            if self.aux_attn_pool:
+                for i in range(5):
+                     for k in self.attnpool_weight_dict.keys():
+                        self.attnpool_weight_dict[f"{k}_{i}"] = self.attnpool_weight_dict[k]
+            self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        else:
+            self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(100))
 
-            self.mask_adapter_weight_dict = {"loss_ce": cfg.MODEL.MASK_ADAPTER.CLASS_WEIGHT, "loss_cosine": cfg.MODEL.MASK_ADAPTER.COS_WEIGHT}
-   
 
         self.new_score_head = cfg.MODEL.SAM3.NEW_SCORE_HEAD
         if self.new_score_head:
@@ -1376,71 +1376,37 @@ class RADIOSAM(nn.Module):
 
                 losses.update(fcclip_losses)
 
-            if self.use_MaskAdapter:
-                mask_adapter_losses = {}
+            if self.use_attnpool:
+                attnpool_losses = {}
+                targets, _ , _ = self.prepare_targets_for_maskadapter(gt_instances, images)
 
-                img_feat_for_pool = backbone_out_vision['vit_feature']
-                # print("img_feat_for_pool shape:", img_feat_for_pool.shape)
-                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-                targets, masks, labels = self.prepare_targets_for_maskadapter(gt_instances, images)
-
-                mask_pred_results = outputs["pred_masks"]
-                mask_cls_results = query_cls_results_final
-
-                src_masks, target_masks, mask_labels = self.match_via_iou(mask_pred_results, mask_cls_results, targets, iou_threshold=self.iou_threshold,max_matches=self.num_pred_masks)
-                binary_src_masks = src_masks.sigmoid() > self.mask_threshold
-                binary_src_masks = binary_src_masks.float()
-
-                binary_src_masks = F.interpolate(binary_src_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
-                target_masks = F.interpolate(target_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
-
-                mask_pred = torch.cat((masks, binary_src_masks, target_masks),dim=1)
-                all_labels = torch.cat((labels, mask_labels, mask_labels),dim=1)
-                    
-                # maps_for_pooling = self.mask_adapter(img_feat_for_pool, mask_pred)
-                maps_for_pooling = []
-                for i in range(bs):
-                    maps_for_pooling_batch = self.mask_adapter(img_feat_for_pool[i:i+1, :, :, :], mask_pred[i:i+1, :, :, :])
-                    maps_for_pooling.append(maps_for_pooling_batch)
-                maps_for_pooling = torch.cat(maps_for_pooling, dim=0)
-                
-                maps_for_pooling = F.interpolate(maps_for_pooling, size=img_feat_for_pool.shape[-2:],
-                                                    mode='bilinear', align_corners=False)
-
-            
-                N = maps_for_pooling.size(1)
-                num_instances = N // self.num_output_maps
-                maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N,-1), dim=-1)
-                pooled_img_feature = torch.bmm(maps_for_pooling, img_feat_for_pool.view(bs, img_feat_for_pool.size(1), -1).permute(0, 2, 1))
-                pooled_img_feature = (pooled_img_feature.reshape(bs, num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
-
-                loss_cosine_similarity = self.cosine_similarity_loss(pooled_img_feature[:, 16:24, :], pooled_img_feature[:, 24:, :])
-
+                img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
                 text_classifier, num_templates = self.get_text_classifier(dataname)
-                mask_cls_results = get_classification_logits(pooled_img_feature, text_classifier, 100, num_templates)
 
-                loss_mask_cls = self.cross_entropy_loss(mask_cls_results, all_labels)
+                assert query_attn_weights.shape[0] == 6
+                for i in range(6):
+                    if self.aux_attn_pool or i == 5:
+                        attn_weights = query_attn_weights[i]
 
-                mask_adapter_losses.update(loss_cosine_similarity)
-                mask_adapter_losses.update(loss_mask_cls)
+                        pooled_img_feat = torch.einsum("bdl, bnl->bnd", img_feat_for_pool.view(bs, img_feat_for_pool.shape[1],-1), attn_weights)
 
-                for k in list(mask_adapter_losses.keys()):
-                    # print("loss:", k, losses[k].item())
-                    if k in self.mask_adapter_weight_dict:
-                        mask_adapter_losses[k] *= self.mask_adapter_weight_dict[k]
+                        attn_cls_results = get_classification_logits(pooled_img_feat, text_classifier, self.out_vocab_logit_scale, num_templates)
+                        
+                        _, matched_src_cls, _, mask_labels = self.match_via_iou(mask_pred_results, attn_cls_results, targets, iou_threshold=self.iou_threshold,max_matches=self.num_pred_masks)
+
+                        loss_attn_ce = self.cross_entropy_loss(attn_cls_results, mask_labels)["loss_ce"]
+                        if i == 5:
+                            attnpool_losses["loss_attn_ce"] = loss_attn_ce
+                        else:
+                            attnpool_losses[f"loss_attn_ce_{i}"] = loss_attn_ce
+
+                for k in list(attnpool_losses.keys()):
+                    if k in self.attnpool_weight_dict:
+                        attnpool_losses[k] *= self.attnpool_weight_dict[k]
                     else:
-                        # remove this loss if not specified in `weight_dict`
-                        mask_adapter_losses.pop(k)
+                        attnpool_losses.pop(k)
 
-                losses.update(mask_adapter_losses)
-            
-            if self.encoder_loss:
-                encoder_outputs = {'pred_logits': encoder_cls_logits, 'pred_boxes': encoder_box}
-                encoder_losses = self.encoder_criterion(encoder_outputs, targets)
-                for k in list(encoder_losses.keys()):
-                    # print("loss:", k, losses[k].item())
-                    if k in self.encoder_criterion.weight_dict:
-                        losses[k + '_encoder'] = encoder_losses[k] * self.encoder_criterion.weight_dict[k]
+                losses.update(attnpool_losses)
 
             return losses
         
@@ -1457,32 +1423,16 @@ class RADIOSAM(nn.Module):
             # 强制清理 CUDA 缓存（虽然有开销，但能有效防止 OOM）
             torch.cuda.empty_cache()
 
-            if self.use_MaskAdapter:
-                mask_cls_results = outputs["pred_logits"]
-                mask_pred_results = outputs["pred_masks"]
-
-                img_feat_for_pool = backbone_out_vision['vit_feature']
-
-                binary_masks = mask_pred_results.sigmoid() > self.mask_threshold
+            if self.use_attnpool:
+                img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
+                text_classifier, num_templates = self.get_text_classifier(dataname)
                 
-                # maps_for_pooling = self.mask_adapter(img_feat_for_pool, binary_masks)
-                adapter_batchsize = 32
-                maps_for_pooling_list = []
-                for i in range(0, mask_pred_results.shape[1], adapter_batchsize):
-                    batch_binary_masks = binary_masks[:, i:i+adapter_batchsize, :, :]
-                    maps_for_pooling_batch = self.mask_adapter(img_feat_for_pool, batch_binary_masks)
-                    maps_for_pooling_list.append(maps_for_pooling_batch)
-                maps_for_pooling = torch.cat(maps_for_pooling_list, dim=1)
+                attn_weights = query_attn_weights[-1]
 
-                maps_for_pooling = F.interpolate(maps_for_pooling, size=img_feat_for_pool.shape[-2:],
-                                            mode='bilinear', align_corners=False)
-                N_maps = maps_for_pooling.size(1)
-                num_instances = N_maps // self.num_output_maps
-                maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N_maps,-1), dim=-1)
-                pooled_img_feature = torch.bmm(maps_for_pooling, img_feat_for_pool.view(bs, img_feat_for_pool.size(1), -1).permute(0, 2, 1))
-                pooled_img_feature = (pooled_img_feature.reshape(bs,num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
-                pooled_img_feat = pooled_img_feature
-                pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
+                pooled_img_feat = torch.einsum("bdl, bnl->bnd", img_feat_for_pool.view(bs, img_feat_for_pool.shape[1],-1), attn_weights)
+
+                pool_cls_logits = get_classification_logits(pooled_img_feat, text_classifier, self.out_vocab_logit_scale, num_templates)
+                            
 
 
             else:
@@ -1494,22 +1444,22 @@ class RADIOSAM(nn.Module):
 
 
                             
-            text_classifier, num_templates = self.get_text_classifier(dataname)
+                text_classifier, num_templates = self.get_text_classifier(dataname)
 
-            maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier, pooled_img_feat) 
+                maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier, pooled_img_feat) 
 
-            maskpool_name_logits = maskpool_name_logits * 100
-            
-            maskpool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
+                maskpool_name_logits = maskpool_name_logits * 100
+                
+                pool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
 
             if self.use_softmax:
                 is_void_prob = F.softmax(query_cls_results_final, dim=-1)[..., -1:]
                 in_vocab_cls_results = query_cls_results_final[..., :-1] 
                 in_vocab_cls_probs = in_vocab_cls_results.softmax(-1)
-                out_vocab_cls_probs = maskpool_cls_logits.softmax(-1)
+                out_vocab_cls_probs = pool_cls_logits.softmax(-1)
             else:
                 in_vocab_cls_probs = torch.sigmoid(query_cls_results_final)
-                out_vocab_cls_probs = F.softmax(maskpool_cls_logits, dim=-1)
+                out_vocab_cls_probs = F.softmax(pool_cls_logits, dim=-1)
             category_overlapping_mask = self.SAM_category_overlapping_mask.to(self.device)
             alpha = self.alpha
             beta = self.beta
@@ -1974,6 +1924,7 @@ class RADIOSAM(nn.Module):
         matched_src_masks = []
         matched_target_masks = []
         matched_labels = []
+        matched_src_cls = []  # <--- [修改1] 新增列表存储匹配的分类结果
 
         
         for b in range(batch_size):
@@ -2025,16 +1976,29 @@ class RADIOSAM(nn.Module):
                     torch.cat([tgt_label[matched_tgt_idx], 
                             torch.full((num_to_add,), -1, dtype=tgt_label.dtype, device=tgt_label.device)], dim=0)
                 )
+
+                 # --- [修改2] Class Result 填充 ---
+                # pred_cls 的形状通常是 (Num_Preds, Num_Classes)
+                # 我们取出匹配的部分，剩余部分用0填充
+                matched_src_cls.append(
+                    torch.cat([pred_cls[matched_pred_idx], 
+                            torch.zeros((num_to_add, pred_cls.shape[-1]), device=pred_cls.device, dtype=pred_cls.dtype)], dim=0)
+                )
+
             else:
                 matched_src_masks.append(pred_mask[matched_pred_idx])
                 matched_target_masks.append(tgt_mask[matched_tgt_idx])
                 matched_labels.append(tgt_label[matched_tgt_idx])
+                
+                # --- [修改3] Class Result 直接提取 ---
+                matched_src_cls.append(pred_cls[matched_pred_idx])
 
         matched_src_masks = torch.stack(matched_src_masks, dim=0) 
         matched_target_masks = torch.stack(matched_target_masks, dim=0)
         matched_labels = torch.stack(matched_labels, dim=0)
         
-        return matched_src_masks, matched_target_masks, matched_labels
+        # 返回值增加了 matched_src_cls
+        return matched_src_masks, matched_src_cls, matched_target_masks, matched_labels
 
     def cross_entropy_loss(self, mask_cls_results, labels):
         
@@ -2064,7 +2028,7 @@ class RADIOSAM(nn.Module):
         
         # 获取 Attention weights
         if cross_attn_weights is not None:
-            attn_weights = cross_attn_weights[1] # 取最后一层
+            attn_weights = cross_attn_weights[-1] # 取最后一层
         else:
             print("cross_attn_weights is None.")
             return
