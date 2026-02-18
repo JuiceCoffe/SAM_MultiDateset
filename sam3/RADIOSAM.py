@@ -1168,9 +1168,15 @@ class RADIOSAM(nn.Module):
                 decoder_img_feat = self.radio_feat_proj(decoder_img_feat)
                 decoder_img_feat = decoder_img_feat.permute(1,0,2)
 
+                pixel_embed = outputs["pixel_embed"] 
+                pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"])
+                cls_queries = self.detector.transformer.decoder.presence_token.weight.unsqueeze(1).expand(bs, N, -1)
+                cls_queries = cls_queries + pooled_pixel_embed
+                cls_queries = cls_queries.permute(1,0,2)
+
                 class_tokens, _, _, _, cross_attn_weights = (
                     self.detector.transformer.decoder(
-                        tgt=self.detector.transformer.decoder.presence_token.weight.unsqueeze(1).expand(N, bs, -1),
+                        tgt=cls_queries,
                         memory=decoder_img_feat,
                         memory_key_padding_mask=encoder_out["padding_mask"],
                         pos=encoder_out["pos_embed"],
