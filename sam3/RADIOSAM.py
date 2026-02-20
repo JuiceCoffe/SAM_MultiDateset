@@ -1231,9 +1231,9 @@ class RADIOSAM(nn.Module):
 
                 text_classifier, num_templates = self.get_text_classifier(dataname)
                 
-                attn_cls_results = get_classification_logits(pooled_img_feat.view(-1 , N, pooled_img_feat.shape[-1]), text_classifier, self.out_vocab_logit_scale, num_templates)
+                attn_cls_results = get_classification_logits(pooled_img_feat.reshape(-1 , N, pooled_img_feat.shape[-1]), text_classifier, self.out_vocab_logit_scale, num_templates)
 
-                attn_cls_results = attn_cls_results.view(-1, bs, N, C_ -1)
+                attn_cls_results = attn_cls_results.view(-1, bs, N, attn_cls_results.shape[-1])
 
             for i in range(6):
                 assert queries.shape[0] == 6
