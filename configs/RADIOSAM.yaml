@@ -16,9 +16,9 @@ MODEL:
     USE_SOFTMAX: True
     ADD_PIXELFEAT: True
 
-    ALPHA: 1.0
-    BETA: 1.0
-    ORACLE_SELECT: True
+    ALPHA: 0.4
+    BETA: 0.8
+    # ORACLE_SELECT: True
 
   # TEACHER: CONVCLIP
   # TEACHER_MASKPOOL: True

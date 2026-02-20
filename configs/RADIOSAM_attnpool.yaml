@@ -50,7 +50,7 @@ SOLVER:
   LR_SCHEDULER_NAME: WarmupPolyLR
   STEPS: (15000, 17500)
   MAX_ITER: 40000
-  CHECKPOINT_PERIOD: 7500
+  CHECKPOINT_PERIOD: 5000
   
 
   CLASS_WEIGHT: 2.0
@@ -83,7 +83,7 @@ DATALOADER:
   DATASET_RATIO: [1.0]
 
   # # Batch Size 对应单个数据集
-  DATASET_BS: [8]
+  DATASET_BS: [4]
   
   # COCO 通常不需要 RFS (Repeat Factor Sampling)
   USE_RFS: [False]
@@ -99,14 +99,13 @@ DATALOADER:
   USE_DIFF_BS_SIZE: True
 
 TEST:
-  EVAL_PERIOD: 25000
+  EVAL_PERIOD: 50
+  SEMANTIC_ON: True   
   # INSTANCE_ON: True   
   # PANOPTIC_ON: True   
-  SEMANTIC_ON: True   
-
 # 修改输出目录名称以区分实验
 VERSION: 2
 
-# OUTPUT_DIR: ./out/test/
-OUTPUT_DIR: ./out/RADIOSAM/copa_attn
+OUTPUT_DIR: ./out/test/
+# OUTPUT_DIR: ./out/RADIOSAM/copa_attn
   

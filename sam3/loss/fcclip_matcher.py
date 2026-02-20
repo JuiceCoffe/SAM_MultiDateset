@@ -126,6 +126,10 @@ class FcclipHungarianMatcher(nn.Module):
             # The 1 is a constant that doesn't change the matching, it can be ommitted.
             cost_class = -out_prob[:, tgt_ids]
 
+            if "attn_cls_logits" in outputs.keys():
+                attn_cls_prob = outputs["attn_cls_logits"][b].softmax(-1)  # [num_queries, num_classes]
+                cost_class += -attn_cls_prob[:, tgt_ids]
+
             # --- 2. Box Cost (修改点：加入健壮性检查) ---
             cost_bbox = 0
             cost_giou = 0

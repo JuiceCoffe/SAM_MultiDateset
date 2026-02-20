@@ -152,6 +152,14 @@ class FcclipSetCriterion(nn.Module):
                                   empty_weight,
         )
         losses = {"loss_cls": loss_ce}
+
+        if "attn_cls_logits" in outputs.keys():
+            attn_cls_logits = outputs["attn_cls_logits"].float()
+            loss_attn_cls = F.cross_entropy(attn_cls_logits.transpose(1, 2), target_classes, 
+                                           empty_weight,
+            )
+            losses["loss_attn_cls"] = loss_attn_cls
+
         return losses
     
     def loss_masks(self, outputs, targets, indices, num_masks):

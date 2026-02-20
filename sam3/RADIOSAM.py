@@ -23,6 +23,7 @@ import os
 import numpy as np
 import torchvision
 import logging
+import copy
 
 from sam3.model_builder import (
     _create_vision_backbone,
@@ -168,6 +169,8 @@ class RADIOSAM(nn.Module):
             self.num_pred_masks = cfg.MODEL.ATTNPOOL.NUM_PRED_MASKS
             self.aux_attn_pool = cfg.MODEL.ATTNPOOL.USE_AUX
             self.add_radio_feat = cfg.MODEL.ATTNPOOL.ADD_RADIO_FEAT
+            
+            self.attn_pool_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
             if self.add_radio_feat:
                 self.fusion_feat_proj = MLP(256, 512, 1536, 3)
                 self.radio_feat_proj =  MLP(1536, 512, 256, 3)
@@ -178,6 +181,8 @@ class RADIOSAM(nn.Module):
                         attnpool_weight_dict_aux[f"{k}_{i}"] = self.attnpool_weight_dict[k]
                 self.attnpool_weight_dict.update(attnpool_weight_dict_aux) 
             self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+            self.pooling_decoder = copy.deepcopy(self.detector.transformer.decoder)
+            self.pooling_decoder_synced = False # 是否已经同步过权重
         else:
             self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(100))
 
@@ -187,7 +192,6 @@ class RADIOSAM(nn.Module):
             self.score_head = MLP(256, 256, 1, 3)
             init_score_head(self.score_head)
 
-        # self.text_feat_resizer = nn.Linear(1024, 256)
 
         # -------------------------------------------------------
         # 计算逻辑
@@ -270,7 +274,8 @@ class RADIOSAM(nn.Module):
         }
         if self.new_score_head:
             criterion_weight_dict["loss_objectness"] = objectness_weight
-
+        if self.use_attnpool:
+            criterion_weight_dict["loss_attn_cls"] = cfg.MODEL.ATTNPOOL.CLASS_WEIGHT
         weight_dict.update(criterion_weight_dict)
 
         if self.use_aux:
@@ -901,6 +906,14 @@ class RADIOSAM(nn.Module):
 
     def forward(self, batched_inputs):
 
+        # if self.training and not self.pooling_decoder_synced:
+        #     # 加载权重
+        #     print("Initializing Pooling Decoder weights from Pre-trained Mask Decoder...")
+        #     self.pooling_decoder.load_state_dict(
+        #         self.detector.transformer.decoder.state_dict()
+        #     )
+        #     self.pooling_decoder_synced = True
+
         images = [x["image"].to(self.device) for x in batched_inputs]
         # print("shape of first image:", images[0].shape)
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
@@ -1161,21 +1174,26 @@ class RADIOSAM(nn.Module):
             if self.new_score_head:
                 obj_logits = self.score_head(queries).squeeze(-1)
 
-            if self.add_radio_feat:
-                radio_img_feat = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
-                radio_img_feat = radio_img_feat.view(bs, 1536, -1).permute(0,2,1)
-                decoder_img_feat = radio_img_feat + self.fusion_feat_proj(out["encoder_hidden_states"].permute(1,0,2))
-                decoder_img_feat = self.radio_feat_proj(decoder_img_feat)
-                decoder_img_feat = decoder_img_feat.permute(1,0,2)
+            
+            if self.use_attnpool:
+                if self.add_radio_feat:
+                    radio_img_feat = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
+                    radio_img_feat = radio_img_feat.view(bs, 1536, -1).permute(0,2,1) # bs, l, d
+                    decoder_img_feat = radio_img_feat + self.fusion_feat_proj(out["encoder_hidden_states"].permute(1,0,2))
+                    decoder_img_feat = self.radio_feat_proj(decoder_img_feat) 
+                    decoder_img_feat = decoder_img_feat.permute(1,0,2) # l, bs, d
+                else:
+                    decoder_img_feat = out["encoder_hidden_states"]
+                decoder_img_feat = F.normalize(decoder_img_feat, dim=-1)
 
                 pixel_embed = outputs["pixel_embed"] 
                 pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"])
-                cls_queries = self.detector.transformer.decoder.presence_token.weight.unsqueeze(1).expand(bs, N, -1)
-                cls_queries = cls_queries + pooled_pixel_embed
+                # cls_queries = self.detector.transformer.decoder.presence_token.weight.unsqueeze(1).expand(bs, N, -1)
+                cls_queries = pooled_pixel_embed
                 cls_queries = cls_queries.permute(1,0,2)
 
                 class_tokens, _, _, _, cross_attn_weights = (
-                    self.detector.transformer.decoder(
+                    self.pooling_decoder(
                         tgt=cls_queries,
                         memory=decoder_img_feat,
                         memory_key_padding_mask=encoder_out["padding_mask"],
@@ -1194,7 +1212,21 @@ class RADIOSAM(nn.Module):
                     )
                 )
 
-                queries = class_tokens.permute(0,2,1,3)
+                # queries = class_tokens.permute(0,2,1,3)
+                class_tokens = F.normalize(class_tokens,dim=-1)
+                cross_attn_weights = torch.einsum("knbd, lbd->kbnl", class_tokens, decoder_img_feat)
+                cross_attn_weights *= torch.clamp(self.attn_pool_logit_scale.exp(),100)
+                cross_attn_weights = cross_attn_weights.softmax(dim=-1) # k, bs, N, L
+
+                pooled_img_feat = torch.einsum("bld, kbnl->kbnd", radio_img_feat, cross_attn_weights) # k, bs, N, D
+
+                text_classifier, num_templates = self.get_text_classifier(dataname)
+
+                attn_cls_results = []
+                for i in range(6):
+                    attn_cls_result = get_classification_logits(pooled_img_feat[i], text_classifier, self.out_vocab_logit_scale, num_templates)
+                    attn_cls_results.append(attn_cls_result)
+                attn_cls_results = torch.stack(attn_cls_results, dim=0) # k, bs, N, C
 
             for i in range(6):
                 assert queries.shape[0] == 6
@@ -1222,8 +1254,7 @@ class RADIOSAM(nn.Module):
                         query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, SAM_text_classifier) # bs, N, C
                     else:
                         query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, SAM_text_classifier) # bs, N, C
-                
-
+                    
                     if self.use_cos_sim:
                         cur_logit_scale = self.logit_scale.exp()
                         cur_logit_scale = torch.clamp(cur_logit_scale, max=100.0)
@@ -1244,11 +1275,20 @@ class RADIOSAM(nn.Module):
                     for num_t in tp_num_templates: 
                         query_cls_results.append(query_names_results[:,:, cur_idx: cur_idx + num_t].max(-1).values)
                         cur_idx += num_t
+                    
+
                     if self.void_embedding is not None:
                         query_cls_results.append(query_names_results[:,:, -1])
-                    query_cls_results = torch.stack(query_cls_results, dim=-1) # bs, N, num_classes
-                    # print(f"aux query_cls_results[{i}] shape:", query_cls_results.shape)
+                        query_cls_results = torch.stack(query_cls_results, dim=-1)
                         
+                        if self.use_attnpool and self.training:
+                            is_void_prob = F.softmax(query_cls_results, dim=-1)[..., -1:]   
+                            attn_cls_prob = F.softmax(attn_cls_results[i],dim=-1)
+                            attn_cls_prob = torch.cat([attn_cls_prob * (1.0 - is_void_prob), is_void_prob], dim =-1)
+
+                    else:
+                        query_cls_results = torch.stack(query_cls_results, dim=-1) # bs, N, num_classes
+
                     if i<5:
                         aux_out = {
                             'pred_logits': query_cls_results, 
@@ -1258,7 +1298,8 @@ class RADIOSAM(nn.Module):
                         }
                         if cur_obj_logits is not None:
                             aux_out['pred_objectness_logits'] = cur_obj_logits
-
+                        if self.use_attnpool and self.training:
+                            aux_out["attn_cls_logits"] = torch.log(attn_cls_prob + 1e-8)
                         
                         aux_outputs.append(aux_out)
                     else:
@@ -1279,7 +1320,8 @@ class RADIOSAM(nn.Module):
                 }
                 if obj_logits_final is not None:
                     criterion_pred['pred_objectness_logits'] = obj_logits_final
-
+                if self.use_attnpool and self.training:
+                    criterion_pred["attn_cls_logits"] = torch.log(attn_cls_prob + 1e-8)
 
                 fcclip_losses = self.criterion(criterion_pred, targets)
 
@@ -1294,39 +1336,33 @@ class RADIOSAM(nn.Module):
 
                 losses.update(fcclip_losses)
 
-            if self.use_attnpool:
-                attnpool_losses = {}
-                targets, _ , _ = self.prepare_targets_for_maskadapter(gt_instances, images)
+            # if self.use_attnpool:
+            #     attnpool_losses = {}
+            #     targets, _ , _ = self.prepare_targets_for_maskadapter(gt_instances, images)
 
-                img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
-                text_classifier, num_templates = self.get_text_classifier(dataname)
+            #     img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]          
 
-                assert cross_attn_weights.shape[0] == 6
-                for i in range(6):
-                    if self.aux_attn_pool or i == 5:
-                        attn_weights = cross_attn_weights[i]
+            #     assert cross_attn_weights.shape[0] == 6
+            #     for i in range(6):
+            #         if self.aux_attn_pool or i == 5:
 
-                        pooled_img_feat = torch.einsum("bdl, bnl->bnd", img_feat_for_pool.view(bs, img_feat_for_pool.shape[1],-1), attn_weights)
-
-                        attn_cls_results = get_classification_logits(pooled_img_feat, text_classifier, self.out_vocab_logit_scale, num_templates)
-
-                        mask_pred_results = outputs['aux_outputs'][i]["pred_masks"] if i < 5 else outputs["pred_masks"]
+            #             mask_pred_results = outputs['aux_outputs'][i]["pred_masks"] if i < 5 else outputs["pred_masks"]
                         
-                        _, matched_src_cls, _, mask_labels = self.match_via_iou(mask_pred_results, attn_cls_results, targets, iou_threshold=self.iou_threshold,max_matches=self.num_pred_masks)
+            #             _, matched_src_cls, _, mask_labels = self.match_via_iou(mask_pred_results, attn_cls_results[i], targets, iou_threshold=self.iou_threshold, max_matches=self.num_pred_masks)
 
-                        loss_attn_ce = self.cross_entropy_loss(matched_src_cls, mask_labels)["loss_ce"]
-                        if i == 5:
-                            attnpool_losses["loss_attn_ce"] = loss_attn_ce
-                        else:
-                            attnpool_losses[f"loss_attn_ce_{i}"] = loss_attn_ce
+            #             loss_attn_ce = self.cross_entropy_loss(matched_src_cls, mask_labels)["loss_ce"]
+            #             if i == 5:
+            #                 attnpool_losses["loss_attn_ce"] = loss_attn_ce
+            #             else:
+            #                 attnpool_losses[f"loss_attn_ce_{i}"] = loss_attn_ce
 
-                for k in list(attnpool_losses.keys()):
-                    if k in self.attnpool_weight_dict:
-                        attnpool_losses[k] *= self.attnpool_weight_dict[k]
-                    else:
-                        attnpool_losses.pop(k)
+            #     for k in list(attnpool_losses.keys()):
+            #         if k in self.attnpool_weight_dict:
+            #             attnpool_losses[k] *= self.attnpool_weight_dict[k]
+            #         else:
+            #             attnpool_losses.pop(k)
 
-                losses.update(attnpool_losses)
+            #     losses.update(attnpool_losses)
 
             # loss排序
             all_keys = list(losses.keys())
