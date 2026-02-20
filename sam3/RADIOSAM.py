@@ -906,13 +906,13 @@ class RADIOSAM(nn.Module):
 
     def forward(self, batched_inputs):
 
-        # if self.training and not self.pooling_decoder_synced:
-        #     # 加载权重
-        #     print("Initializing Pooling Decoder weights from Pre-trained Mask Decoder...")
-        #     self.pooling_decoder.load_state_dict(
-        #         self.detector.transformer.decoder.state_dict()
-        #     )
-        #     self.pooling_decoder_synced = True
+        if self.training and not self.pooling_decoder_synced:
+            # 加载权重
+            print("Initializing Pooling Decoder weights from Pre-trained Mask Decoder...")
+            self.pooling_decoder.load_state_dict(
+                self.detector.transformer.decoder.state_dict()
+            )
+            self.pooling_decoder_synced = True
 
         images = [x["image"].to(self.device) for x in batched_inputs]
         # print("shape of first image:", images[0].shape)
