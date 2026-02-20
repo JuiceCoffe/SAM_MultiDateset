@@ -22,9 +22,9 @@ MODEL:
 
   ATTNPOOL:
     ENABLE: True
-    # NEW_POOL_DECODER: True
-    # ADD_RADIO_FEAT: True
-    # BUILD_POOL_DECODER_FROM_MASKDECODER: True
+    NEW_POOL_DECODER: True
+    ADD_RADIO_FEAT: True
+    BUILD_POOL_DECODER_FROM_MASKDECODER: True
 
   # WEIGHTS: "/data/hmp/sam3.pt"
   WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
@@ -108,6 +108,6 @@ TEST:
 # 修改输出目录名称以区分实验
 VERSION: 2
 
-OUTPUT_DIR: ./out/test/
-# OUTPUT_DIR: ./out/RADIOSAM/copa_attn
+# OUTPUT_DIR: ./out/test/
+OUTPUT_DIR: ./out/RADIOSAM/copa_attn
   

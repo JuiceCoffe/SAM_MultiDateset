@@ -180,12 +180,12 @@ class RADIOSAM(nn.Module):
                 self.attnpool_weight_dict.update(attnpool_weight_dict_aux) 
             self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
             if self.new_pool_decoder:
-                self.pooling_decoder = copy.deepcopy(self.detector.transformer.decoder)
+                self.pooling_decoder = _create_pool_decoder()
                 if self.add_radio_feat:
                     self.fusion_feat_proj = MLP(256, 512, 1536, 3)
                     self.radio_feat_proj =  MLP(1536, 512, 256, 3)
                 self.attn_pool_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-                self.pooling_decoder_synced = False if not self.build_pool_decoder_from_maskdecoder else True
+                self.pooling_decoder_synced = False if self.build_pool_decoder_from_maskdecoder else True
         else:
             self.new_pool_decoder = False
             self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(100))
@@ -914,7 +914,8 @@ class RADIOSAM(nn.Module):
             if not self.pooling_decoder_synced:
                 # 加载权重
                 print("Initializing Pooling Decoder weights from Pre-trained Mask Decoder...")
-                self.pooling_decoder.load_state_dict(
+                load_partial_weights(
+                    self.pooling_decoder, 
                     self.detector.transformer.decoder.state_dict()
                 )
                 self.pooling_decoder_synced = True
@@ -1190,7 +1191,7 @@ class RADIOSAM(nn.Module):
                         decoder_img_feat = decoder_img_feat.permute(1,0,2) # l, bs, d
                     else:
                         decoder_img_feat = out["encoder_hidden_states"]
-                    decoder_img_feat = F.normalize(decoder_img_feat, dim=-1)
+                    # decoder_img_feat = F.normalize(decoder_img_feat, dim=-1)
 
                     pixel_embed = outputs["pixel_embed"] 
                     pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"])
@@ -1219,7 +1220,8 @@ class RADIOSAM(nn.Module):
                     )
 
                     # queries = class_tokens.permute(0,2,1,3)
-                    class_tokens = F.normalize(class_tokens,dim=-1)
+                    class_tokens = class_tokens[-1:,...]
+                    class_tokens = F.normalize(class_tokens, dim=-1)
                     cross_attn_weights = torch.einsum("knbd, lbd->kbnl", class_tokens, decoder_img_feat)
                     cross_attn_weights *= torch.clamp(self.attn_pool_logit_scale.exp(),100)
                     cross_attn_weights = cross_attn_weights.softmax(dim=-1) # k, bs, N, L
@@ -1228,12 +1230,10 @@ class RADIOSAM(nn.Module):
                 pooled_img_feat = torch.einsum("bld, kbnl->kbnd", radio_img_feat, cross_attn_weights) # k, bs, N, D
 
                 text_classifier, num_templates = self.get_text_classifier(dataname)
+                
+                attn_cls_results = get_classification_logits(pooled_img_feat.view(-1 , N, pooled_img_feat.shape[-1]), text_classifier, self.out_vocab_logit_scale, num_templates)
 
-                attn_cls_results = []
-                for i in range(6):
-                    attn_cls_result = get_classification_logits(pooled_img_feat[i], text_classifier, self.out_vocab_logit_scale, num_templates)
-                    attn_cls_results.append(attn_cls_result)
-                attn_cls_results = torch.stack(attn_cls_results, dim=0) # k, bs, N, C
+                attn_cls_results = attn_cls_results.view(-1, bs, N, C_ -1)
 
             for i in range(6):
                 assert queries.shape[0] == 6
@@ -1289,9 +1289,9 @@ class RADIOSAM(nn.Module):
                         query_cls_results = torch.stack(query_cls_results, dim=-1)
                         
                         if self.use_attnpool and self.training:
-                            is_void_prob = F.softmax(query_cls_results, dim=-1)[..., -1:]   
-                            attn_cls_prob = F.softmax(attn_cls_results[i],dim=-1)
-                            attn_cls_prob = torch.cat([attn_cls_prob * (1.0 - is_void_prob), is_void_prob], dim =-1)
+                            idx_attn_cls = -1 if attn_cls_results.shape[0] == 1 else i
+                            attn_cls_prob = F.softmax(attn_cls_results[idx_attn_cls],dim=-1)
+                            # attn_cls_prob = torch.cat([attn_cls_prob * (1.0 - is_void_prob), is_void_prob], dim =-1)
 
                     else:
                         query_cls_results = torch.stack(query_cls_results, dim=-1) # bs, N, num_classes
@@ -2535,3 +2535,113 @@ def get_classification_logits(x, text_classifier, logit_scale, num_templates=Non
     # final_pred_logits.append(pred_logits[:, :, -1]) # the last classifier is for void
     final_pred_logits = torch.stack(final_pred_logits, dim=-1)
     return final_pred_logits
+
+
+from sam3.model.decoder import (
+    TransformerDecoder,
+    TransformerDecoderLayer,
+    TransformerEncoderCrossAttention,
+)
+
+def _create_pool_decoder() -> TransformerDecoder:
+    """Create transformer decoder with its layer."""
+    decoder_layer = TransformerDecoderLayer(
+        activation="relu",
+        d_model=256,
+        dim_feedforward=2048,
+        dropout=0.1,
+        cross_attention=nn.MultiheadAttention(
+        # cross_attention=MultiheadAttention(
+            num_heads=8,
+            dropout=0.1,
+            embed_dim=256,
+        ),
+        n_heads=8,
+        use_text_cross_attention=True,
+    )
+
+    decoder = TransformerDecoder(
+        layer=decoder_layer,
+        num_layers=3,
+        num_queries=200,   
+        return_intermediate=True,
+        box_refine=True,
+        num_o2m_queries=0,    
+        dac=False,            
+        boxRPB="log",
+        d_model=256,
+        frozen=False,
+        interaction_layer=None,
+        dac_use_selfatt_ln=False, # 【建议修改】既然不用 dac，该参数已无意义，设为 False 即可
+        resolution=1008,
+        stride=14,
+        use_act_checkpoint=True,
+        presence_token=False,
+    ) 
+
+    return decoder
+
+def load_partial_weights(target_module, source_state_dict):
+    """
+    加载权重并自动处理结构差异，将差异记录到 detectron2 日志中。
+    
+    Args:
+        target_module (nn.Module): 需要加载权重的模型 (例如 self.pooling_decoder)
+        source_state_dict (dict): 源权重字典 (例如 self.detector.transformer.decoder.state_dict())
+    """
+    logger = logging.getLogger("detectron2")
+    
+    target_state_dict = target_module.state_dict()
+    processed_source_dict = {}
+    shape_mismatch_keys = []
+    
+    # 1. 过滤形状不匹配的参数
+    # 如果不做这一步，load_state_dict 遇到同名但形状不同的参数会直接报错 Crash
+    for k, v in source_state_dict.items():
+        if k in target_state_dict:
+            if v.shape != target_state_dict[k].shape:
+                shape_mismatch_keys.append(
+                    f"{k}: source {v.shape} vs target {target_state_dict[k].shape}"
+                )
+                continue
+        processed_source_dict[k] = v
+
+    # 2. 加载权重 (strict=False 允许结构不一致)
+    # missing_keys: target 中有但 source 中没有 (需要被初始化但没加载到的)
+    # unexpected_keys: source 中有但 target 中没有 (预训练里多余的，比如你删掉的层)
+    msg = target_module.load_state_dict(processed_source_dict, strict=False)
+    
+    missing_keys = msg.missing_keys
+    unexpected_keys = msg.unexpected_keys
+    
+    # 3. 记录日志
+    log_info = []
+    if len(missing_keys) > 0:
+        log_info.append(
+            f"[Pooling Decoder Init] MISSING keys (initialized randomly): \n" + 
+            "\n".join([f"\t- {k}" for k in missing_keys])
+        )
+    
+    if len(shape_mismatch_keys) > 0:
+        log_info.append(
+            f"[Pooling Decoder Init] SHAPE MISMATCH keys (skipped & initialized randomly): \n" + 
+            "\n".join([f"\t- {k}" for k in shape_mismatch_keys])
+        )
+
+    # 对于 Unexpected keys (多余的权重)，由于你是“减少层数”，这部分可能会很多
+    # 通常我们只需要知道数量，或者打印出来确认是被移除的层
+    if len(unexpected_keys) > 0:
+        # 这里选择简略打印数量，如果想看详细列表可以将下方注释打开
+        log_info.append(
+            f"[Pooling Decoder Init] UNEXPECTED keys in source (ignored, likely removed layers): {len(unexpected_keys)} keys."
+        )
+        # 详细打印前10个例子
+        example_keys = unexpected_keys[:10]
+        log_info.append(f"\tExamples: {example_keys} ...")
+
+    if not log_info:
+        logger.info("[Pooling Decoder Init] Weights loaded perfectly matches!")
+    else:
+        logger.warning("\n".join(log_info))
+
+    return msg

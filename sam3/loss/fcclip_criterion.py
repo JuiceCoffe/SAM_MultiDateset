@@ -155,10 +155,36 @@ class FcclipSetCriterion(nn.Module):
 
         if "attn_cls_logits" in outputs.keys():
             attn_cls_logits = outputs["attn_cls_logits"].float()
-            loss_attn_cls = F.cross_entropy(attn_cls_logits.transpose(1, 2), target_classes, 
-                                           empty_weight,
-            )
+
+            # --- 修改开始 ---
+            
+            # 1. 提取匹配到的 Query 的预测 Logits
+            # idx 是 (batch_indices, query_indices)，用于直接索引
+            # 维度变化: [Batch, Query, Class] -> [Num_Matched, Class]
+            matched_logits = attn_cls_logits[idx]
+            
+            # 2. 检查是否有匹配的目标（防止没有任何物体时报错）
+            if len(target_classes_o) > 0:
+                # 3. 计算交叉熵
+                # target_classes_o: 是前面代码已经生成的真实标签，只包含匹配到的物体，没有背景类
+                # empty_weight: 仍然传入是为了保持对前景类别权重的兼容（如果有的话），
+                #               虽然此时 target 中没有背景类，eos_coef 不会生效。
+                loss_attn_cls = F.cross_entropy(
+                    matched_logits, 
+                    target_classes_o, 
+                    empty_weight[:-1]
+                )
+            else:
+                # 如果当前 batch 没有任何物体匹配，损失置为 0
+                # * 0.0 是为了保持计算图连接，防止分布式训练(DDP)报错
+                loss_attn_cls = attn_cls_logits.sum() * 0.0
+            
+
+            # loss_attn_cls = F.cross_entropy(attn_cls_logits.transpose(1, 2), target_classes, 
+            #                                empty_weight,
+            # )
             losses["loss_attn_cls"] = loss_attn_cls
+
 
         return losses
     
