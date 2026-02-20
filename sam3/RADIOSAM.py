@@ -1289,9 +1289,10 @@ class RADIOSAM(nn.Module):
                         query_cls_results = torch.stack(query_cls_results, dim=-1)
                         
                         if self.use_attnpool and self.training:
-                            idx_attn_cls = -1 if attn_cls_results.shape[0] == 1 else i
-                            attn_cls_prob = F.softmax(attn_cls_results[idx_attn_cls],dim=-1)
-                            # attn_cls_prob = torch.cat([attn_cls_prob * (1.0 - is_void_prob), is_void_prob], dim =-1)
+                            is_void_prob = F.softmax(query_cls_results, dim=-1)[..., -1:]  
+                            attn_cls_result  = attn_cls_results[-1] if attn_cls_results.shape[0] == 1 else attn_cls_results[i]
+                            attn_cls_prob = F.softmax(attn_cls_result,dim=-1)
+                            attn_cls_prob = torch.cat([attn_cls_prob * (1.0 - is_void_prob), is_void_prob], dim =-1)
 
                     else:
                         query_cls_results = torch.stack(query_cls_results, dim=-1) # bs, N, num_classes
