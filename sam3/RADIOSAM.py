@@ -1221,6 +1221,8 @@ class RADIOSAM(nn.Module):
 
                     # queries = class_tokens.permute(0,2,1,3)
                     class_tokens = class_tokens[-1:,...]
+                    # class_tokens = class_tokens[:1,...]
+
                     class_tokens = F.normalize(class_tokens, dim=-1)
                     cross_attn_weights = torch.einsum("knbd, lbd->kbnl", class_tokens, decoder_img_feat)
                     cross_attn_weights *= torch.clamp(self.attn_pool_logit_scale.exp(),100)
@@ -1494,12 +1496,14 @@ class RADIOSAM(nn.Module):
         
             mask_cls_logits = query_cls_results_final # 保持 Logits 状态
             mask_pred_logits = outputs["pred_masks"]  # 保持 Logits 状态
+            
+            box_pred_logits = outputs["pred_boxes_xyxy"] 
 
 
             results = []
 
             VISUALIZE_ATTENTION = False
-            # VISUALIZE_ATTENTION = True
+            VISUALIZE_ATTENTION = True
             VIS_SAVE_ROOT = "./attnmap"
     
             
@@ -1600,8 +1604,9 @@ class RADIOSAM(nn.Module):
                 
                 # --- C. 实例分割 (Instance Segmentation) ---
                 if self.instance_on:
+                    box_pred_i = box_pred_logits[i]
                     instances = self.instance_inference(
-                        mask_cls_i, mask_pred_i, dataname
+                        mask_cls_i, mask_pred_i, box_pred_i, dataname
                     )
                     res["instances"] = instances
 
@@ -1832,11 +1837,13 @@ class RADIOSAM(nn.Module):
 
         return panoptic_seg, segments_info
 
-    def instance_inference(self, mask_cls, mask_pred, dataname):
+    def instance_inference(self, mask_cls, mask_pred, box_pred, dataname):
         # mask_cls: [Q, K] (Logits)
         # mask_pred: [Q, H, W] (Logits)
+        # box_pred: [Q, 4] 归一化坐标 [0, 1]
         
         image_size = mask_pred.shape[-2:]
+        img_h, img_w = image_size  # 获取原图尺寸用于反归一化
         
         # 1. 计算分数 (Sigmoid)
         scores = F.softmax(mask_cls, dim=-1)[:, :-1]
@@ -1849,9 +1856,10 @@ class RADIOSAM(nn.Module):
         scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.test_topk_per_image, sorted=False)
         labels_per_image = labels[topk_indices]
 
-        # 找到对应的 mask index
+        # 找到对应的 mask 和 box index
         topk_indices = topk_indices // num_classes
         mask_pred = mask_pred[topk_indices]
+        box_pred = box_pred[topk_indices]  # === 修改 2：同步提取预测框 ===
 
         # 4. 过滤 Thing Classes (如果是 Panoptic 模式)
         if self.panoptic_on:
@@ -1869,6 +1877,7 @@ class RADIOSAM(nn.Module):
             scores_per_image = scores_per_image[keep]
             labels_per_image = labels_per_image[keep]
             mask_pred = mask_pred[keep]
+            box_pred = box_pred[keep]      # === 修改 3：同步过滤预测框 ===
 
         # 5. 生成 Instances 对象
         result = Instances(image_size)
@@ -1877,17 +1886,19 @@ class RADIOSAM(nn.Module):
         mask_pred_sigmoid = mask_pred.sigmoid()
         pred_masks_binary = (mask_pred_sigmoid > 0.5).float()
         result.pred_masks = pred_masks_binary
-        result.pred_boxes = Boxes(torch.zeros(mask_pred.size(0), 4)) # SAM3 通常不直接出框，这里放空框或者用 mask2box 计算
         
         # 计算综合分数
         mask_scores_per_image = (mask_pred_sigmoid.flatten(1) * result.pred_masks.flatten(1)).sum(1) / (result.pred_masks.flatten(1).sum(1) + 1e-6)
         result.scores = scores_per_image * mask_scores_per_image
         result.pred_classes = labels_per_image
 
+        # === 修改 4：使用网络直接预测的 Box 恢复为绝对坐标 ===
         if pred_masks_binary.numel() > 0:
-            # BitMasks 最好接收 Bool 或 Uint8
-            # result.pred_masks 是 float，这里转一下 ensure 安全
-            result.pred_boxes = BitMasks(pred_masks_binary > 0).get_bounding_boxes()
+            # 缩放因子：[宽度, 高度, 宽度, 高度]
+            scale_fct = torch.tensor([img_w, img_h, img_w, img_h], dtype=torch.float32, device=self.device)
+            # 反归一化：将 [0, 1] 的坐标转为真实的像素绝对坐标
+            abs_boxes = box_pred * scale_fct
+            result.pred_boxes = Boxes(abs_boxes)
         else:
             result.pred_boxes = Boxes(torch.zeros(0, 4, device=self.device))
             
@@ -2002,6 +2013,7 @@ class RADIOSAM(nn.Module):
         
         # 1. 获取模型输出
         pred_masks = outputs["pred_masks"].sigmoid() 
+        pred_boxes_xyxy = outputs["pred_boxes_xyxy"] 
         
         # 获取 Attention weights
         if cross_attn_weights is not None:
@@ -2069,6 +2081,7 @@ class RADIOSAM(nn.Module):
             tgt_labels = targets[b]["labels"].cpu().numpy()
             
             curr_pred_masks = pred_masks[b]
+            curr_pred_boxes = pred_boxes_xyxy[b]
             
             if tgt_masks.shape[-2:] != curr_pred_masks.shape[-2:]:
                 tgt_masks_resized = F.interpolate(tgt_masks.unsqueeze(1), size=curr_pred_masks.shape[-2:], mode='nearest').squeeze(1)
@@ -2194,7 +2207,19 @@ class RADIOSAM(nn.Module):
                 
                 mask_vis = img_np.copy()
                 mask_vis[mask_bin.cpu().numpy()] = mask_vis[mask_bin.cpu().numpy()] * 0.5 + np.array([255, 0, 0]) * 0.5
+
+                # === 新增：绘制绿色的 Box ===
+                q_box = curr_pred_boxes[q_idx]
+                # Box 坐标反归一化 (x0, y0, x1, y1) -> 原图像素大小
+                x0 = int(max(0, q_box[0].item() * img_w))
+                y0 = int(max(0, q_box[1].item() * img_h))
+                x1 = int(min(img_w, q_box[2].item() * img_w))
+                y1 = int(min(img_h, q_box[3].item() * img_h))
                 
+                # 使用 cv2 在图上画出矩形框，颜色为绿色(0, 255, 0)，线宽为2
+                cv2.rectangle(mask_vis, (x0, y0), (x1, y1), (0, 255, 0), thickness=2)
+                # ==============================
+
                 # Attention Map 可视化
                 attn = attn_weights[b, q_idx]
                 attn_map = attn.view(feat_h, feat_w)
@@ -2563,7 +2588,7 @@ def _create_pool_decoder() -> TransformerDecoder:
 
     decoder = TransformerDecoder(
         layer=decoder_layer,
-        num_layers=3,
+        num_layers=1,
         num_queries=200,   
         return_intermediate=True,
         box_refine=True,

@@ -19,9 +19,42 @@ from detectron2.projects.point_rend.point_features import (
     point_sample,
 )
 
-
 from maft.utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 from sam3.model.box_ops import box_cxcywh_to_xyxy, generalized_box_iou
+
+
+def sigmoid_focal_loss( 
+    inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2, no_reduction=False
+):
+    # 来自groundingdino
+    """
+    Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+                (0 for the negative class and 1 for the positive class).
+        alpha: (optional) Weighting factor in range (0,1) to balance
+                positive vs negative examples. Default = -1 (no weighting).
+        gamma: Exponent of the modulating factor (1 - p_t) to
+               balance easy vs hard examples.
+    Returns:
+        Loss tensor
+    """
+    prob = inputs.sigmoid()
+    ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    p_t = prob * targets + (1 - prob) * (1 - targets)
+    loss = ce_loss * ((1 - p_t) ** gamma)
+
+    if alpha >= 0:
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = alpha_t * loss
+
+    if no_reduction:
+        return loss
+
+    return loss.sum() / num_boxes
 
 
 def dice_loss(
@@ -93,74 +126,137 @@ def calculate_uncertainty(logits):
     return -(torch.abs(gt_class_logits))
 
 
-class FcclipSetCriterion(nn.Module):
+class SetCriterion(nn.Module):
     """This class computes the loss for DETR.
     The process happens in two steps:
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
 
-    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
-                 num_points, oversample_ratio, importance_sample_ratio):
+    def __init__(self,  matcher, weight_dict,  losses,
+                 num_points, oversample_ratio, importance_sample_ratio,
+                 tau=0.07
+                 ):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
             matcher: module able to compute a matching between targets and proposals
             weight_dict: dict containing as key the names of the losses and as values their relative weight.
-            eos_coef: relative classification weight applied to the no-object category
             losses: list of all the losses to be applied. See get_loss for list of available losses.
         """
         super().__init__()
-        # self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
-        self.eos_coef = eos_coef
         self.losses = losses
-
-        # empty_weight = torch.ones(self.num_classes + 1)
-        # empty_weight[-1] = self.eos_coef
-        # self.register_buffer("empty_weight", empty_weight)
 
         # pointwise mask loss parameters
         self.num_points = num_points
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
 
+        self.tau = tau
+
+    def loss_contrast(self, outputs, targets, indices, num_masks):
+        """
+        Pull-Only Contrastive Distillation with Consistency Filtering
+        """
+        assert 'pred_region_features' in outputs
+        student_feats = outputs['pred_region_features'] # [B, N, D]
+        
+        loss_contrast = 0.0
+        total_valid_pairs = 0
+        
+        device = student_feats.device
+
+        for batch_i, (src_idx, tgt_idx) in enumerate(indices):
+            if len(tgt_idx) == 0:
+                continue
+            
+            # 1. 获取基础数据
+            # Student: [M, D]
+            e_matched = student_feats[batch_i][src_idx] 
+            # Teacher: [M, D]
+            r_matched = targets[batch_i]['teacher_features'][tgt_idx]
+            
+            # [新增] 获取 Teacher 的有效性 Mask
+            # targets[batch_i]['teacher_valid_mask'] 是 [Num_GT]
+            # 我们只取匹配到的那些 GT 的 valid 状态 -> [M]
+            is_teacher_correct = targets[batch_i]['teacher_valid_mask'][tgt_idx]
+
+            # 如果当前图片匹配到的 GT 全都被 Teacher 认错了，跳过
+            if not is_teacher_correct.any():
+                continue
+
+            # 2. 归一化
+            e_matched = F.normalize(e_matched, p=2, dim=-1)
+            r_matched = F.normalize(r_matched, p=2, dim=-1)
+            
+            # 3. 计算距离 (1 - Cosine Similarity)
+            # dist: [M]
+            dist = 1.0 - (e_matched * r_matched).sum(dim=-1)
+            
+            # 4. [关键] 应用过滤
+            # 只保留 Teacher 预测正确的那些样本的 Loss
+            valid_loss = dist * is_teacher_correct.float()
+            
+            loss_contrast += valid_loss.sum()
+            
+            # 分母只统计有效的对数
+            total_valid_pairs += is_teacher_correct.sum().item()
+
+        if total_valid_pairs > 0:
+            return {'loss_contrast': loss_contrast / total_valid_pairs}
+        else:
+            return {'loss_contrast': student_feats.sum() * 0.0}
+
     def loss_labels(self, outputs, targets, indices, num_masks):
-        """Classification loss (NLL)
-        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
+        Grounding DINO style Classification Loss (Sigmoid Focal Loss)
         """
         assert "pred_logits" in outputs
         src_logits = outputs["pred_logits"].float()
-        current_num_classes = src_logits.shape[-1] - 1
 
+        # 1. 准备 Target 容器，初始化为全 0
+        # src_logits shape: [Batch, Num_Queries, Num_Classes]
+        # 注意：这里的 Num_Classes 不应该包含背景类，纯粹是文本的类别数
+        target_classes_onehot = torch.zeros_like(src_logits)
+
+        # 2. 获取匹配的索引 (Batch ID, Query ID)
         idx = self._get_src_permutation_idx(indices)
+
+        losses = {}
+
+        # ================= 1. Objectness Loss (Focal) =================
+        if "pred_objectness_logits" in outputs:
+            src_obj_logits = outputs["pred_objectness_logits"]
+            target_obj = torch.zeros_like(src_obj_logits)
+            target_obj[idx] = 1.0
+            
+            # 使用标准的 Focal Loss 监督 Objectness
+            losses['loss_objectness'] = sigmoid_focal_loss(
+                src_obj_logits, target_obj, num_masks, 
+                alpha=0.25, gamma=2.0
+            ).sum() / num_masks
+
+
+        # 3. 获取匹配到的 GT 对应的类别 ID
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(
-            src_logits.shape[:2], 
-            # self.num_classes, 
-            current_num_classes, 
-            dtype=torch.int64, device=src_logits.device
+        
+        # 4. 在匹配的位置填 1 (正样本)
+        # 没匹配上的位置保持 0 (负样本)
+        target_classes_onehot[idx[0], idx[1], target_classes_o] = 1.0
+
+        # 5. 计算 Sigmoid Focal Loss
+        # 注意：这里调用你上面定义的 sigmoid_focal_loss
+        # num_masks 通常建议替换为 num_boxes 或者匹配到的正样本总数，用于归一化
+        losses['loss_focal'] = sigmoid_focal_loss(
+            src_logits, 
+            target_classes_onehot, 
+            num_masks, 
+            alpha=0.25, 
+            gamma=2.0, 
+            no_reduction=False
         )
-        target_classes[idx] = target_classes_o
-
-        empty_weight = torch.ones(current_num_classes + 1, device=src_logits.device)
-        empty_weight[-1] = self.eos_coef
-
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, 
-                                #   self.empty_weight
-                                  empty_weight,
-        )
-        losses = {"loss_cls": loss_ce}
-
-        if "attn_cls_logits" in outputs.keys():
-            attn_cls_logits = outputs["attn_cls_logits"].float()
-            empty_weight = torch.ones(current_num_classes + 1, device=src_logits.device)
-            empty_weight[-1] = self.eos_coef * 0.0
-            loss_attn_cls = F.cross_entropy(attn_cls_logits.transpose(1, 2), target_classes, 
-                                           empty_weight,
-            )
-            losses["loss_attn_cls"] = loss_attn_cls
 
         return losses
     
@@ -216,6 +312,31 @@ class FcclipSetCriterion(nn.Module):
         del target_masks
         return losses
 
+    def loss_boxes(self, outputs, targets, indices, num_masks):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+        """
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        
+        # 取出匹配好的预测框和GT框
+        src_boxes = outputs['pred_boxes'][idx]
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+        # 1. L1 Loss
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+        losses = {}
+        losses['loss_bbox'] = loss_bbox.sum() / num_masks
+
+        # 2. GIoU Loss
+        loss_giou = 1 - torch.diag(generalized_box_iou(
+            box_cxcywh_to_xyxy(src_boxes),
+            box_cxcywh_to_xyxy(target_boxes))
+        )
+        losses['loss_giou'] = loss_giou.sum() / num_masks
+        
+        return losses
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -233,6 +354,7 @@ class FcclipSetCriterion(nn.Module):
             'labels': self.loss_labels,
             'masks': self.loss_masks,
             'boxes': self.loss_boxes, 
+            'contrast': self.loss_contrast,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
@@ -274,43 +396,16 @@ class FcclipSetCriterion(nn.Module):
 
         return losses
 
-    # def __repr__(self):
-    #     head = "Criterion " + self.__class__.__name__
-    #     body = [
-    #         "matcher: {}".format(self.matcher.__repr__(_repr_indent=8)),
-    #         "losses: {}".format(self.losses),
-    #         "weight_dict: {}".format(self.weight_dict),
-    #         "num_classes: {}".format(self.num_classes),
-    #         "eos_coef: {}".format(self.eos_coef),
-    #         "num_points: {}".format(self.num_points),
-    #         "oversample_ratio: {}".format(self.oversample_ratio),
-    #         "importance_sample_ratio: {}".format(self.importance_sample_ratio),
-    #     ]
-    #     _repr_indent = 4
-    #     lines = [head] + [" " * _repr_indent + line for line in body]
-    #     return "\n".join(lines)
-
-    def loss_boxes(self, outputs, targets, indices, num_masks):
-        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
-           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
-        """
-        assert 'pred_boxes' in outputs
-        idx = self._get_src_permutation_idx(indices)
-        
-        # 取出匹配好的预测框和GT框
-        src_boxes = outputs['pred_boxes'][idx]
-        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-
-        # 1. L1 Loss
-        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
-        losses = {}
-        losses['loss_bbox'] = loss_bbox.sum() / num_masks
-
-        # 2. GIoU Loss
-        loss_giou = 1 - torch.diag(generalized_box_iou(
-            box_cxcywh_to_xyxy(src_boxes),
-            box_cxcywh_to_xyxy(target_boxes))
-        )
-        losses['loss_giou'] = loss_giou.sum() / num_masks
-        
-        return losses
+    def __repr__(self):
+        head = "Criterion " + self.__class__.__name__
+        body = [
+            "matcher: {}".format(self.matcher.__repr__(_repr_indent=8)),
+            "losses: {}".format(self.losses),
+            "weight_dict: {}".format(self.weight_dict),
+            "num_points: {}".format(self.num_points),
+            "oversample_ratio: {}".format(self.oversample_ratio),
+            "importance_sample_ratio: {}".format(self.importance_sample_ratio),
+        ]
+        _repr_indent = 4
+        lines = [head] + [" " * _repr_indent + line for line in body]
+        return "\n".join(lines)

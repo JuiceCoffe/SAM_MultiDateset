@@ -52,7 +52,7 @@ SOLVER:
   LR_SCHEDULER_NAME: WarmupPolyLR
   STEPS: (30000, 40000)
   MAX_ITER: 45000
-  CHECKPOINT_PERIOD: 2500
+  CHECKPOINT_PERIOD: 5000
   
 
   CLASS_WEIGHT: 2.0
@@ -108,6 +108,6 @@ TEST:
 # 修改输出目录名称以区分实验
 VERSION: 2
 
-# OUTPUT_DIR: ./out/test/
-OUTPUT_DIR: ./out/RADIOSAM/copa_attn_1decoder
+OUTPUT_DIR: ./out/test/
+# OUTPUT_DIR: ./out/RADIOSAM/copa_attn_1decoder
   
