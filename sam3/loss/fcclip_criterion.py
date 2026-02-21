@@ -153,14 +153,14 @@ class FcclipSetCriterion(nn.Module):
         )
         losses = {"loss_cls": loss_ce}
 
-        if "attn_cls_logits" in outputs.keys():
-            attn_cls_logits = outputs["attn_cls_logits"].float()
-            empty_weight = torch.ones(current_num_classes + 1, device=src_logits.device)
-            empty_weight[-1] = self.eos_coef * 0.0
-            loss_attn_cls = F.cross_entropy(attn_cls_logits.transpose(1, 2), target_classes, 
-                                           empty_weight,
-            )
-            losses["loss_attn_cls"] = loss_attn_cls
+        # if "attn_cls_logits" in outputs.keys():
+        #     attn_cls_logits = outputs["attn_cls_logits"].float()
+        #     empty_weight = torch.ones(current_num_classes + 1, device=src_logits.device)
+        #     empty_weight[-1] = self.eos_coef * 0.0
+        #     loss_attn_cls = F.cross_entropy(attn_cls_logits.transpose(1, 2), target_classes, 
+        #                                    empty_weight,
+        #     )
+        #     losses["loss_attn_cls"] = loss_attn_cls
 
         return losses
     
