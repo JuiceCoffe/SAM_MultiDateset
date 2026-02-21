@@ -163,7 +163,7 @@ class RADIOSAM(nn.Module):
 
         self.use_attnpool = cfg.MODEL.ATTNPOOL.ENABLE
         if self.use_attnpool:
-            self.attnpool_weight_dict = {"loss_attn_ce": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT}
+            self.attnpool_weight_dict = {"loss_attn_cls": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT}
             self.num_gt_masks = cfg.MODEL.ATTNPOOL.NUM_GT_MASKS
             self.iou_threshold = cfg.MODEL.ATTNPOOL.IOU_THRESHOLD
             self.num_pred_masks = cfg.MODEL.ATTNPOOL.NUM_PRED_MASKS
@@ -278,8 +278,6 @@ class RADIOSAM(nn.Module):
         }
         if self.new_score_head:
             criterion_weight_dict["loss_objectness"] = objectness_weight
-        if self.use_attnpool:
-            criterion_weight_dict["loss_attn_cls"] = cfg.MODEL.ATTNPOOL.CLASS_WEIGHT
         weight_dict.update(criterion_weight_dict)
 
         if self.use_aux:
@@ -331,6 +329,32 @@ class RADIOSAM(nn.Module):
                 importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
                 tau=cfg.SOLVER.CONTRAST_TEMPERATURE,
             )
+
+        if self.use_attnpool:
+            if self.new_pool_decoder:
+                from .loss.box_criterion import BOXCriterion
+                from .loss.box_matcher import BOXHungarianMatcher
+
+                self.box_weight_dict = {
+                    "loss_cls": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT,
+                    'loss_bbox':bbox_weight, 
+                    'loss_giou':giou_weight,
+                }
+                box_matcher = BOXHungarianMatcher(
+                    cost_class=cfg.MODEL.ATTNPOOL.CLASS_WEIGHT,
+                    cost_bbox=bbox_weight,
+                    cost_giou=giou_weight,
+                )
+                self.box_criterion = BOXCriterion(
+                    num_classes = 133,
+                    matcher=box_matcher,
+                    weight_dict=self.box_weight_dict,
+                    eos_coef= 0,
+                    losses=["labels"],
+                    num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
+                    oversample_ratio=cfg.SOLVER.OVERSAMPLE_RATIO,
+                    importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
+                )
 
         # -------------------------------------------------------
         # 【新增】Inference 参数配置
@@ -1289,12 +1313,6 @@ class RADIOSAM(nn.Module):
                     if self.void_embedding is not None:
                         query_cls_results.append(query_names_results[:,:, -1])
                         query_cls_results = torch.stack(query_cls_results, dim=-1)
-                        
-                        if self.use_attnpool and self.training:
-                            is_void_prob = F.softmax(query_cls_results, dim=-1)[..., -1:]  
-                            attn_cls_result  = attn_cls_results[-1] if attn_cls_results.shape[0] == 1 else attn_cls_results[i]
-                            attn_cls_prob = F.softmax(attn_cls_result,dim=-1)
-                            attn_cls_prob = torch.cat([attn_cls_prob * (1.0 - is_void_prob), is_void_prob], dim =-1)
 
                     else:
                         query_cls_results = torch.stack(query_cls_results, dim=-1) # bs, N, num_classes
@@ -1308,8 +1326,6 @@ class RADIOSAM(nn.Module):
                         }
                         if cur_obj_logits is not None:
                             aux_out['pred_objectness_logits'] = cur_obj_logits
-                        if self.use_attnpool and self.training:
-                            aux_out["attn_cls_logits"] = torch.log(attn_cls_prob + 1e-8)
                         
                         aux_outputs.append(aux_out)
                     else:
@@ -1330,8 +1346,6 @@ class RADIOSAM(nn.Module):
                 }
                 if obj_logits_final is not None:
                     criterion_pred['pred_objectness_logits'] = obj_logits_final
-                if self.use_attnpool and self.training:
-                    criterion_pred["attn_cls_logits"] = torch.log(attn_cls_prob + 1e-8)
 
                 fcclip_losses = self.criterion(criterion_pred, targets)
 
@@ -1346,33 +1360,26 @@ class RADIOSAM(nn.Module):
 
                 losses.update(fcclip_losses)
 
-            # if self.use_attnpool:
-            #     attnpool_losses = {}
-            #     targets, _ , _ = self.prepare_targets_for_maskadapter(gt_instances, images)
+            if self.use_attnpool:
 
-            #     img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]          
+                img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]          
 
-            #     assert cross_attn_weights.shape[0] == 6
-            #     for i in range(6):
-            #         if self.aux_attn_pool or i == 5:
+                attn_cls_result  = attn_cls_results[-1]
 
-            #             mask_pred_results = outputs['aux_outputs'][i]["pred_masks"] if i < 5 else outputs["pred_masks"]
-                        
-            #             _, matched_src_cls, _, mask_labels = self.match_via_iou(mask_pred_results, attn_cls_results[i], targets, iou_threshold=self.iou_threshold, max_matches=self.num_pred_masks)
+                box_criterion_pred = {
+                    "pred_logits": attn_cls_result,
+                    'pred_boxes': outputs['pred_boxes'],
+                }
 
-            #             loss_attn_ce = self.cross_entropy_loss(matched_src_cls, mask_labels)["loss_ce"]
-            #             if i == 5:
-            #                 attnpool_losses["loss_attn_ce"] = loss_attn_ce
-            #             else:
-            #                 attnpool_losses[f"loss_attn_ce_{i}"] = loss_attn_ce
+                attnpool_losses = self.box_criterion(box_criterion_pred, targets)
 
-            #     for k in list(attnpool_losses.keys()):
-            #         if k in self.attnpool_weight_dict:
-            #             attnpool_losses[k] *= self.attnpool_weight_dict[k]
-            #         else:
-            #             attnpool_losses.pop(k)
+                for k in list(attnpool_losses.keys()):
+                    if k in self.attnpool_weight_dict:
+                        attnpool_losses[k] *= self.attnpool_weight_dict[k]
+                    else:
+                        attnpool_losses.pop(k)
 
-            #     losses.update(attnpool_losses)
+                losses.update(attnpool_losses)
 
             # loss排序
             all_keys = list(losses.keys())
@@ -1503,7 +1510,7 @@ class RADIOSAM(nn.Module):
             results = []
 
             VISUALIZE_ATTENTION = False
-            VISUALIZE_ATTENTION = True
+            # VISUALIZE_ATTENTION = True
             VIS_SAVE_ROOT = "./attnmap"
     
             

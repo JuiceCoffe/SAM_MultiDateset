@@ -73,7 +73,7 @@ batch_sigmoid_ce_loss_jit = torch.jit.script(
 )  # type: torch.jit.ScriptModule
 
 
-class FcclipHungarianMatcher(nn.Module):
+class BOXHungarianMatcher(nn.Module):
     """This class computes an assignment between the targets and the predictions of the network
 
     For efficiency reasons, the targets don't include the no_object. Because of this, in general,
@@ -83,11 +83,11 @@ class FcclipHungarianMatcher(nn.Module):
 
     def __init__(self, 
         cost_class: float = 1, 
-        cost_mask: float = 1, 
-        cost_dice: float = 1, 
+        # cost_mask: float = 1, 
+        # cost_dice: float = 1, 
         cost_bbox: float = 0.0, 
         cost_giou: float = 0.0,  
-        num_points: int = 0,
+        # num_points: int = 0,
     ):
         """Creates the matcher
 
@@ -98,15 +98,15 @@ class FcclipHungarianMatcher(nn.Module):
         """
         super().__init__()
         self.cost_class = cost_class
-        self.cost_mask = cost_mask
-        self.cost_dice = cost_dice
+        # self.cost_mask = cost_mask
+        # self.cost_dice = cost_dice
 
         self.cost_bbox = cost_bbox # 新增
         self.cost_giou = cost_giou # 新增
 
-        assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
+        # assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
 
-        self.num_points = num_points
+        # self.num_points = num_points
 
     @torch.no_grad()
     def memory_efficient_forward(self, outputs, targets):
@@ -146,41 +146,41 @@ class FcclipHungarianMatcher(nn.Module):
                     box_cxcywh_to_xyxy(tgt_bbox)
                 )
 
-            out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
-            # gt masks are already padded when preparing target
-            tgt_mask = targets[b]["masks"].to(out_mask)
+            # out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
+            # # gt masks are already padded when preparing target
+            # tgt_mask = targets[b]["masks"].to(out_mask)
 
-            out_mask = out_mask[:, None]
-            tgt_mask = tgt_mask[:, None]
-            # all masks share the same set of points for efficient matching!
-            point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
-            # get gt labels
-            tgt_mask = point_sample(
-                tgt_mask,
-                point_coords.repeat(tgt_mask.shape[0], 1, 1),
-                align_corners=False,
-            ).squeeze(1)
+            # out_mask = out_mask[:, None]
+            # tgt_mask = tgt_mask[:, None]
+            # # all masks share the same set of points for efficient matching!
+            # point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
+            # # get gt labels
+            # tgt_mask = point_sample(
+            #     tgt_mask,
+            #     point_coords.repeat(tgt_mask.shape[0], 1, 1),
+            #     align_corners=False,
+            # ).squeeze(1)
 
-            out_mask = point_sample(
-                out_mask,
-                point_coords.repeat(out_mask.shape[0], 1, 1),
-                align_corners=False,
-            ).squeeze(1)
+            # out_mask = point_sample(
+            #     out_mask,
+            #     point_coords.repeat(out_mask.shape[0], 1, 1),
+            #     align_corners=False,
+            # ).squeeze(1)
 
-            with autocast(enabled=False):
-                out_mask = out_mask.float()
-                tgt_mask = tgt_mask.float()
-                # Compute the focal loss between masks
-                cost_mask = batch_sigmoid_ce_loss_jit(out_mask, tgt_mask)
+            # with autocast(enabled=False):
+            #     out_mask = out_mask.float()
+            #     tgt_mask = tgt_mask.float()
+            #     # Compute the focal loss between masks
+            #     cost_mask = batch_sigmoid_ce_loss_jit(out_mask, tgt_mask)
 
-                # Compute the dice loss betwen masks
-                cost_dice = batch_dice_loss_jit(out_mask, tgt_mask)
+            #     # Compute the dice loss betwen masks
+            #     cost_dice = batch_dice_loss_jit(out_mask, tgt_mask)
             
             # Final cost matrix
             C = (
-                self.cost_mask * cost_mask
-                + self.cost_class * cost_class
-                + self.cost_dice * cost_dice
+                self.cost_class * cost_class
+                # + self.cost_mask * cost_mask
+                # + self.cost_dice * cost_dice
                 + self.cost_bbox * cost_bbox   # 加入 Box L1
                 + self.cost_giou * cost_giou   # 加入 GIoU
             )
@@ -223,12 +223,12 @@ class FcclipHungarianMatcher(nn.Module):
         """
         return self.memory_efficient_forward(outputs, targets)
 
-    def __repr__(self, _repr_indent=4):
-        head = "Matcher " + self.__class__.__name__
-        body = [
-            "cost_class: {}".format(self.cost_class),
-            "cost_mask: {}".format(self.cost_mask),
-            "cost_dice: {}".format(self.cost_dice),
-        ]
-        lines = [head] + [" " * _repr_indent + line for line in body]
-        return "\n".join(lines)
+    # def __repr__(self, _repr_indent=4):
+    #     head = "Matcher " + self.__class__.__name__
+    #     body = [
+    #         "cost_class: {}".format(self.cost_class),
+    #         "cost_mask: {}".format(self.cost_mask),
+    #         "cost_dice: {}".format(self.cost_dice),
+    #     ]
+    #     lines = [head] + [" " * _repr_indent + line for line in body]
+    #     return "\n".join(lines)

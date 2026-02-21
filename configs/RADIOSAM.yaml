@@ -16,7 +16,7 @@ MODEL:
     USE_SOFTMAX: True
     ADD_PIXELFEAT: True
 
-    ALPHA: 0.6
+    ALPHA: 0.5
     BETA: 0.8
     # ORACLE_SELECT: True
 
