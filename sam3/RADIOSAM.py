@@ -160,6 +160,19 @@ class RADIOSAM(nn.Module):
  
         self.mask_pooling = MaskPooling()
 
+        self.use_MaskAdapter = cfg.MODEL.USE_MASKADAPTER
+        if self.use_MaskAdapter:
+            from .mask_adapter_head import load_mask_adapter_standalone
+            self.mask_adapter = build_mask_adapter(cfg, cfg.MODEL.MASK_ADAPTER.NAME)
+            self.num_output_maps = cfg.MODEL.MASK_ADAPTER.NUM_OUTPUT_MAPS
+            self.iou_threshold = cfg.MODEL.MASK_ADAPTER.IOU_THRESHOLD
+            self.mask_threshold = cfg.MODEL.MASK_ADAPTER.MASK_THRESHOLD
+            self.num_gt_masks = cfg.MODEL.MASK_ADAPTER.NUM_GT_MASKS
+            self.num_pred_masks = cfg.MODEL.MASK_ADAPTER.NUM_PRED_MASKS
+
+            self.mask_adapter_weight_dict = {"loss_ce": cfg.MODEL.MASK_ADAPTER.CLASS_WEIGHT, "loss_cosine": cfg.MODEL.MASK_ADAPTER.COS_WEIGHT}
+            self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+   
 
         self.use_attnpool = cfg.MODEL.ATTNPOOL.ENABLE
         if self.use_attnpool:
@@ -1272,6 +1285,7 @@ class RADIOSAM(nn.Module):
 
                         pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"] if i ==5 else outputs['aux_outputs'][i]["pred_masks"])
                         tp_queries = tp_queries + pooled_pixel_embed
+                        tp_queries = tp_queries + pooled_pixel_embed
 
                     cur_obj_logits = obj_logits[i] if obj_logits is not None else None
 
@@ -1381,6 +1395,64 @@ class RADIOSAM(nn.Module):
 
                 losses.update(attnpool_losses)
 
+            if self.use_MaskAdapter:
+                mask_adapter_losses = {}
+
+                img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]  
+                # print("img_feat_for_pool shape:", img_feat_for_pool.shape)
+                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                targets, masks, labels = self.prepare_targets_for_maskadapter(gt_instances, images)
+
+                mask_pred_results = outputs["pred_masks"]
+                mask_cls_results = query_cls_results_final
+
+                src_masks, _ , target_masks, mask_labels = self.match_via_iou(mask_pred_results, mask_cls_results, targets, iou_threshold=self.iou_threshold,max_matches=self.num_pred_masks)
+                binary_src_masks = src_masks.sigmoid() > self.mask_threshold
+                binary_src_masks = binary_src_masks.float()
+
+                binary_src_masks = F.interpolate(binary_src_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+                target_masks = F.interpolate(target_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+
+                mask_pred = torch.cat((masks, binary_src_masks, target_masks),dim=1)
+                all_labels = torch.cat((labels, mask_labels, mask_labels),dim=1)
+                    
+                # maps_for_pooling = self.mask_adapter(img_feat_for_pool, mask_pred)
+                maps_for_pooling = []
+                for i in range(bs):
+                    maps_for_pooling_batch = self.mask_adapter(img_feat_for_pool[i:i+1, :, :, :], mask_pred[i:i+1, :, :, :])
+                    maps_for_pooling.append(maps_for_pooling_batch)
+                maps_for_pooling = torch.cat(maps_for_pooling, dim=0)
+                
+                maps_for_pooling = F.interpolate(maps_for_pooling, size=img_feat_for_pool.shape[-2:],
+                                                    mode='bilinear', align_corners=False)
+
+            
+                N = maps_for_pooling.size(1)
+                num_instances = N // self.num_output_maps
+                maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N,-1), dim=-1)
+                pooled_img_feature = torch.bmm(maps_for_pooling, img_feat_for_pool.view(bs, img_feat_for_pool.size(1), -1).permute(0, 2, 1))
+                pooled_img_feature = (pooled_img_feature.reshape(bs, num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
+
+                loss_cosine_similarity = self.cosine_similarity_loss(pooled_img_feature[:, 16:24, :], pooled_img_feature[:, 24:, :])
+
+                text_classifier, num_templates = self.get_text_classifier(dataname)
+                mask_cls_results = get_classification_logits(pooled_img_feature , text_classifier, self.out_vocab_logit_scale, num_templates)
+
+                loss_mask_cls = self.cross_entropy_loss(mask_cls_results, all_labels)
+
+                mask_adapter_losses.update(loss_cosine_similarity)
+                mask_adapter_losses.update(loss_mask_cls)
+
+                for k in list(mask_adapter_losses.keys()):
+                    # print("loss:", k, losses[k].item())
+                    if k in self.mask_adapter_weight_dict:
+                        mask_adapter_losses[k] *= self.mask_adapter_weight_dict[k]
+                    else:
+                        # remove this loss if not specified in `weight_dict`
+                        mask_adapter_losses.pop(k)
+
+                losses.update(mask_adapter_losses)
+
             # loss排序
             all_keys = list(losses.keys())
             aux_suffixes = [f"_{i}" for i in range(5)]
@@ -1418,7 +1490,32 @@ class RADIOSAM(nn.Module):
 
                 pool_cls_logits = get_classification_logits(pooled_img_feat, text_classifier, self.out_vocab_logit_scale, num_templates)
                             
+            if self.use_MaskAdapter:
+                mask_cls_results = outputs["pred_logits"]
+                mask_pred_results = outputs["pred_masks"]
 
+                img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
+
+                binary_masks = mask_pred_results.sigmoid() > self.mask_threshold
+                
+                # maps_for_pooling = self.mask_adapter(img_feat_for_pool, binary_masks)
+                adapter_batchsize = 32
+                maps_for_pooling_list = []
+                for i in range(0, mask_pred_results.shape[1], adapter_batchsize):
+                    batch_binary_masks = binary_masks[:, i:i+adapter_batchsize, :, :]
+                    maps_for_pooling_batch = self.mask_adapter(img_feat_for_pool, batch_binary_masks)
+                    maps_for_pooling_list.append(maps_for_pooling_batch)
+                maps_for_pooling = torch.cat(maps_for_pooling_list, dim=1)
+
+                maps_for_pooling = F.interpolate(maps_for_pooling, size=img_feat_for_pool.shape[-2:],
+                                            mode='bilinear', align_corners=False)
+                N_maps = maps_for_pooling.size(1)
+                num_instances = N_maps // self.num_output_maps
+                maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N_maps,-1), dim=-1)
+                pooled_img_feature = torch.bmm(maps_for_pooling, img_feat_for_pool.view(bs, img_feat_for_pool.size(1), -1).permute(0, 2, 1))
+                pooled_img_feature = (pooled_img_feature.reshape(bs,num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
+                pooled_img_feat = pooled_img_feature
+                pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
 
             else:
                 img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
