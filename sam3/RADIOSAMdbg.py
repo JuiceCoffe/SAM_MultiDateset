@@ -61,6 +61,7 @@ import random
 import math
 
 from .mask_adapter_head import build_mask_adapter
+from .convnext import ConvNextBlock
 
 
 from.RADIOwrapper import replace_sam3_encoder, load_radio_model
@@ -160,10 +161,27 @@ class RADIOSAM(nn.Module):
  
         self.mask_pooling = MaskPooling()
 
+        self.use_MaskAdapter = cfg.MODEL.USE_MASKADAPTER
+        if self.use_MaskAdapter:
+            from .mask_adapter_head import load_mask_adapter_standalone
+            self.mask_adapter = build_mask_adapter(cfg, cfg.MODEL.MASK_ADAPTER.NAME)
+            self.num_output_maps = cfg.MODEL.MASK_ADAPTER.NUM_OUTPUT_MAPS
+            self.iou_threshold = cfg.MODEL.MASK_ADAPTER.IOU_THRESHOLD
+            self.mask_threshold = cfg.MODEL.MASK_ADAPTER.MASK_THRESHOLD
+            self.num_gt_masks = cfg.MODEL.MASK_ADAPTER.NUM_GT_MASKS
+            self.num_pred_masks = cfg.MODEL.MASK_ADAPTER.NUM_PRED_MASKS
+
+            self.mask_adapter_weight_dict = {"loss_ce": cfg.MODEL.MASK_ADAPTER.CLASS_WEIGHT, "loss_cosine": cfg.MODEL.MASK_ADAPTER.COS_WEIGHT}
+            self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+   
 
         self.use_attnpool = cfg.MODEL.ATTNPOOL.ENABLE
         if self.use_attnpool:
-            self.attnpool_weight_dict = {"loss_attn_cls": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT}
+            self.attnpool_weight_dict = {
+                "loss_cls": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT,
+                'loss_bbox':cfg.SOLVER.BBOX_WEIGHT, 
+                'loss_giou':cfg.SOLVER.GIOU_WEIGHT,
+            }
             self.num_gt_masks = cfg.MODEL.ATTNPOOL.NUM_GT_MASKS
             self.iou_threshold = cfg.MODEL.ATTNPOOL.IOU_THRESHOLD
             self.num_pred_masks = cfg.MODEL.ATTNPOOL.NUM_PRED_MASKS
@@ -179,11 +197,23 @@ class RADIOSAM(nn.Module):
                         attnpool_weight_dict_aux[f"{k}_{i}"] = self.attnpool_weight_dict[k]
                 self.attnpool_weight_dict.update(attnpool_weight_dict_aux) 
             self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+            if self.add_radio_feat:
+                fusioner_dim = 768
+                self.fusion_feat_proj = MLP(256, 1024, fusioner_dim, 3)
+                self.radio_feat_proj =  MLP(1536, 768, fusioner_dim, 3)
+                self.feature_fusioner = nn.Sequential(
+                    ConvNextBlock(fusioner_dim),
+                    ConvNextBlock(fusioner_dim),
+                    ConvNextBlock(fusioner_dim),
+                    ConvNextBlock(fusioner_dim),
+                    ConvNextBlock(fusioner_dim),
+                    ConvNextBlock(fusioner_dim),
+                )
+                self.decoder_feat_proj =  MLP(fusioner_dim, 512, 256, 3)
+
             if self.new_pool_decoder:
                 self.pooling_decoder = _create_pool_decoder()
-                if self.add_radio_feat:
-                    self.fusion_feat_proj = MLP(256, 512, 1536, 3)
-                    self.radio_feat_proj =  MLP(1536, 512, 256, 3)
                 self.attn_pool_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
                 self.pooling_decoder_synced = False if self.build_pool_decoder_from_maskdecoder else True
         else:
@@ -275,6 +305,7 @@ class RADIOSAM(nn.Module):
             "loss_dice": dice_weight,
             'loss_bbox':bbox_weight, 
             'loss_giou':giou_weight,
+            "loss_attn_cls": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT,
         }
         if self.new_score_head:
             criterion_weight_dict["loss_objectness"] = objectness_weight
@@ -350,7 +381,7 @@ class RADIOSAM(nn.Module):
                     matcher=box_matcher,
                     weight_dict=self.box_weight_dict,
                     eos_coef= 0,
-                    losses=["labels"],
+                    losses=["labels", "boxes"],
                     num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
                     oversample_ratio=cfg.SOLVER.OVERSAMPLE_RATIO,
                     importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
@@ -1206,24 +1237,32 @@ class RADIOSAM(nn.Module):
 
             if self.use_attnpool:
                 radio_img_feat = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
+                radio_feat_D, radio_feat_H, radio_feat_W = radio_img_feat.shape[-3:]
                 radio_img_feat = radio_img_feat.view(bs, 1536, -1).permute(0,2,1) # bs, l, d
+
+                cls_box = outputs['pred_boxes']
+                
+                if self.add_radio_feat:
+                    decoder_img_feat = self.radio_feat_proj(radio_img_feat) + self.fusion_feat_proj(out["encoder_hidden_states"].permute(1,0,2))
+                    
+                    decoder_img_feat = decoder_img_feat.view(bs, radio_feat_H, radio_feat_W, -1).permute(0, 3, 1, 2)
+                    decoder_img_feat = self.feature_fusioner(decoder_img_feat)
+                    decoder_img_feat = decoder_img_feat.permute(0, 2, 3, 1).view(bs, radio_feat_H * radio_feat_W, -1)
+
+                    decoder_img_feat = self.decoder_feat_proj(decoder_img_feat) # bs, l, d
+                    decoder_img_feat = decoder_img_feat.permute(1,0,2) # l, bs, d
+                else:
+                    decoder_img_feat = out["encoder_hidden_states"]
+                # decoder_img_feat = F.normalize(decoder_img_feat, dim=-1)
                 
                 if self.new_pool_decoder:
-                    if self.add_radio_feat:
-                        decoder_img_feat = radio_img_feat + self.fusion_feat_proj(out["encoder_hidden_states"].permute(1,0,2))
-                        decoder_img_feat = self.radio_feat_proj(decoder_img_feat) 
-                        decoder_img_feat = decoder_img_feat.permute(1,0,2) # l, bs, d
-                    else:
-                        decoder_img_feat = out["encoder_hidden_states"]
-                    # decoder_img_feat = F.normalize(decoder_img_feat, dim=-1)
-
                     pixel_embed = outputs["pixel_embed"] 
                     pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"])
                     # cls_queries = self.detector.transformer.decoder.presence_token.weight.unsqueeze(1).expand(bs, N, -1)
                     cls_queries = pooled_pixel_embed
                     cls_queries = cls_queries.permute(1,0,2)
 
-                    class_tokens, _, _, _, cross_attn_weights = (
+                    class_tokens, reference_boxes_2, dec_presence_out_2, dec_presence_feats_2, cross_attn_weights = (
                         self.pooling_decoder(
                             tgt=cls_queries,
                             memory=decoder_img_feat,
@@ -1239,19 +1278,75 @@ class RADIOSAM(nn.Module):
                             apply_dac=False,
 
                             use_presence_token = False,
-                            fixed_reference_boxes = True
+                            # fixed_reference_boxes = True
                         )
                     )
 
+                    hs_2 = class_tokens.transpose(1, 2)  # seq-first to batch-first
+                    reference_boxes_2 = reference_boxes_2.transpose(1, 2)  # seq-first to batch-first
+                    if dec_presence_out_2 is not None:
+                        # seq-first to batch-first
+                        dec_presence_out_2 = dec_presence_out_2.transpose(1, 2)
+                    out2 = {}
+                    out2["presence_feats"] = dec_presence_feats_2
+                    self.detector._update_scores_and_boxes(
+                        out2,
+                        hs_2,
+                        reference_boxes_2,
+                        prompt,
+                        prompt_mask,
+                        dec_presence_out=dec_presence_out_2,
+                    )
+
+                    cls_box = out2['pred_boxes']
                     # queries = class_tokens.permute(0,2,1,3)
-                    class_tokens = class_tokens[-1:,...]
-                    # class_tokens = class_tokens[:1,...]
+                    # class_tokens = class_tokens[-1:,...]
 
                     class_tokens = F.normalize(class_tokens, dim=-1)
                     cross_attn_weights = torch.einsum("knbd, lbd->kbnl", class_tokens, decoder_img_feat)
                     cross_attn_weights *= torch.clamp(self.attn_pool_logit_scale.exp(),100)
                     cross_attn_weights = cross_attn_weights.softmax(dim=-1) # k, bs, N, L
+                
+                else:
+                    cross_attn_weights = torch.einsum("kbnd, lbd->kbnl", queries, decoder_img_feat)
+                    # ========================== 新增：Mask Attention 约束 ==========================
 
+                    layers_masks_list = []
+                    
+                    if 'aux_outputs' in outputs and outputs['aux_outputs'] is not None:
+                        for aux_out in outputs['aux_outputs']:
+                            layers_masks_list.append(aux_out['pred_masks'])
+                    layers_masks_list.append(outputs['pred_masks'])
+                    
+                    attn_mask_stack = torch.stack(layers_masks_list, dim=0)
+
+                    if attn_mask_stack.shape[0] != queries.shape[0]:
+                        attn_mask_stack = outputs['pred_masks'].unsqueeze(0).expand(queries.shape[0], -1, -1, -1, -1)
+
+                    # 2. 形状调整：为了高效插值，将 K, B, N 合并
+                    K_layers, B_batch, N_queries, H_orig, W_orig = attn_mask_stack.shape
+                    
+                    # -> [K*B*N, 1, H_orig, W_orig]
+                    attn_mask_stack = attn_mask_stack.flatten(0, 2).unsqueeze(1)
+
+                    # 3. 插值到 Feature Map 的分辨率 (radio_feat_H, radio_feat_W)
+                    # radio_feat_H/W 在前文 radio_img_feat.shape[-3:] 处已获得
+                    attn_mask_stack = F.interpolate(
+                        attn_mask_stack, 
+                        size=(radio_feat_H, radio_feat_W), 
+                        mode="bilinear", 
+                        align_corners=False
+                    )
+
+                    # 4. 恢复形状并展平空间维度 -> [K, B, N, L]
+                    attn_mask_stack = attn_mask_stack.view(K_layers, B_batch, N_queries, -1)
+
+                    valid_mask = (attn_mask_stack > 0.0)
+                    cross_attn_weights = cross_attn_weights.masked_fill(~valid_mask, -1e4)
+
+                    
+                    # =============================================================================
+                    cross_attn_weights = F.softmax(F.logsigmoid(cross_attn_weights), dim=-1)
                 
                 pooled_img_feat = torch.einsum("bld, kbnl->kbnd", radio_img_feat, cross_attn_weights) # k, bs, N, D
 
@@ -1271,6 +1366,7 @@ class RADIOSAM(nn.Module):
                         pixel_embed = outputs["pixel_embed"] # bs, D, H', W'
 
                         pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"] if i ==5 else outputs['aux_outputs'][i]["pred_masks"])
+                        tp_queries = tp_queries + pooled_pixel_embed
                         tp_queries = tp_queries + pooled_pixel_embed
 
                     cur_obj_logits = obj_logits[i] if obj_logits is not None else None
@@ -1323,6 +1419,7 @@ class RADIOSAM(nn.Module):
                             'pred_masks': outputs['aux_outputs'][i]["pred_masks"], 
                             'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'],
                             'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"],
+                            "attn_cls_logits": attn_cls_results[i],
                         }
                         if cur_obj_logits is not None:
                             aux_out['pred_objectness_logits'] = cur_obj_logits
@@ -1342,6 +1439,7 @@ class RADIOSAM(nn.Module):
                     'pred_masks': outputs["pred_masks"],
                     'pred_boxes': outputs['pred_boxes'],
                     'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
+                    "attn_cls_logits": attn_cls_results[-1],
                     'aux_outputs': aux_outputs if use_aux is True else None,
                 }
                 if obj_logits_final is not None:
@@ -1360,26 +1458,93 @@ class RADIOSAM(nn.Module):
 
                 losses.update(fcclip_losses)
 
-            if self.use_attnpool:
+            # if self.use_attnpool:
 
-                img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]          
+            #     img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]          
 
-                attn_cls_result  = attn_cls_results[-1]
 
-                box_criterion_pred = {
-                    "pred_logits": attn_cls_result,
-                    'pred_boxes': outputs['pred_boxes'],
-                }
+            #     box_criterion_pred = {
+            #         "pred_logits": attn_cls_results[-1],
+            #         'pred_boxes': cls_box,
+            #     }
 
-                attnpool_losses = self.box_criterion(box_criterion_pred, targets)
+            #     if attn_cls_results.shape[0]>1:
+            #         box_criterion_pred["aux_outputs"] = []
+            #         for i in range(0, attn_cls_results.shape[0]-1, 1):
+            #             box_criterion_pred["aux_outputs"].append(
+            #                 {
+            #                     "pred_logits": attn_cls_results[i],
+            #                     'pred_boxes': out2['aux_outputs'][i]['pred_boxes'],
+            #                 }
+            #             )
 
-                for k in list(attnpool_losses.keys()):
-                    if k in self.attnpool_weight_dict:
-                        attnpool_losses[k] *= self.attnpool_weight_dict[k]
+            #     attnpool_losses = self.box_criterion(box_criterion_pred, targets)
+
+            #     for k in list(attnpool_losses.keys()):
+            #         if k in self.attnpool_weight_dict:
+            #             losses['attn_'+k] = self.attnpool_weight_dict[k] * attnpool_losses[k]
+            #         else:
+            #             attnpool_losses.pop(k)
+
+            #     losses.update(attnpool_losses)
+
+            if self.use_MaskAdapter:
+                mask_adapter_losses = {}
+
+                img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]  
+                # print("img_feat_for_pool shape:", img_feat_for_pool.shape)
+                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                targets, masks, labels = self.prepare_targets_for_maskadapter(gt_instances, images)
+
+                mask_pred_results = outputs["pred_masks"]
+                mask_cls_results = query_cls_results_final
+
+                src_masks, _ , target_masks, mask_labels = self.match_via_iou(mask_pred_results, mask_cls_results, targets, iou_threshold=self.iou_threshold,max_matches=self.num_pred_masks)
+                binary_src_masks = src_masks.sigmoid() > self.mask_threshold
+                binary_src_masks = binary_src_masks.float()
+
+                binary_src_masks = F.interpolate(binary_src_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+                target_masks = F.interpolate(target_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+
+                mask_pred = torch.cat((masks, binary_src_masks, target_masks),dim=1)
+                all_labels = torch.cat((labels, mask_labels, mask_labels),dim=1)
+                    
+                # maps_for_pooling = self.mask_adapter(img_feat_for_pool, mask_pred)
+                maps_for_pooling = []
+                for i in range(bs):
+                    maps_for_pooling_batch = self.mask_adapter(img_feat_for_pool[i:i+1, :, :, :], mask_pred[i:i+1, :, :, :])
+                    maps_for_pooling.append(maps_for_pooling_batch)
+                maps_for_pooling = torch.cat(maps_for_pooling, dim=0)
+                
+                maps_for_pooling = F.interpolate(maps_for_pooling, size=img_feat_for_pool.shape[-2:],
+                                                    mode='bilinear', align_corners=False)
+
+            
+                N = maps_for_pooling.size(1)
+                num_instances = N // self.num_output_maps
+                maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N,-1), dim=-1)
+                pooled_img_feature = torch.bmm(maps_for_pooling, img_feat_for_pool.view(bs, img_feat_for_pool.size(1), -1).permute(0, 2, 1))
+                pooled_img_feature = (pooled_img_feature.reshape(bs, num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
+
+                loss_cosine_similarity = self.cosine_similarity_loss(pooled_img_feature[:, 16:24, :], pooled_img_feature[:, 24:, :])
+
+                text_classifier, num_templates = self.get_text_classifier(dataname)
+                mask_cls_results = get_classification_logits(pooled_img_feature , text_classifier, self.out_vocab_logit_scale, num_templates)
+
+                loss_mask_cls = self.cross_entropy_loss(mask_cls_results, all_labels)
+
+                mask_adapter_losses.update(loss_cosine_similarity)
+                mask_adapter_losses.update(loss_mask_cls)
+
+                for k in list(mask_adapter_losses.keys()):
+                    # print("loss:", k, losses[k].item())
+                    if k in self.mask_adapter_weight_dict:
+                        mask_adapter_losses[k] *= self.mask_adapter_weight_dict[k]
                     else:
-                        attnpool_losses.pop(k)
+                        # remove this loss if not specified in `weight_dict`
+                        mask_adapter_losses.pop(k)
 
-                losses.update(attnpool_losses)
+                losses.update(mask_adapter_losses)
 
             # loss排序
             all_keys = list(losses.keys())
@@ -1418,7 +1583,32 @@ class RADIOSAM(nn.Module):
 
                 pool_cls_logits = get_classification_logits(pooled_img_feat, text_classifier, self.out_vocab_logit_scale, num_templates)
                             
+            elif self.use_MaskAdapter:
+                mask_cls_results = outputs["pred_logits"]
+                mask_pred_results = outputs["pred_masks"]
 
+                img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
+
+                binary_masks = mask_pred_results.sigmoid() > self.mask_threshold
+                
+                # maps_for_pooling = self.mask_adapter(img_feat_for_pool, binary_masks)
+                adapter_batchsize = 32
+                maps_for_pooling_list = []
+                for i in range(0, mask_pred_results.shape[1], adapter_batchsize):
+                    batch_binary_masks = binary_masks[:, i:i+adapter_batchsize, :, :]
+                    maps_for_pooling_batch = self.mask_adapter(img_feat_for_pool, batch_binary_masks)
+                    maps_for_pooling_list.append(maps_for_pooling_batch)
+                maps_for_pooling = torch.cat(maps_for_pooling_list, dim=1)
+
+                maps_for_pooling = F.interpolate(maps_for_pooling, size=img_feat_for_pool.shape[-2:],
+                                            mode='bilinear', align_corners=False)
+                N_maps = maps_for_pooling.size(1)
+                num_instances = N_maps // self.num_output_maps
+                maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N_maps,-1), dim=-1)
+                pooled_img_feature = torch.bmm(maps_for_pooling, img_feat_for_pool.view(bs, img_feat_for_pool.size(1), -1).permute(0, 2, 1))
+                pooled_img_feature = (pooled_img_feature.reshape(bs,num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
+                pooled_img_feat = pooled_img_feature
+                pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
 
             else:
                 img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
@@ -2595,7 +2785,7 @@ def _create_pool_decoder() -> TransformerDecoder:
 
     decoder = TransformerDecoder(
         layer=decoder_layer,
-        num_layers=1,
+        num_layers=3,
         num_queries=200,   
         return_intermediate=True,
         box_refine=True,

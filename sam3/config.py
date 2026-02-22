@@ -77,6 +77,7 @@ def add_sam3_config(cfg):
     cfg.SOLVER.CONTRAST_TEMPERATURE = 0.07
 
     cfg.SOLVER.TRAIN_MASK = True
+    cfg.SOLVER.TRAIN_OUT_VOCAB = False
 
     cfg.TEST.SEMANTIC_ON = True
     cfg.TEST.INSTANCE_ON = False

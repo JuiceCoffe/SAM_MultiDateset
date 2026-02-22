@@ -22,8 +22,8 @@ MODEL:
 
   ATTNPOOL:
     ENABLE: True
+    ADD_RADIO_FEAT: True
     # NEW_POOL_DECODER: True
-    # ADD_RADIO_FEAT: True
     # BUILD_POOL_DECODER_FROM_MASKDECODER: True
 
   # WEIGHTS: "/data/hmp/sam3.pt"
@@ -85,7 +85,7 @@ DATALOADER:
   DATASET_RATIO: [1.0]
 
   # # Batch Size 对应单个数据集
-  DATASET_BS: [8]
+  DATASET_BS: [4]
   
   # COCO 通常不需要 RFS (Repeat Factor Sampling)
   USE_RFS: [False]
@@ -101,13 +101,13 @@ DATALOADER:
   USE_DIFF_BS_SIZE: True
 
 TEST:
-  EVAL_PERIOD: 25000
+  EVAL_PERIOD: 5000
   SEMANTIC_ON: True   
   # INSTANCE_ON: True   
   # PANOPTIC_ON: True   
 # 修改输出目录名称以区分实验
 VERSION: 2
 
-OUTPUT_DIR: ./out/test/
-# OUTPUT_DIR: ./out/RADIOSAM/copa_attn_1decoder
+# OUTPUT_DIR: ./out/test/
+OUTPUT_DIR: ./out/RADIOSAM/copa_attn_1decoder
   

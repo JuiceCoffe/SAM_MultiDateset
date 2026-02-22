@@ -145,7 +145,7 @@ class BOXCriterion(nn.Module):
         loss_attn_cls = F.cross_entropy(matched_logits, target_classes_o, 
                                         empty_weight,
         )
-        losses["loss_attn_cls"] = loss_attn_cls
+        losses["loss_cls"] = loss_attn_cls
 
         return losses
     
@@ -217,7 +217,7 @@ class BOXCriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels,
             # 'masks': self.loss_masks,
-            # 'boxes': self.loss_boxes, 
+            'boxes': self.loss_boxes, 
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
@@ -258,22 +258,6 @@ class BOXCriterion(nn.Module):
                     losses.update(l_dict)
 
         return losses
-
-    # def __repr__(self):
-    #     head = "Criterion " + self.__class__.__name__
-    #     body = [
-    #         "matcher: {}".format(self.matcher.__repr__(_repr_indent=8)),
-    #         "losses: {}".format(self.losses),
-    #         "weight_dict: {}".format(self.weight_dict),
-    #         "num_classes: {}".format(self.num_classes),
-    #         "eos_coef: {}".format(self.eos_coef),
-    #         "num_points: {}".format(self.num_points),
-    #         "oversample_ratio: {}".format(self.oversample_ratio),
-    #         "importance_sample_ratio: {}".format(self.importance_sample_ratio),
-    #     ]
-    #     _repr_indent = 4
-    #     lines = [head] + [" " * _repr_indent + line for line in body]
-    #     return "\n".join(lines)
 
     def loss_boxes(self, outputs, targets, indices, num_masks):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss

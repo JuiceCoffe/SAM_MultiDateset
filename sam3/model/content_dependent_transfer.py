@@ -3,16 +3,12 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from typing import Optional
 
-
 from maft.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
-
-
-
 
 
 class ShortCut_CrossAttention(nn.Module):
 
-    def __init__(self, d_model, nhead, panoptic_on = True):
+    def __init__(self, d_model, nhead, panoptic_on = False):
         super().__init__()
         self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=0.0)
         self.norm = nn.LayerNorm(d_model)
@@ -44,14 +40,11 @@ class ShortCut_CrossAttention(nn.Module):
                                    key=self.with_pos_embed(memory, pos),
                                    value=memory, attn_mask=memory_mask,
                                    key_padding_mask=memory_key_padding_mask)[0]
-        
-        tgt2 = self.norm(tgt2) 
-        tgt2 = self.activation(tgt2) # <--- 建议加上这一行 (ReLU)
-        tgt2 = self.MLP(tgt2)
-        tgt = tgt + tgt2
+
+        tgt = tgt + self.norm(self.MLP(tgt2))
 
         return tgt
-
+    
 
 
 class ContentDependentTransfer(nn.Module):
@@ -60,17 +53,14 @@ class ContentDependentTransfer(nn.Module):
         super().__init__()
         self.pe_layer = PositionEmbeddingSine(d_model//2, normalize=True)
         self.cross_atten = ShortCut_CrossAttention(d_model = d_model, nhead = nhead, panoptic_on = panoptic_on)
+    
 
     def forward(self, img_feat, text_classifier, ):
-        if len(text_classifier.shape) == 2:
-            text_classifier = text_classifier.unsqueeze(0).repeat(img_feat.shape[0],1,1)
+        text_classifier = text_classifier.unsqueeze(0).repeat(img_feat.shape[0],1,1)
 
         pos = self.pe_layer(img_feat, None).flatten(2).permute(2, 0, 1)  # hw * b * c
         img_feat = img_feat.flatten(2).permute(2, 0, 1)  # hw * b * c
 
-        output = self.cross_atten(text_classifier.permute(1, 0, 2), img_feat, memory_mask=None, memory_key_padding_mask=None, pos=pos, query_pos=None)
+        bias = self.cross_atten(text_classifier.permute(1, 0, 2), img_feat, memory_mask=None, memory_key_padding_mask=None, pos=pos, query_pos=None)
 
-        output = F.normalize(output, dim=-1) 
-
-        return output.permute(1, 0, 2)
-
+        return bias.permute(1, 0, 2) 
