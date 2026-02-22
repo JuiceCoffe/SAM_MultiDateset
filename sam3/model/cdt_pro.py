@@ -7,23 +7,25 @@ from maft.modeling.transformer_decoder.position_encoding import PositionEmbeddin
 
 
 class ShortCut_CrossAttention(nn.Module):
-
     def __init__(self, d_model, nhead, panoptic_on = False):
         super().__init__()
         self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=0.0)
-        self.norm = nn.LayerNorm(d_model)
-        self.activation = F.relu
-
-        self._reset_parameters()
+        self.norm = nn.LayerNorm(d_model) # 仍保留，但改变作用位置
+        self.activation = F.gelu
 
         self.MLP = nn.Linear(d_model, d_model)
         self.panoptic_on = panoptic_on
-
+        
+        self._reset_parameters()
 
     def _reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+        
+        # 【关键修改】：将 MLP 的最后一层权重和偏置严格初始化为 0
+        nn.init.zeros_(self.MLP.weight)
+        nn.init.zeros_(self.MLP.bias)
 
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
@@ -33,18 +35,22 @@ class ShortCut_CrossAttention(nn.Module):
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
                 query_pos: Optional[Tensor] = None):
-        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
+        
+        # 【关键修改】：将 LayerNorm 作用于 tgt 的输入端 (Pre-Norm)
+        tgt_normed = self.norm(tgt)
+        
+        # 使用 tgt_normed 去做 Query
+        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt_normed, query_pos),
                                    key=self.with_pos_embed(memory, pos),
                                    value=memory, attn_mask=memory_mask,
                                    key_padding_mask=memory_key_padding_mask)[0]
 
-        tgt = tgt + self.norm(self.MLP(tgt2))
+        tgt = tgt + self.activation(self.MLP(tgt2))
 
         return tgt
-    
 
 
-class ContentDependentTransfer(nn.Module):
+class ContentDependentTransferPRO(nn.Module):
 
     def __init__(self, d_model, nhead, panoptic_on):
         super().__init__()
