@@ -281,7 +281,7 @@ class RADIOSAM(nn.Module):
 
             self.out_vocab_weight_dict = {
                 "loss_ce": 1.0, 
-                "loss_cdt_cos": 1.0  
+                "loss_cdt_cos": 3.0  
             }
             self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
@@ -2840,6 +2840,7 @@ def get_classification_logits(x, text_classifier, logit_scale, num_templates=Non
     # text_classifier in shape of [num_classes, C]
     # logit_scale is a learnable scalar https://github.com/mlfoundations/open_clip/blob/main/src/open_clip/model.py#L201
     # return: [B, *, num_classes]
+    text_classifier = F.normalize(text_classifier, dim=-1)
     x = F.normalize(x, dim=-1)
     logit_scale = torch.clamp(logit_scale.exp(), max=100)
     if len(text_classifier.shape) == 2:

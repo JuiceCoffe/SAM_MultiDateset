@@ -9,11 +9,15 @@ from maft.modeling.transformer_decoder.position_encoding import PositionEmbeddin
 class ShortCut_CrossAttention(nn.Module):
     def __init__(self, d_model, nhead, panoptic_on = False):
         super().__init__()
-        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=0.0)
-        self.norm = nn.LayerNorm(d_model) # 仍保留，但改变作用位置
-        self.activation = F.gelu
-
-        self.MLP = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model) # 保持 Pre-Norm
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=0.1)
+        
+        # 【关键修改 1】：构造标准的两层前馈网络 (FFN)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model)
+        )
         self.panoptic_on = panoptic_on
         
         self._reset_parameters()
@@ -23,9 +27,10 @@ class ShortCut_CrossAttention(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
         
-        # 【关键修改】：将 MLP 的最后一层权重和偏置严格初始化为 0
-        nn.init.zeros_(self.MLP.weight)
-        nn.init.zeros_(self.MLP.bias)
+        # 【关键修改 2】：只对最后一层的权重和偏置进行 0 初始化
+        # 这样初始输出为 0，且输出可以包含任意正负数！
+        nn.init.zeros_(self.ffn[-1].weight)
+        nn.init.zeros_(self.ffn[-1].bias)
 
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
@@ -36,16 +41,15 @@ class ShortCut_CrossAttention(nn.Module):
                 pos: Optional[Tensor] = None,
                 query_pos: Optional[Tensor] = None):
         
-        # 【关键修改】：将 LayerNorm 作用于 tgt 的输入端 (Pre-Norm)
         tgt_normed = self.norm(tgt)
         
-        # 使用 tgt_normed 去做 Query
         tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt_normed, query_pos),
                                    key=self.with_pos_embed(memory, pos),
                                    value=memory, attn_mask=memory_mask,
                                    key_padding_mask=memory_key_padding_mask)[0]
 
-        tgt = tgt + self.activation(self.MLP(tgt2))
+        # 【关键修改 3】：残差直接加上 FFN 的输出，去掉外层的激活函数！
+        tgt = tgt + self.ffn(tgt2)
 
         return tgt
 
