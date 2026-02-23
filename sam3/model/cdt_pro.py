@@ -9,10 +9,11 @@ from maft.modeling.transformer_decoder.position_encoding import PositionEmbeddin
 class ShortCut_CrossAttention(nn.Module):
     def __init__(self, d_model, nhead, panoptic_on = False):
         super().__init__()
-        self.norm = nn.LayerNorm(d_model) # 保持 Pre-Norm
-        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=0.1)
+        self.norm = nn.LayerNorm(d_model) # Pre-Norm
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=0.0)
         
-        # 【关键修改 1】：构造标准的两层前馈网络 (FFN)
+        self.null_key = nn.Parameter(torch.zeros(1, 1, d_model))
+        
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
@@ -27,8 +28,10 @@ class ShortCut_CrossAttention(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
         
-        # 【关键修改 2】：只对最后一层的权重和偏置进行 0 初始化
-        # 这样初始输出为 0，且输出可以包含任意正负数！
+        # Null key 初始化为一个极小的高斯分布，帮助网络起步寻找
+        nn.init.normal_(self.null_key, std=0.02)
+        
+        # FFN 最后一层严格 0 初始化
         nn.init.zeros_(self.ffn[-1].weight)
         nn.init.zeros_(self.ffn[-1].bias)
 
@@ -43,16 +46,43 @@ class ShortCut_CrossAttention(nn.Module):
         
         tgt_normed = self.norm(tgt)
         
-        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt_normed, query_pos),
-                                   key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=memory_mask,
-                                   key_padding_mask=memory_key_padding_mask)[0]
+        # memory 的默认形状是 [Seq_Len, Batch, Dim]
+        L, B, D = memory.shape
+        
+        # ========================================================
+        # 核心逻辑：构造 Null Token
+        # ========================================================
+        # 1. 构造全零的 Null Value (形状: [1, Batch, Dim])
+        null_value = torch.zeros(1, B, D, device=memory.device, dtype=memory.dtype)
+        # 将其拼接到原有的 memory 上 -> [L+1, Batch, Dim]
+        aug_memory = torch.cat([memory, null_value], dim=0)
+        
+        # 2. 构造对应的 Null Key
+        orig_key = self.with_pos_embed(memory, pos)
+        # 将可学习的 null_key 扩展到 Batch 大小，并拼接到 key 上 -> [L+1, Batch, Dim]
+        # 注意：Null Token 没有空间位置，所以不需要加 pos
+        aug_key = torch.cat([orig_key, self.null_key.expand(1, B, D)], dim=0)
+        
+        # 3. 处理 key_padding_mask (通常在你的代码里是 None，但为了严谨处理一下)
+        aug_memory_key_padding_mask = memory_key_padding_mask
+        if memory_key_padding_mask is not None:
+            # 原 mask 形状: [Batch, Seq_Len]
+            # 我们需要增加一列 False (0)，表示 Null Token 永远对网络可见，不被 Mask
+            null_mask = torch.zeros(B, 1, device=memory.device, dtype=torch.bool)
+            aug_memory_key_padding_mask = torch.cat([memory_key_padding_mask, null_mask], dim=1)
+        # ========================================================
 
-        # 【关键修改 3】：残差直接加上 FFN 的输出，去掉外层的激活函数！
+        # 使用拼装好的 augmented 张量去做 Cross Attention
+        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt_normed, query_pos),
+                                   key=aug_key,
+                                   value=aug_memory,
+                                   attn_mask=memory_mask,
+                                   key_padding_mask=aug_memory_key_padding_mask)[0]
+
+        # 残差相加
         tgt = tgt + self.ffn(tgt2)
 
         return tgt
-
 
 class ContentDependentTransferPRO(nn.Module):
 

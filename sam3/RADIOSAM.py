@@ -50,7 +50,7 @@ from maft.utils.text_templetes import VILD_PROMPT
 
 from .loss.matcher import HungarianMatcher
 from .loss.criterion import SetCriterion
-# from sam3.model.content_dependent_transfer import ContentDependentTransfer
+from sam3.model.content_dependent_transfer import ContentDependentTransfer
 from sam3.model.cdt_pro import ContentDependentTransferPRO
 from sam3.model.box_ops import masks_to_boxes, box_xyxy_to_cxcywh
 
@@ -148,8 +148,8 @@ class RADIOSAM(nn.Module):
             if self.use_pe_text:
                 print("CDT模块当前仅支持256文本特征输入，请关闭PE文本特征选项！")
             text_classifier_dim = 1536
-            # self.cdt = ContentDependentTransfer(d_model=text_classifier_dim, nhead=8, panoptic_on=False) 
-            self.cdt = ContentDependentTransferPRO(d_model=text_classifier_dim, nhead=8, panoptic_on=False) 
+            self.cdt = ContentDependentTransfer(d_model=text_classifier_dim, nhead=8, panoptic_on=False) 
+            # self.cdt = ContentDependentTransferPRO(d_model=text_classifier_dim, nhead=8, panoptic_on=False) 
 
             self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         else:
@@ -281,7 +281,7 @@ class RADIOSAM(nn.Module):
 
             self.out_vocab_weight_dict = {
                 "loss_ce": 1.0, 
-                "loss_cdt_cos": 3.0  
+                # "loss_cdt_cos": 10.0  
             }
             self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
