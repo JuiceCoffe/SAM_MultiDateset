@@ -51,6 +51,7 @@ from maft.utils.text_templetes import VILD_PROMPT
 from .loss.matcher import HungarianMatcher
 from .loss.criterion import SetCriterion
 from sam3.model.content_dependent_transfer import ContentDependentTransfer
+from sam3.model.cdt_pro import ContentDependentTransferPRO
 from sam3.model.box_ops import masks_to_boxes, box_xyxy_to_cxcywh
 
 
@@ -128,6 +129,8 @@ class RADIOSAM(nn.Module):
         
         self.use_cos_sim = getattr(cfg.MODEL.SAM3, "COS_SIM", False) # 默认为 False
 
+        self.out_vocab_logit_scale = None
+
 
         # 通过 cfg 控制是否启用，硬编码输入输出维度为 256
         self.use_query_proj = cfg.MODEL.SAM3.USE_QUERY_PROJ
@@ -144,11 +147,11 @@ class RADIOSAM(nn.Module):
         if self.use_cdt:
             if self.use_pe_text:
                 print("CDT模块当前仅支持256文本特征输入，请关闭PE文本特征选项！")
-            text_classifier_dim = 256
-            self.cdt = nn.ModuleList([
-                ContentDependentTransfer(d_model=text_classifier_dim, nhead=8, panoptic_on=True) 
-                for _ in range(self.num_cdt)
-            ])
+            text_classifier_dim = 1536
+            self.cdt = ContentDependentTransfer(d_model=text_classifier_dim, nhead=8, panoptic_on=False) 
+            # self.cdt = ContentDependentTransferPRO(d_model=text_classifier_dim, nhead=8, panoptic_on=False) 
+
+            self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         else:
             self.cdt = None
 
@@ -218,7 +221,6 @@ class RADIOSAM(nn.Module):
                 self.pooling_decoder_synced = False if self.build_pool_decoder_from_maskdecoder else True
         else:
             self.new_pool_decoder = False
-            self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(100))
             
 
         self.new_score_head = cfg.MODEL.SAM3.NEW_SCORE_HEAD
@@ -269,6 +271,20 @@ class RADIOSAM(nn.Module):
             raise NotImplementedError("only_instance尚未给prepare_targets_for_maskadapter适配")
         
         self.train_mask = cfg.SOLVER.TRAIN_MASK
+
+        self.train_out_vocab= cfg.SOLVER.TRAIN_OUT_VOCAB
+        if self.train_out_vocab:
+            self.iou_threshold = cfg.MODEL.MASK_ADAPTER.IOU_THRESHOLD
+            self.mask_threshold = 0.50
+            self.num_gt_masks = cfg.MODEL.MASK_ADAPTER.NUM_GT_MASKS
+            self.num_pred_masks = cfg.MODEL.MASK_ADAPTER.NUM_PRED_MASKS
+
+            self.out_vocab_weight_dict = {
+                "loss_ce": 1.0, 
+                # "loss_cdt_cos": 10.0  
+            }
+            self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
         # -------------------------------------------------------
         # criterion损失函数
         # -------------------------------------------------------
@@ -1019,11 +1035,6 @@ class RADIOSAM(nn.Module):
 
             # others
             geometric_prompt = self.detector._get_dummy_prompt(bs)
-        
-        if self.use_cdt:
-            raise NotImplementedError("CDT is not implemented yet.")
-            # for layer in self.cdt:
-            #     text_classifier = layer(img_feat,text_classifier) # 逐层通过
 
         batch_gt_names_idx = []
         for i in range(bs):
@@ -1307,46 +1318,9 @@ class RADIOSAM(nn.Module):
                     cross_attn_weights *= torch.clamp(self.attn_pool_logit_scale.exp(),100)
                     cross_attn_weights = cross_attn_weights.softmax(dim=-1) # k, bs, N, L
                 
-                else:
-                    cross_attn_weights = torch.einsum("kbnd, lbd->kbnl", queries, decoder_img_feat)
-                    # ========================== 新增：Mask Attention 约束 ==========================
-
-                    layers_masks_list = []
-                    
-                    if 'aux_outputs' in outputs and outputs['aux_outputs'] is not None:
-                        for aux_out in outputs['aux_outputs']:
-                            layers_masks_list.append(aux_out['pred_masks'])
-                    layers_masks_list.append(outputs['pred_masks'])
-                    
-                    attn_mask_stack = torch.stack(layers_masks_list, dim=0)
-
-                    if attn_mask_stack.shape[0] != queries.shape[0]:
-                        attn_mask_stack = outputs['pred_masks'].unsqueeze(0).expand(queries.shape[0], -1, -1, -1, -1)
-
-                    # 2. 形状调整：为了高效插值，将 K, B, N 合并
-                    K_layers, B_batch, N_queries, H_orig, W_orig = attn_mask_stack.shape
-                    
-                    # -> [K*B*N, 1, H_orig, W_orig]
-                    attn_mask_stack = attn_mask_stack.flatten(0, 2).unsqueeze(1)
-
-                    # 3. 插值到 Feature Map 的分辨率 (radio_feat_H, radio_feat_W)
-                    # radio_feat_H/W 在前文 radio_img_feat.shape[-3:] 处已获得
-                    attn_mask_stack = F.interpolate(
-                        attn_mask_stack, 
-                        size=(radio_feat_H, radio_feat_W), 
-                        mode="bilinear", 
-                        align_corners=False
-                    )
-
-                    # 4. 恢复形状并展平空间维度 -> [K, B, N, L]
-                    attn_mask_stack = attn_mask_stack.view(K_layers, B_batch, N_queries, -1)
-
-                    valid_mask = (attn_mask_stack > 0.0)
-                    cross_attn_weights = cross_attn_weights.masked_fill(~valid_mask, -1e4)
-
-                    
-                    # =============================================================================
-                    cross_attn_weights = F.softmax(F.logsigmoid(cross_attn_weights), dim=-1)
+                # else:
+                    # cross_attn_weights = torch.einsum("kbnd, lbd->kbnl", queries, decoder_img_feat)
+                    # cross_attn_weights = F.softmax(F.logsigmoid(cross_attn_weights), dim=-1)
                 
                 pooled_img_feat = torch.einsum("bld, kbnl->kbnd", radio_img_feat, cross_attn_weights) # k, bs, N, D
 
@@ -1378,11 +1352,7 @@ class RADIOSAM(nn.Module):
                     if self.use_cos_sim:
                         tp_queries = F.normalize(tp_queries, dim=-1, p=2)
 
-
-                    if self.use_cdt:
-                        query_names_results = torch.einsum("bnd,bcd->bnc", tp_queries, SAM_text_classifier) # bs, N, C
-                    else:
-                        query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, SAM_text_classifier) # bs, N, C
+                    query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, SAM_text_classifier) # bs, N, C
                     
                     if self.use_cos_sim:
                         cur_logit_scale = self.logit_scale.exp()
@@ -1546,6 +1516,98 @@ class RADIOSAM(nn.Module):
 
                 losses.update(mask_adapter_losses)
 
+            elif self.train_out_vocab:
+                out_vocab_losses = {}
+
+                img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]  
+                # print("img_feat_for_pool shape:", img_feat_for_pool.shape)
+                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                targets, masks, labels = self.prepare_targets_for_maskadapter(gt_instances, images)
+
+                mask_pred_results = outputs["pred_masks"]
+                mask_cls_results = query_cls_results_final
+
+                src_masks, _ , target_masks, mask_labels = self.match_via_iou(mask_pred_results, mask_cls_results, targets, iou_threshold=self.iou_threshold,max_matches=self.num_pred_masks)
+                binary_src_masks = src_masks.sigmoid() > self.mask_threshold
+                binary_src_masks = binary_src_masks.float()
+
+                binary_src_masks = F.interpolate(binary_src_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+                target_masks = F.interpolate(target_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+
+                mask_pred = torch.cat((masks, binary_src_masks, target_masks),dim=1)
+                all_labels = torch.cat((labels, mask_labels, mask_labels),dim=1)
+                    
+                mask_for_pool = F.interpolate(mask_pred, size=img_feat_for_pool.shape[-2:],
+                                                    mode='bilinear', align_corners=False)
+                pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
+                pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
+
+                text_classifier_orig, num_templates = self.get_text_classifier(dataname)
+                text_classifier_orig = text_classifier_orig.clone().detach() 
+                
+                if self.cdt is not None:
+                    text_classifier_updated = self.cdt(img_feat_for_pool, text_classifier_orig)
+                else:
+                    text_classifier_updated = text_classifier_orig
+
+                mask_cls_results = get_classification_logits(pooled_img_feat , text_classifier_updated, self.out_vocab_logit_scale, num_templates)
+
+                loss_mask_cls = self.cross_entropy_loss(mask_cls_results, all_labels)
+
+                out_vocab_losses.update(loss_mask_cls)
+
+                # ==============================================================
+                # 【新增核心逻辑】：计算不在当前图片中出现的类别的余弦相似度损失
+                # ==============================================================
+                if self.cdt is not None:
+                    B, Total_Names, D = text_classifier_updated.shape
+                    
+                    # 1. 初始化 Mask：True 表示该类“不在当前图中”（需要正则化）
+                    absent_mask = torch.ones((B, Total_Names), dtype=torch.bool, device=self.device)
+                    
+                    # 2. 遍历 Batch，找出每一张图里存在的类别，并将其设为 False
+                    for b in range(B):
+                        present_labels = targets[b]["labels"].unique()
+                        present_labels = present_labels[present_labels >= 0].cpu().tolist() # 过滤有效ID
+                        
+                        # 把 Class ID 转换为具体的 Template/Name Indices (因为可能有同义词展开)
+                        present_name_indices = []
+                        for cid in present_labels:
+                            if cid < len(num_templates): # 安全校验
+                                start_idx = sum(num_templates[:cid])
+                                count = num_templates[cid]
+                                present_name_indices.extend(range(start_idx, start_idx + count))
+                        
+                        # 把存在的文本类别从约束 Mask 中剔除
+                        if present_name_indices:
+                            absent_mask[b, present_name_indices] = False
+                            
+                    # 3. 计算 Cosine Similarity 
+                    # updated: [B, Total_Names, D], orig: [Total_Names, D] -> [1, Total_Names, D]
+                    cos_sim = F.cosine_similarity(text_classifier_updated, text_classifier_orig.unsqueeze(0), dim=-1) # shape: [B, Total_Names]
+                    
+                    # 4. 只对未出现的类别进行惩罚
+                    if absent_mask.any():
+                        # 余弦相似度越接近 1，损失越接近 0
+                        loss_cdt_reg = 1.0 - cos_sim[absent_mask].mean()
+                    else:
+                        loss_cdt_reg = cos_sim.sum() * 0.0 # 保持计算图连通
+                        
+                    # 添加到损失字典
+                    out_vocab_losses["loss_cdt_cos"] = loss_cdt_reg
+                # ==============================================================
+
+                for k in list(out_vocab_losses.keys()):
+                    # print("loss:", k, losses[k].item())
+                    if k in self.out_vocab_weight_dict:
+                        out_vocab_losses[k] *= self.out_vocab_weight_dict[k]
+                    else:
+                        # remove this loss if not specified in `weight_dict`
+                        out_vocab_losses.pop(k)
+
+                losses.update(out_vocab_losses)                
+     
+
             # loss排序
             all_keys = list(losses.keys())
             aux_suffixes = [f"_{i}" for i in range(5)]
@@ -1573,6 +1635,9 @@ class RADIOSAM(nn.Module):
             # 强制清理 CUDA 缓存（虽然有开销，但能有效防止 OOM）
             torch.cuda.empty_cache()
 
+            if self.out_vocab_logit_scale is None:
+                self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(100))
+
             if self.use_attnpool:
                 img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
                 text_classifier, num_templates = self.get_text_classifier(dataname)
@@ -1580,7 +1645,7 @@ class RADIOSAM(nn.Module):
                 attn_weights = cross_attn_weights[-1]
 
                 pooled_img_feat = torch.einsum("bdl, bnl->bnd", img_feat_for_pool.view(bs, img_feat_for_pool.shape[1],-1), attn_weights)
-
+            
                 pool_cls_logits = get_classification_logits(pooled_img_feat, text_classifier, self.out_vocab_logit_scale, num_templates)
                             
             elif self.use_MaskAdapter:
@@ -1616,16 +1681,12 @@ class RADIOSAM(nn.Module):
                                                     mode='bilinear', align_corners=False)
                 pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
                 pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
-
-
                             
                 text_classifier, num_templates = self.get_text_classifier(dataname)
-
-                maskpool_name_logits = torch.einsum("cd,bnd->bnc", text_classifier, pooled_img_feat) 
-
-                maskpool_name_logits = maskpool_name_logits * 100
+                if self.cdt is not None:
+                    text_classifier = self.cdt(img_feat_for_pool, text_classifier)
                 
-                pool_cls_logits = aggregate_name_to_class_logits(maskpool_name_logits, num_templates)
+                pool_cls_logits = get_classification_logits(pooled_img_feat ,text_classifier, self.out_vocab_logit_scale, num_templates)
 
             if self.use_softmax:
                 is_void_prob = F.softmax(query_cls_results_final, dim=-1)[..., -1:]
@@ -2742,6 +2803,7 @@ def get_classification_logits(x, text_classifier, logit_scale, num_templates=Non
     # text_classifier in shape of [num_classes, C]
     # logit_scale is a learnable scalar https://github.com/mlfoundations/open_clip/blob/main/src/open_clip/model.py#L201
     # return: [B, *, num_classes]
+    text_classifier = F.normalize(text_classifier, dim=-1)
     x = F.normalize(x, dim=-1)
     logit_scale = torch.clamp(logit_scale.exp(), max=100)
     if len(text_classifier.shape) == 2:

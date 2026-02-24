@@ -1251,113 +1251,76 @@ class RADIOSAM(nn.Module):
                 radio_feat_D, radio_feat_H, radio_feat_W = radio_img_feat.shape[-3:]
                 radio_img_feat = radio_img_feat.view(bs, 1536, -1).permute(0,2,1) # bs, l, d
 
-                cls_box = outputs['pred_boxes']
+                # cls_box = outputs['pred_boxes']
                 
-                if self.add_radio_feat:
-                    decoder_img_feat = self.radio_feat_proj(radio_img_feat) + self.fusion_feat_proj(out["encoder_hidden_states"].permute(1,0,2))
+                # if self.add_radio_feat:
+                #     decoder_img_feat = self.radio_feat_proj(radio_img_feat) + self.fusion_feat_proj(out["encoder_hidden_states"].permute(1,0,2))
                     
-                    decoder_img_feat = decoder_img_feat.view(bs, radio_feat_H, radio_feat_W, -1).permute(0, 3, 1, 2)
-                    decoder_img_feat = self.feature_fusioner(decoder_img_feat)
-                    decoder_img_feat = decoder_img_feat.permute(0, 2, 3, 1).view(bs, radio_feat_H * radio_feat_W, -1)
+                #     decoder_img_feat = decoder_img_feat.view(bs, radio_feat_H, radio_feat_W, -1).permute(0, 3, 1, 2)
+                #     decoder_img_feat = self.feature_fusioner(decoder_img_feat)
+                #     decoder_img_feat = decoder_img_feat.permute(0, 2, 3, 1).view(bs, radio_feat_H * radio_feat_W, -1)
 
-                    decoder_img_feat = self.decoder_feat_proj(decoder_img_feat) # bs, l, d
-                    decoder_img_feat = decoder_img_feat.permute(1,0,2) # l, bs, d
-                else:
-                    decoder_img_feat = out["encoder_hidden_states"]
-                # decoder_img_feat = F.normalize(decoder_img_feat, dim=-1)
+                #     decoder_img_feat = self.decoder_feat_proj(decoder_img_feat) # bs, l, d
+                #     decoder_img_feat = decoder_img_feat.permute(1,0,2) # l, bs, d
+                # else:
+                #     decoder_img_feat = out["encoder_hidden_states"]
+                # # decoder_img_feat = F.normalize(decoder_img_feat, dim=-1)
                 
-                if self.new_pool_decoder:
-                    pixel_embed = outputs["pixel_embed"] 
-                    pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"])
-                    # cls_queries = self.detector.transformer.decoder.presence_token.weight.unsqueeze(1).expand(bs, N, -1)
-                    cls_queries = pooled_pixel_embed
-                    cls_queries = cls_queries.permute(1,0,2)
+                # if self.new_pool_decoder:
+                #     pixel_embed = outputs["pixel_embed"] 
+                #     pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"])
+                #     # cls_queries = self.detector.transformer.decoder.presence_token.weight.unsqueeze(1).expand(bs, N, -1)
+                #     cls_queries = pooled_pixel_embed
+                #     cls_queries = cls_queries.permute(1,0,2)
 
-                    class_tokens, reference_boxes_2, dec_presence_out_2, dec_presence_feats_2, cross_attn_weights = (
-                        self.pooling_decoder(
-                            tgt=cls_queries,
-                            memory=decoder_img_feat,
-                            memory_key_padding_mask=encoder_out["padding_mask"],
-                            pos=encoder_out["pos_embed"],
-                            reference_boxes=pred_boxes.permute(1, 0, 2),
-                            level_start_index=encoder_out["level_start_index"],
-                            spatial_shapes=encoder_out["spatial_shapes"],
-                            valid_ratios=encoder_out["valid_ratios"],
-                            tgt_mask=None,
-                            memory_text=prompt,
-                            text_attention_mask=prompt_mask,
-                            apply_dac=False,
+                #     class_tokens, reference_boxes_2, dec_presence_out_2, dec_presence_feats_2, cross_attn_weights = (
+                #         self.pooling_decoder(
+                #             tgt=cls_queries,
+                #             memory=decoder_img_feat,
+                #             memory_key_padding_mask=encoder_out["padding_mask"],
+                #             pos=encoder_out["pos_embed"],
+                #             reference_boxes=pred_boxes.permute(1, 0, 2),
+                #             level_start_index=encoder_out["level_start_index"],
+                #             spatial_shapes=encoder_out["spatial_shapes"],
+                #             valid_ratios=encoder_out["valid_ratios"],
+                #             tgt_mask=None,
+                #             memory_text=prompt,
+                #             text_attention_mask=prompt_mask,
+                #             apply_dac=False,
 
-                            use_presence_token = False,
-                            # fixed_reference_boxes = True
-                        )
-                    )
+                #             use_presence_token = False,
+                #             # fixed_reference_boxes = True
+                #         )
+                #     )
 
-                    hs_2 = class_tokens.transpose(1, 2)  # seq-first to batch-first
-                    reference_boxes_2 = reference_boxes_2.transpose(1, 2)  # seq-first to batch-first
-                    if dec_presence_out_2 is not None:
-                        # seq-first to batch-first
-                        dec_presence_out_2 = dec_presence_out_2.transpose(1, 2)
-                    out2 = {}
-                    out2["presence_feats"] = dec_presence_feats_2
-                    self.detector._update_scores_and_boxes(
-                        out2,
-                        hs_2,
-                        reference_boxes_2,
-                        prompt,
-                        prompt_mask,
-                        dec_presence_out=dec_presence_out_2,
-                    )
+                #     hs_2 = class_tokens.transpose(1, 2)  # seq-first to batch-first
+                #     reference_boxes_2 = reference_boxes_2.transpose(1, 2)  # seq-first to batch-first
+                #     if dec_presence_out_2 is not None:
+                #         # seq-first to batch-first
+                #         dec_presence_out_2 = dec_presence_out_2.transpose(1, 2)
+                #     out2 = {}
+                #     out2["presence_feats"] = dec_presence_feats_2
+                #     self.detector._update_scores_and_boxes(
+                #         out2,
+                #         hs_2,
+                #         reference_boxes_2,
+                #         prompt,
+                #         prompt_mask,
+                #         dec_presence_out=dec_presence_out_2,
+                #     )
 
-                    cls_box = out2['pred_boxes']
-                    # queries = class_tokens.permute(0,2,1,3)
-                    # class_tokens = class_tokens[-1:,...]
+                #     cls_box = out2['pred_boxes']
+                #     # queries = class_tokens.permute(0,2,1,3)
+                #     # class_tokens = class_tokens[-1:,...]
 
-                    class_tokens = F.normalize(class_tokens, dim=-1)
-                    cross_attn_weights = torch.einsum("knbd, lbd->kbnl", class_tokens, decoder_img_feat)
-                    cross_attn_weights *= torch.clamp(self.attn_pool_logit_scale.exp(),100)
-                    cross_attn_weights = cross_attn_weights.softmax(dim=-1) # k, bs, N, L
+                #     class_tokens = F.normalize(class_tokens, dim=-1)
+                #     cross_attn_weights = torch.einsum("knbd, lbd->kbnl", class_tokens, decoder_img_feat)
+                #     cross_attn_weights *= torch.clamp(self.attn_pool_logit_scale.exp(),100)
+                #     cross_attn_weights = cross_attn_weights.softmax(dim=-1) # k, bs, N, L
                 
-                else:
-                    cross_attn_weights = torch.einsum("kbnd, lbd->kbnl", queries, decoder_img_feat)
-                    # ========================== 新增：Mask Attention 约束 ==========================
-
-                    layers_masks_list = []
-                    
-                    if 'aux_outputs' in outputs and outputs['aux_outputs'] is not None:
-                        for aux_out in outputs['aux_outputs']:
-                            layers_masks_list.append(aux_out['pred_masks'])
-                    layers_masks_list.append(outputs['pred_masks'])
-                    
-                    attn_mask_stack = torch.stack(layers_masks_list, dim=0)
-
-                    if attn_mask_stack.shape[0] != queries.shape[0]:
-                        attn_mask_stack = outputs['pred_masks'].unsqueeze(0).expand(queries.shape[0], -1, -1, -1, -1)
-
-                    # 2. 形状调整：为了高效插值，将 K, B, N 合并
-                    K_layers, B_batch, N_queries, H_orig, W_orig = attn_mask_stack.shape
-                    
-                    # -> [K*B*N, 1, H_orig, W_orig]
-                    attn_mask_stack = attn_mask_stack.flatten(0, 2).unsqueeze(1)
-
-                    # 3. 插值到 Feature Map 的分辨率 (radio_feat_H, radio_feat_W)
-                    # radio_feat_H/W 在前文 radio_img_feat.shape[-3:] 处已获得
-                    attn_mask_stack = F.interpolate(
-                        attn_mask_stack, 
-                        size=(radio_feat_H, radio_feat_W), 
-                        mode="bilinear", 
-                        align_corners=False
-                    )
-
-                    # 4. 恢复形状并展平空间维度 -> [K, B, N, L]
-                    attn_mask_stack = attn_mask_stack.view(K_layers, B_batch, N_queries, -1)
-
-                    valid_mask = (attn_mask_stack > 0.0)
-                    cross_attn_weights = cross_attn_weights.masked_fill(~valid_mask, -1e4)
-
-                    
-                    # =============================================================================
-                    cross_attn_weights = F.softmax(F.logsigmoid(cross_attn_weights), dim=-1)
+                # else:
+                    # cross_attn_weights = torch.einsum("kbnd, lbd->kbnl", queries, decoder_img_feat)
+                    # cross_attn_weights = F.softmax(F.logsigmoid(cross_attn_weights), dim=-1)
                 
                 pooled_img_feat = torch.einsum("bld, kbnl->kbnd", radio_img_feat, cross_attn_weights) # k, bs, N, D
 
@@ -1426,7 +1389,7 @@ class RADIOSAM(nn.Module):
                             'pred_masks': outputs['aux_outputs'][i]["pred_masks"], 
                             'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'],
                             'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"],
-                            # "attn_cls_logits": attn_cls_results[i],
+                            "attn_cls_logits": attn_cls_results[i],
                         }
                         if cur_obj_logits is not None:
                             aux_out['pred_objectness_logits'] = cur_obj_logits
@@ -1446,7 +1409,7 @@ class RADIOSAM(nn.Module):
                     'pred_masks': outputs["pred_masks"],
                     'pred_boxes': outputs['pred_boxes'],
                     'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
-                    # "attn_cls_logits": attn_cls_results[-1],
+                    "attn_cls_logits": attn_cls_results[-1],
                     'aux_outputs': aux_outputs if use_aux is True else None,
                 }
                 if obj_logits_final is not None:
@@ -1495,154 +1458,154 @@ class RADIOSAM(nn.Module):
 
             #     losses.update(attnpool_losses)
 
-            if self.use_MaskAdapter:
-                mask_adapter_losses = {}
+            # if self.use_MaskAdapter:
+            #     mask_adapter_losses = {}
 
-                img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]  
-                # print("img_feat_for_pool shape:", img_feat_for_pool.shape)
-                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-                targets, masks, labels = self.prepare_targets_for_maskadapter(gt_instances, images)
+            #     img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]  
+            #     # print("img_feat_for_pool shape:", img_feat_for_pool.shape)
+            #     gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+            #     targets, masks, labels = self.prepare_targets_for_maskadapter(gt_instances, images)
 
-                mask_pred_results = outputs["pred_masks"]
-                mask_cls_results = query_cls_results_final
+            #     mask_pred_results = outputs["pred_masks"]
+            #     mask_cls_results = query_cls_results_final
 
-                src_masks, _ , target_masks, mask_labels = self.match_via_iou(mask_pred_results, mask_cls_results, targets, iou_threshold=self.iou_threshold,max_matches=self.num_pred_masks)
-                binary_src_masks = src_masks.sigmoid() > self.mask_threshold
-                binary_src_masks = binary_src_masks.float()
+            #     src_masks, _ , target_masks, mask_labels = self.match_via_iou(mask_pred_results, mask_cls_results, targets, iou_threshold=self.iou_threshold,max_matches=self.num_pred_masks)
+            #     binary_src_masks = src_masks.sigmoid() > self.mask_threshold
+            #     binary_src_masks = binary_src_masks.float()
 
-                binary_src_masks = F.interpolate(binary_src_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
-                target_masks = F.interpolate(target_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+            #     binary_src_masks = F.interpolate(binary_src_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+            #     target_masks = F.interpolate(target_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
 
-                mask_pred = torch.cat((masks, binary_src_masks, target_masks),dim=1)
-                all_labels = torch.cat((labels, mask_labels, mask_labels),dim=1)
+            #     mask_pred = torch.cat((masks, binary_src_masks, target_masks),dim=1)
+            #     all_labels = torch.cat((labels, mask_labels, mask_labels),dim=1)
                     
-                # maps_for_pooling = self.mask_adapter(img_feat_for_pool, mask_pred)
-                maps_for_pooling = []
-                for i in range(bs):
-                    maps_for_pooling_batch = self.mask_adapter(img_feat_for_pool[i:i+1, :, :, :], mask_pred[i:i+1, :, :, :])
-                    maps_for_pooling.append(maps_for_pooling_batch)
-                maps_for_pooling = torch.cat(maps_for_pooling, dim=0)
+            #     # maps_for_pooling = self.mask_adapter(img_feat_for_pool, mask_pred)
+            #     maps_for_pooling = []
+            #     for i in range(bs):
+            #         maps_for_pooling_batch = self.mask_adapter(img_feat_for_pool[i:i+1, :, :, :], mask_pred[i:i+1, :, :, :])
+            #         maps_for_pooling.append(maps_for_pooling_batch)
+            #     maps_for_pooling = torch.cat(maps_for_pooling, dim=0)
                 
-                maps_for_pooling = F.interpolate(maps_for_pooling, size=img_feat_for_pool.shape[-2:],
-                                                    mode='bilinear', align_corners=False)
+            #     maps_for_pooling = F.interpolate(maps_for_pooling, size=img_feat_for_pool.shape[-2:],
+            #                                         mode='bilinear', align_corners=False)
 
             
-                N = maps_for_pooling.size(1)
-                num_instances = N // self.num_output_maps
-                maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N,-1), dim=-1)
-                pooled_img_feature = torch.bmm(maps_for_pooling, img_feat_for_pool.view(bs, img_feat_for_pool.size(1), -1).permute(0, 2, 1))
-                pooled_img_feature = (pooled_img_feature.reshape(bs, num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
+            #     N = maps_for_pooling.size(1)
+            #     num_instances = N // self.num_output_maps
+            #     maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N,-1), dim=-1)
+            #     pooled_img_feature = torch.bmm(maps_for_pooling, img_feat_for_pool.view(bs, img_feat_for_pool.size(1), -1).permute(0, 2, 1))
+            #     pooled_img_feature = (pooled_img_feature.reshape(bs, num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
 
-                loss_cosine_similarity = self.cosine_similarity_loss(pooled_img_feature[:, 16:24, :], pooled_img_feature[:, 24:, :])
+            #     loss_cosine_similarity = self.cosine_similarity_loss(pooled_img_feature[:, 16:24, :], pooled_img_feature[:, 24:, :])
 
-                text_classifier, num_templates = self.get_text_classifier(dataname)
-                mask_cls_results = get_classification_logits(pooled_img_feature , text_classifier, self.out_vocab_logit_scale, num_templates)
+            #     text_classifier, num_templates = self.get_text_classifier(dataname)
+            #     mask_cls_results = get_classification_logits(pooled_img_feature , text_classifier, self.out_vocab_logit_scale, num_templates)
 
-                loss_mask_cls = self.cross_entropy_loss(mask_cls_results, all_labels)
+            #     loss_mask_cls = self.cross_entropy_loss(mask_cls_results, all_labels)
 
-                mask_adapter_losses.update(loss_cosine_similarity)
-                mask_adapter_losses.update(loss_mask_cls)
+            #     mask_adapter_losses.update(loss_cosine_similarity)
+            #     mask_adapter_losses.update(loss_mask_cls)
 
-                for k in list(mask_adapter_losses.keys()):
-                    # print("loss:", k, losses[k].item())
-                    if k in self.mask_adapter_weight_dict:
-                        mask_adapter_losses[k] *= self.mask_adapter_weight_dict[k]
-                    else:
-                        # remove this loss if not specified in `weight_dict`
-                        mask_adapter_losses.pop(k)
+            #     for k in list(mask_adapter_losses.keys()):
+            #         # print("loss:", k, losses[k].item())
+            #         if k in self.mask_adapter_weight_dict:
+            #             mask_adapter_losses[k] *= self.mask_adapter_weight_dict[k]
+            #         else:
+            #             # remove this loss if not specified in `weight_dict`
+            #             mask_adapter_losses.pop(k)
 
-                losses.update(mask_adapter_losses)
+            #     losses.update(mask_adapter_losses)
 
-            elif self.train_out_vocab:
-                out_vocab_losses = {}
+            # elif self.train_out_vocab:
+            #     out_vocab_losses = {}
 
-                img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]  
-                # print("img_feat_for_pool shape:", img_feat_for_pool.shape)
-                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-                targets, masks, labels = self.prepare_targets_for_maskadapter(gt_instances, images)
+            #     img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]  
+            #     # print("img_feat_for_pool shape:", img_feat_for_pool.shape)
+            #     gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+            #     targets, masks, labels = self.prepare_targets_for_maskadapter(gt_instances, images)
 
-                mask_pred_results = outputs["pred_masks"]
-                mask_cls_results = query_cls_results_final
+            #     mask_pred_results = outputs["pred_masks"]
+            #     mask_cls_results = query_cls_results_final
 
-                src_masks, _ , target_masks, mask_labels = self.match_via_iou(mask_pred_results, mask_cls_results, targets, iou_threshold=self.iou_threshold,max_matches=self.num_pred_masks)
-                binary_src_masks = src_masks.sigmoid() > self.mask_threshold
-                binary_src_masks = binary_src_masks.float()
+            #     src_masks, _ , target_masks, mask_labels = self.match_via_iou(mask_pred_results, mask_cls_results, targets, iou_threshold=self.iou_threshold,max_matches=self.num_pred_masks)
+            #     binary_src_masks = src_masks.sigmoid() > self.mask_threshold
+            #     binary_src_masks = binary_src_masks.float()
 
-                binary_src_masks = F.interpolate(binary_src_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
-                target_masks = F.interpolate(target_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+            #     binary_src_masks = F.interpolate(binary_src_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+            #     target_masks = F.interpolate(target_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
 
-                mask_pred = torch.cat((masks, binary_src_masks, target_masks),dim=1)
-                all_labels = torch.cat((labels, mask_labels, mask_labels),dim=1)
+            #     mask_pred = torch.cat((masks, binary_src_masks, target_masks),dim=1)
+            #     all_labels = torch.cat((labels, mask_labels, mask_labels),dim=1)
                     
-                mask_for_pool = F.interpolate(mask_pred, size=img_feat_for_pool.shape[-2:],
-                                                    mode='bilinear', align_corners=False)
-                pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
-                pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
+            #     mask_for_pool = F.interpolate(mask_pred, size=img_feat_for_pool.shape[-2:],
+            #                                         mode='bilinear', align_corners=False)
+            #     pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
+            #     pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
 
-                text_classifier_orig, num_templates = self.get_text_classifier(dataname)
-                text_classifier_orig = text_classifier_orig.clone().detach() 
+            #     text_classifier_orig, num_templates = self.get_text_classifier(dataname)
+            #     text_classifier_orig = text_classifier_orig.clone().detach() 
                 
-                if self.cdt is not None:
-                    text_classifier_updated = self.cdt(img_feat_for_pool, text_classifier_orig)
-                else:
-                    text_classifier_updated = text_classifier_orig
+            #     if self.cdt is not None:
+            #         text_classifier_updated = self.cdt(img_feat_for_pool, text_classifier_orig)
+            #     else:
+            #         text_classifier_updated = text_classifier_orig
 
-                mask_cls_results = get_classification_logits(pooled_img_feat , text_classifier_updated, self.out_vocab_logit_scale, num_templates)
+            #     mask_cls_results = get_classification_logits(pooled_img_feat , text_classifier_updated, self.out_vocab_logit_scale, num_templates)
 
-                loss_mask_cls = self.cross_entropy_loss(mask_cls_results, all_labels)
+            #     loss_mask_cls = self.cross_entropy_loss(mask_cls_results, all_labels)
 
-                out_vocab_losses.update(loss_mask_cls)
+            #     out_vocab_losses.update(loss_mask_cls)
 
-                # ==============================================================
-                # 【新增核心逻辑】：计算不在当前图片中出现的类别的余弦相似度损失
-                # ==============================================================
-                if self.cdt is not None:
-                    B, Total_Names, D = text_classifier_updated.shape
+            #     # ==============================================================
+            #     # 【新增核心逻辑】：计算不在当前图片中出现的类别的余弦相似度损失
+            #     # ==============================================================
+            #     if self.cdt is not None:
+            #         B, Total_Names, D = text_classifier_updated.shape
                     
-                    # 1. 初始化 Mask：True 表示该类“不在当前图中”（需要正则化）
-                    absent_mask = torch.ones((B, Total_Names), dtype=torch.bool, device=self.device)
+            #         # 1. 初始化 Mask：True 表示该类“不在当前图中”（需要正则化）
+            #         absent_mask = torch.ones((B, Total_Names), dtype=torch.bool, device=self.device)
                     
-                    # 2. 遍历 Batch，找出每一张图里存在的类别，并将其设为 False
-                    for b in range(B):
-                        present_labels = targets[b]["labels"].unique()
-                        present_labels = present_labels[present_labels >= 0].cpu().tolist() # 过滤有效ID
+            #         # 2. 遍历 Batch，找出每一张图里存在的类别，并将其设为 False
+            #         for b in range(B):
+            #             present_labels = targets[b]["labels"].unique()
+            #             present_labels = present_labels[present_labels >= 0].cpu().tolist() # 过滤有效ID
                         
-                        # 把 Class ID 转换为具体的 Template/Name Indices (因为可能有同义词展开)
-                        present_name_indices = []
-                        for cid in present_labels:
-                            if cid < len(num_templates): # 安全校验
-                                start_idx = sum(num_templates[:cid])
-                                count = num_templates[cid]
-                                present_name_indices.extend(range(start_idx, start_idx + count))
+            #             # 把 Class ID 转换为具体的 Template/Name Indices (因为可能有同义词展开)
+            #             present_name_indices = []
+            #             for cid in present_labels:
+            #                 if cid < len(num_templates): # 安全校验
+            #                     start_idx = sum(num_templates[:cid])
+            #                     count = num_templates[cid]
+            #                     present_name_indices.extend(range(start_idx, start_idx + count))
                         
-                        # 把存在的文本类别从约束 Mask 中剔除
-                        if present_name_indices:
-                            absent_mask[b, present_name_indices] = False
+            #             # 把存在的文本类别从约束 Mask 中剔除
+            #             if present_name_indices:
+            #                 absent_mask[b, present_name_indices] = False
                             
-                    # 3. 计算 Cosine Similarity 
-                    # updated: [B, Total_Names, D], orig: [Total_Names, D] -> [1, Total_Names, D]
-                    cos_sim = F.cosine_similarity(text_classifier_updated, text_classifier_orig.unsqueeze(0), dim=-1) # shape: [B, Total_Names]
+            #         # 3. 计算 Cosine Similarity 
+            #         # updated: [B, Total_Names, D], orig: [Total_Names, D] -> [1, Total_Names, D]
+            #         cos_sim = F.cosine_similarity(text_classifier_updated, text_classifier_orig.unsqueeze(0), dim=-1) # shape: [B, Total_Names]
                     
-                    # 4. 只对未出现的类别进行惩罚
-                    if absent_mask.any():
-                        # 余弦相似度越接近 1，损失越接近 0
-                        loss_cdt_reg = 1.0 - cos_sim[absent_mask].mean()
-                    else:
-                        loss_cdt_reg = cos_sim.sum() * 0.0 # 保持计算图连通
+            #         # 4. 只对未出现的类别进行惩罚
+            #         if absent_mask.any():
+            #             # 余弦相似度越接近 1，损失越接近 0
+            #             loss_cdt_reg = 1.0 - cos_sim[absent_mask].mean()
+            #         else:
+            #             loss_cdt_reg = cos_sim.sum() * 0.0 # 保持计算图连通
                         
-                    # 添加到损失字典
-                    out_vocab_losses["loss_cdt_cos"] = loss_cdt_reg
-                # ==============================================================
+            #         # 添加到损失字典
+            #         out_vocab_losses["loss_cdt_cos"] = loss_cdt_reg
+            #     # ==============================================================
 
-                for k in list(out_vocab_losses.keys()):
-                    # print("loss:", k, losses[k].item())
-                    if k in self.out_vocab_weight_dict:
-                        out_vocab_losses[k] *= self.out_vocab_weight_dict[k]
-                    else:
-                        # remove this loss if not specified in `weight_dict`
-                        out_vocab_losses.pop(k)
+            #     for k in list(out_vocab_losses.keys()):
+            #         # print("loss:", k, losses[k].item())
+            #         if k in self.out_vocab_weight_dict:
+            #             out_vocab_losses[k] *= self.out_vocab_weight_dict[k]
+            #         else:
+            #             # remove this loss if not specified in `weight_dict`
+            #             out_vocab_losses.pop(k)
 
-                losses.update(out_vocab_losses)                
+            #     losses.update(out_vocab_losses)                
      
 
             # loss排序
