@@ -1325,7 +1325,7 @@ class RADIOSAM(nn.Module):
                 pooled_img_feat = torch.einsum("bld, kbnl->kbnd", radio_img_feat, cross_attn_weights) # k, bs, N, D
 
                 text_classifier, num_templates = self.get_text_classifier(dataname)
-                
+             
                 attn_cls_results = get_classification_logits(pooled_img_feat.reshape(-1 , N, pooled_img_feat.shape[-1]), text_classifier, self.out_vocab_logit_scale, num_templates)
 
                 attn_cls_results = attn_cls_results.view(-1, bs, N, attn_cls_results.shape[-1])
@@ -1515,98 +1515,6 @@ class RADIOSAM(nn.Module):
                         mask_adapter_losses.pop(k)
 
                 losses.update(mask_adapter_losses)
-
-            elif self.train_out_vocab:
-                out_vocab_losses = {}
-
-                img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]  
-                # print("img_feat_for_pool shape:", img_feat_for_pool.shape)
-                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-                targets, masks, labels = self.prepare_targets_for_maskadapter(gt_instances, images)
-
-                mask_pred_results = outputs["pred_masks"]
-                mask_cls_results = query_cls_results_final
-
-                src_masks, _ , target_masks, mask_labels = self.match_via_iou(mask_pred_results, mask_cls_results, targets, iou_threshold=self.iou_threshold,max_matches=self.num_pred_masks)
-                binary_src_masks = src_masks.sigmoid() > self.mask_threshold
-                binary_src_masks = binary_src_masks.float()
-
-                binary_src_masks = F.interpolate(binary_src_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
-                target_masks = F.interpolate(target_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
-
-                mask_pred = torch.cat((masks, binary_src_masks, target_masks),dim=1)
-                all_labels = torch.cat((labels, mask_labels, mask_labels),dim=1)
-                    
-                mask_for_pool = F.interpolate(mask_pred, size=img_feat_for_pool.shape[-2:],
-                                                    mode='bilinear', align_corners=False)
-                pooled_img_feat = self.mask_pooling(img_feat_for_pool, mask_for_pool)
-                pooled_img_feat = F.normalize(pooled_img_feat, dim=-1, p=2)
-
-                text_classifier_orig, num_templates = self.get_text_classifier(dataname)
-                text_classifier_orig = text_classifier_orig.clone().detach() 
-                
-                if self.cdt is not None:
-                    text_classifier_updated = self.cdt(img_feat_for_pool, text_classifier_orig)
-                else:
-                    text_classifier_updated = text_classifier_orig
-
-                mask_cls_results = get_classification_logits(pooled_img_feat , text_classifier_updated, self.out_vocab_logit_scale, num_templates)
-
-                loss_mask_cls = self.cross_entropy_loss(mask_cls_results, all_labels)
-
-                out_vocab_losses.update(loss_mask_cls)
-
-                # ==============================================================
-                # 【新增核心逻辑】：计算不在当前图片中出现的类别的余弦相似度损失
-                # ==============================================================
-                if self.cdt is not None:
-                    B, Total_Names, D = text_classifier_updated.shape
-                    
-                    # 1. 初始化 Mask：True 表示该类“不在当前图中”（需要正则化）
-                    absent_mask = torch.ones((B, Total_Names), dtype=torch.bool, device=self.device)
-                    
-                    # 2. 遍历 Batch，找出每一张图里存在的类别，并将其设为 False
-                    for b in range(B):
-                        present_labels = targets[b]["labels"].unique()
-                        present_labels = present_labels[present_labels >= 0].cpu().tolist() # 过滤有效ID
-                        
-                        # 把 Class ID 转换为具体的 Template/Name Indices (因为可能有同义词展开)
-                        present_name_indices = []
-                        for cid in present_labels:
-                            if cid < len(num_templates): # 安全校验
-                                start_idx = sum(num_templates[:cid])
-                                count = num_templates[cid]
-                                present_name_indices.extend(range(start_idx, start_idx + count))
-                        
-                        # 把存在的文本类别从约束 Mask 中剔除
-                        if present_name_indices:
-                            absent_mask[b, present_name_indices] = False
-                            
-                    # 3. 计算 Cosine Similarity 
-                    # updated: [B, Total_Names, D], orig: [Total_Names, D] -> [1, Total_Names, D]
-                    cos_sim = F.cosine_similarity(text_classifier_updated, text_classifier_orig.unsqueeze(0), dim=-1) # shape: [B, Total_Names]
-                    
-                    # 4. 只对未出现的类别进行惩罚
-                    if absent_mask.any():
-                        # 余弦相似度越接近 1，损失越接近 0
-                        loss_cdt_reg = 1.0 - cos_sim[absent_mask].mean()
-                    else:
-                        loss_cdt_reg = cos_sim.sum() * 0.0 # 保持计算图连通
-                        
-                    # 添加到损失字典
-                    out_vocab_losses["loss_cdt_cos"] = loss_cdt_reg
-                # ==============================================================
-
-                for k in list(out_vocab_losses.keys()):
-                    # print("loss:", k, losses[k].item())
-                    if k in self.out_vocab_weight_dict:
-                        out_vocab_losses[k] *= self.out_vocab_weight_dict[k]
-                    else:
-                        # remove this loss if not specified in `weight_dict`
-                        out_vocab_losses.pop(k)
-
-                losses.update(out_vocab_losses)                
-     
 
             # loss排序
             all_keys = list(losses.keys())

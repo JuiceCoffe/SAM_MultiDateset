@@ -51,7 +51,7 @@ from maft.utils.text_templetes import VILD_PROMPT
 from .loss.matcher import HungarianMatcher
 from .loss.criterion import SetCriterion
 from sam3.model.content_dependent_transfer import ContentDependentTransfer
-from sam3.model.cdt_pro import ContentDependentTransferPRO
+# from sam3.model.cdt_pro import ContentDependentTransferPRO
 from sam3.model.box_ops import masks_to_boxes, box_xyxy_to_cxcywh
 
 
@@ -202,18 +202,12 @@ class RADIOSAM(nn.Module):
             self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
             if self.add_radio_feat:
-                fusioner_dim = 768
-                self.fusion_feat_proj = MLP(256, 1024, fusioner_dim, 3)
-                self.radio_feat_proj =  MLP(1536, 768, fusioner_dim, 3)
-                self.feature_fusioner = nn.Sequential(
-                    ConvNextBlock(fusioner_dim),
-                    ConvNextBlock(fusioner_dim),
-                    ConvNextBlock(fusioner_dim),
-                    ConvNextBlock(fusioner_dim),
-                    ConvNextBlock(fusioner_dim),
-                    ConvNextBlock(fusioner_dim),
+                from .attn_adapter import AttnAdapter
+                self.feat_weight_adapter = AttnAdapter(
+                    feat_dim = 768,
+                    radio_dim = 1536,
+                    sam_dim = 256,
                 )
-                self.decoder_feat_proj =  MLP(fusioner_dim, 512, 256, 3)
 
             if self.new_pool_decoder:
                 self.pooling_decoder = _create_pool_decoder()
@@ -1249,84 +1243,34 @@ class RADIOSAM(nn.Module):
             if self.use_attnpool:
                 radio_img_feat = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
                 radio_feat_D, radio_feat_H, radio_feat_W = radio_img_feat.shape[-3:]
+                
+                if self.add_radio_feat:
+                    feat_weight_map = self.feat_weight_adapter(
+                        radio_img_feat,
+                        out["encoder_hidden_states"],
+                    )
+                    cross_attn_weights = feat_weight_map.flatten(2).sigmoid() * cross_attn_weights
+                    cross_attn_weights = torch.log(cross_attn_weights + 1e-8).softmax(-1)
+
                 radio_img_feat = radio_img_feat.view(bs, 1536, -1).permute(0,2,1) # bs, l, d
 
-                # cls_box = outputs['pred_boxes']
-                
-                # if self.add_radio_feat:
-                #     decoder_img_feat = self.radio_feat_proj(radio_img_feat) + self.fusion_feat_proj(out["encoder_hidden_states"].permute(1,0,2))
-                    
-                #     decoder_img_feat = decoder_img_feat.view(bs, radio_feat_H, radio_feat_W, -1).permute(0, 3, 1, 2)
-                #     decoder_img_feat = self.feature_fusioner(decoder_img_feat)
-                #     decoder_img_feat = decoder_img_feat.permute(0, 2, 3, 1).view(bs, radio_feat_H * radio_feat_W, -1)
-
-                #     decoder_img_feat = self.decoder_feat_proj(decoder_img_feat) # bs, l, d
-                #     decoder_img_feat = decoder_img_feat.permute(1,0,2) # l, bs, d
-                # else:
-                #     decoder_img_feat = out["encoder_hidden_states"]
-                # # decoder_img_feat = F.normalize(decoder_img_feat, dim=-1)
-                
-                # if self.new_pool_decoder:
-                #     pixel_embed = outputs["pixel_embed"] 
-                #     pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"])
-                #     # cls_queries = self.detector.transformer.decoder.presence_token.weight.unsqueeze(1).expand(bs, N, -1)
-                #     cls_queries = pooled_pixel_embed
-                #     cls_queries = cls_queries.permute(1,0,2)
-
-                #     class_tokens, reference_boxes_2, dec_presence_out_2, dec_presence_feats_2, cross_attn_weights = (
-                #         self.pooling_decoder(
-                #             tgt=cls_queries,
-                #             memory=decoder_img_feat,
-                #             memory_key_padding_mask=encoder_out["padding_mask"],
-                #             pos=encoder_out["pos_embed"],
-                #             reference_boxes=pred_boxes.permute(1, 0, 2),
-                #             level_start_index=encoder_out["level_start_index"],
-                #             spatial_shapes=encoder_out["spatial_shapes"],
-                #             valid_ratios=encoder_out["valid_ratios"],
-                #             tgt_mask=None,
-                #             memory_text=prompt,
-                #             text_attention_mask=prompt_mask,
-                #             apply_dac=False,
-
-                #             use_presence_token = False,
-                #             # fixed_reference_boxes = True
-                #         )
-                #     )
-
-                #     hs_2 = class_tokens.transpose(1, 2)  # seq-first to batch-first
-                #     reference_boxes_2 = reference_boxes_2.transpose(1, 2)  # seq-first to batch-first
-                #     if dec_presence_out_2 is not None:
-                #         # seq-first to batch-first
-                #         dec_presence_out_2 = dec_presence_out_2.transpose(1, 2)
-                #     out2 = {}
-                #     out2["presence_feats"] = dec_presence_feats_2
-                #     self.detector._update_scores_and_boxes(
-                #         out2,
-                #         hs_2,
-                #         reference_boxes_2,
-                #         prompt,
-                #         prompt_mask,
-                #         dec_presence_out=dec_presence_out_2,
-                #     )
-
-                #     cls_box = out2['pred_boxes']
-                #     # queries = class_tokens.permute(0,2,1,3)
-                #     # class_tokens = class_tokens[-1:,...]
-
-                #     class_tokens = F.normalize(class_tokens, dim=-1)
-                #     cross_attn_weights = torch.einsum("knbd, lbd->kbnl", class_tokens, decoder_img_feat)
-                #     cross_attn_weights *= torch.clamp(self.attn_pool_logit_scale.exp(),100)
-                #     cross_attn_weights = cross_attn_weights.softmax(dim=-1) # k, bs, N, L
-                
-                # else:
-                    # cross_attn_weights = torch.einsum("kbnd, lbd->kbnl", queries, decoder_img_feat)
-                    # cross_attn_weights = F.softmax(F.logsigmoid(cross_attn_weights), dim=-1)
-                
                 pooled_img_feat = torch.einsum("bld, kbnl->kbnd", radio_img_feat, cross_attn_weights) # k, bs, N, D
 
                 text_classifier, num_templates = self.get_text_classifier(dataname)
-                
-                attn_cls_results = get_classification_logits(pooled_img_feat.reshape(-1 , N, pooled_img_feat.shape[-1]), text_classifier, self.out_vocab_logit_scale, num_templates)
+
+                if self.cdt is not None:
+                    text_classifier = self.cdt(
+                        backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"], 
+                        text_classifier
+                    )
+                    attn_cls_results = []
+                    for i in range(bs):
+                        attn_cls_result = get_classification_logits(pooled_img_feat[:,i,:,:], text_classifier[i], self.out_vocab_logit_scale, num_templates)
+                        attn_cls_results.append(attn_cls_result)
+                    attn_cls_results = torch.stack(attn_cls_results, dim = 1)
+
+                else:
+                    attn_cls_results = get_classification_logits(pooled_img_feat.reshape(-1 , N, pooled_img_feat.shape[-1]), text_classifier, self.out_vocab_logit_scale, num_templates)
 
                 attn_cls_results = attn_cls_results.view(-1, bs, N, attn_cls_results.shape[-1])
 
@@ -1639,14 +1583,7 @@ class RADIOSAM(nn.Module):
                 self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(100))
 
             if self.use_attnpool:
-                img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
-                text_classifier, num_templates = self.get_text_classifier(dataname)
-                
-                attn_weights = cross_attn_weights[-1]
-
-                pooled_img_feat = torch.einsum("bdl, bnl->bnd", img_feat_for_pool.view(bs, img_feat_for_pool.shape[1],-1), attn_weights)
-            
-                pool_cls_logits = get_classification_logits(pooled_img_feat, text_classifier, self.out_vocab_logit_scale, num_templates)
+                pool_cls_logits = attn_cls_results[-1]
                             
             elif self.use_MaskAdapter:
                 mask_cls_results = outputs["pred_logits"]
@@ -1684,7 +1621,10 @@ class RADIOSAM(nn.Module):
                             
                 text_classifier, num_templates = self.get_text_classifier(dataname)
                 if self.cdt is not None:
-                    text_classifier = self.cdt(img_feat_for_pool, text_classifier)
+                    text_classifier = self.cdt(
+                        backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"], 
+                        text_classifier
+                    )
                 
                 pool_cls_logits = get_classification_logits(pooled_img_feat ,text_classifier, self.out_vocab_logit_scale, num_templates)
 
