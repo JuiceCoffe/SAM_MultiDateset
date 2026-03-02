@@ -15,6 +15,7 @@ MODEL:
     # COS_SIM: False
     USE_SOFTMAX: True
     ADD_PIXELFEAT: True
+    USE_DOT_PROD_HEAD: True
 
     ALPHA: 0.8
     BETA: 1.0
@@ -29,12 +30,13 @@ MODEL:
   WEIGHTS: "/data/hmp/sam3.pt"
   # WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
   # WEIGHTS: /root/autodl-tmp/sam3.pt
-  # WEIGHTS: /root/hmp/SAMweight/RADIOSAM_copa2ep.pth
+  # WEIGHTS: /data/hmp/TASK/OVS/mysamMultiDateset/out/RADIOSAM/copa_attn_cdt/model_0022499.pth
 
 DATASETS:
   # 只保留 COCO Panoptic
   TRAIN: ("coco_2017_train_panoptic", )
   TEST: ("openvocab_ade20k_panoptic_val",) 
+  # TEST: ("openvocab_cityscapes_fine_panoptic_val",)
   # TEST: ("openvocab_ade20k_full_sem_seg_val","openvocab_pascal20_sem_seg_val",'openvocab_pascal_ctx459_sem_seg_val', 'openvocab_pascal_ctx59_sem_seg_val',)
   # TEST: ("openvocab_ade20k_panoptic_val", "openvocab_ade20k_full_sem_seg_val","openvocab_pascal20_sem_seg_val",'openvocab_pascal_ctx459_sem_seg_val', 'openvocab_pascal_ctx59_sem_seg_val',)
 
@@ -109,5 +111,5 @@ TEST:
 VERSION: 2
 
 # OUTPUT_DIR: ./out/test/
-OUTPUT_DIR: ./out/RADIOSAM/copa_attn_cdt
+OUTPUT_DIR: ./out/RADIOSAM/copa_attn_cdt_dotprod/
   

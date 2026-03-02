@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple
 import torch
 
 import torch.nn as nn
+from torch.nn import functional as F
 
 
 class Sam3DualViTDetNeck(nn.Module):

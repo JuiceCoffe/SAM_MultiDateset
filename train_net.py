@@ -1,8 +1,45 @@
 import warnings
 import os
 
-# 1. 禁用所有警告
 warnings.filterwarnings("ignore")
+
+import sys
+import types
+
+try:
+    # 1. 核心改进：直接“深度导入” detectron2 会用到的具体底层文件
+    # 这样可以迫使 Python 提前将这些文件加载进内存。
+    # 如果这里报错，说明是环境真的缺库（比如缺 cv2 或 Pillow），而不是路径问题。
+    import cityscapesscripts.evaluation.evalPixelLevelSemanticLabeling as eval_pixel
+    
+    # 顺便把实例分割的评测也导入（如果 detectron2 需要的话）
+    try:
+        import cityscapesscripts.evaluation.evalInstanceLevelSemanticLabeling as eval_instance
+    except ImportError:
+        eval_instance = None
+
+except ImportError as e:
+    # 拦截真实的依赖错误，并提供清晰的报错信息
+    print("\n" + "="*60)
+    print(f"❌ 导入 cityscapesscripts 核心模块失败！\n真实的错误原因是: {e}")
+    print("👉 如果提示 'No module named cityscapesscripts'，请运行: pip install cityscapesscripts")
+    print("👉 如果提示缺少 cv2、numpy 等其他库，请 pip install 对应的库。")
+    print("="*60 + "\n")
+    sys.exit(1)
+
+# 2. 完美的深层别名映射 (模拟 Facebook 内部的完整路径)
+# 这样无论是 detectron2 走 try 分支还是 except 走 deeplearning 分支，都会命中缓存，绝不报错
+sys.modules['deeplearning'] = types.ModuleType('deeplearning')
+sys.modules['deeplearning.projects'] = types.ModuleType('deeplearning.projects')
+sys.modules['deeplearning.projects.cityscapesApi'] = types.ModuleType('deeplearning.projects.cityscapesApi')
+
+# 将完整的深度模块精准挂载上去
+sys.modules['deeplearning.projects.cityscapesApi.cityscapesscripts'] = sys.modules['cityscapesscripts']
+sys.modules['deeplearning.projects.cityscapesApi.cityscapesscripts.evaluation'] = sys.modules['cityscapesscripts.evaluation']
+sys.modules['deeplearning.projects.cityscapesApi.cityscapesscripts.evaluation.evalPixelLevelSemanticLabeling'] = eval_pixel
+
+if eval_instance:
+    sys.modules['deeplearning.projects.cityscapesApi.cityscapesscripts.evaluation.evalInstanceLevelSemanticLabeling'] = eval_instance
 
 
 import copy
@@ -104,6 +141,11 @@ class Trainer(DefaultTrainer):
             evaluator_list.append( LVISEvaluator(dataset_name, cfg, True, output_folder))
             return evaluator_list
 
+        if "cityscape" in dataset_name:
+            print("="*20,"使用cityscape评估器","="*20)
+            evaluator_list.append(CityscapesSemSegEvaluator(dataset_name))
+            evaluator_list.append(CityscapesInstanceEvaluator(dataset_name))
+            return evaluator_list
 
         if cfg.TEST.INSTANCE_ON:
             evaluator_list.append(InstanceSegEvaluator(dataset_name, output_dir=output_folder))

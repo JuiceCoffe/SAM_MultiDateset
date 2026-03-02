@@ -388,6 +388,51 @@ class Sam3Image(torch.nn.Module):
                 update_aux=self.training,
             )
 
+    def compute_open_vocab_classification_scores(
+        self,
+        hs: torch.Tensor, # [num_layer, bs, num_query, d]
+        text_embeddings: torch.Tensor,  # 当前场景的文本张量，形状:[num_classes, dim]
+        is_instance_prompt: bool = False,
+    ):
+        """
+        针对开放词汇 (Open-Vocabulary) 修改的分类分数计算函数
+        """
+        out = {}
+
+        if self.use_dot_prod_scoring:
+            dot_prod_head = self.dot_prod_scoring
+            if is_instance_prompt and self.instance_dot_prod_scoring is not None:
+                dot_prod_head = self.instance_dot_prod_scoring
+            
+            if dot_prod_head.prompt_mlp is not None:
+                text_feats = dot_prod_head.prompt_mlp(text_embeddings)
+            else:
+                text_feats = text_embeddings
+                
+            proj_text = dot_prod_head.prompt_proj(text_feats)
+
+            proj_hs = dot_prod_head.hs_proj(hs)
+            
+
+            outputs_class = torch.matmul(proj_hs, proj_text.T)
+            outputs_class *= dot_prod_head.scale
+
+            # 4. 截断 Logits
+            if dot_prod_head.clamp_logits:
+                outputs_class.clamp_(
+                    min=-dot_prod_head.clamp_max_val, 
+                    max=dot_prod_head.clamp_max_val
+                )
+            # ======================================================
+        else:
+            # 如果你未来走非点乘分支，则对应的线性层本身就需要支持输出 num_classes
+            class_embed_head = self.class_embed
+            if is_instance_prompt and self.instance_class_embed is not None:
+                class_embed_head = self.instance_class_embed
+            outputs_class = class_embed_head(hs)
+
+        return outputs_class
+
     def _run_segmentation_heads(
         self,
         out,

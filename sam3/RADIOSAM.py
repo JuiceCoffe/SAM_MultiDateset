@@ -51,7 +51,6 @@ from maft.utils.text_templetes import VILD_PROMPT
 from .loss.matcher import HungarianMatcher
 from .loss.criterion import SetCriterion
 from sam3.model.content_dependent_transfer import ContentDependentTransfer
-# from sam3.model.cdt_pro import ContentDependentTransferPRO
 from sam3.model.box_ops import masks_to_boxes, box_xyxy_to_cxcywh
 
 
@@ -149,7 +148,6 @@ class RADIOSAM(nn.Module):
                 print("CDT模块当前仅支持256文本特征输入，请关闭PE文本特征选项！")
             text_classifier_dim = 1536
             self.cdt = ContentDependentTransfer(d_model=text_classifier_dim, nhead=8, panoptic_on=False) 
-            # self.cdt = ContentDependentTransferPRO(d_model=text_classifier_dim, nhead=8, panoptic_on=False) 
 
             self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         else:
@@ -222,7 +220,7 @@ class RADIOSAM(nn.Module):
             self.score_head = MLP(256, 256, 1, 3)
             init_score_head(self.score_head)
 
-
+        self.use_dot_prod_head = cfg.MODEL.SAM3.USE_DOT_PROD_HEAD
         # -------------------------------------------------------
         # 计算逻辑
         # -------------------------------------------------------
@@ -1168,6 +1166,12 @@ class RADIOSAM(nn.Module):
                     dec_presence_out=dec_presence_out,
                 )
 
+            if self.use_dot_prod_head:
+                dot_prod = self.detector.compute_open_vocab_classification_scores(
+                    hs,
+                    SAM_text_classifier,
+                )
+                # print("dot_prod shape:", dot_prod.shape) # (6, bs, N, num_names)
 
             # print("keys of out after decoder:", out.keys()) # (['encoder_hidden_states', 'prev_encoder_out', 'presence_feats', 'queries', 'presence_logit_dec', 'pred_logits', 'pred_boxes', 'pred_boxes_xyxy'])
             # Run segmentation heads
@@ -1278,37 +1282,40 @@ class RADIOSAM(nn.Module):
                 assert queries.shape[0] == 6
                 assert queries.shape[2] == N
                 if use_aux or i == 5 :
-                    tp_queries = queries[i,:,:,:].clone() 
+                    if self.use_dot_prod_head:
+                        query_names_results = dot_prod[i,:,:,:] # bs, N, C
+                    else:
+                        tp_queries = queries[i,:,:,:].clone() 
 
-                    if self.add_pixelfeat:
-                        pixel_embed = outputs["pixel_embed"] # bs, D, H', W'
+                        if self.add_pixelfeat:
+                            pixel_embed = outputs["pixel_embed"] # bs, D, H', W'
 
-                        pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"] if i ==5 else outputs['aux_outputs'][i]["pred_masks"])
-                        tp_queries = tp_queries + pooled_pixel_embed
-                        tp_queries = tp_queries + pooled_pixel_embed
+                            pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"] if i ==5 else outputs['aux_outputs'][i]["pred_masks"])
+                            tp_queries = tp_queries + pooled_pixel_embed
+                            tp_queries = tp_queries + pooled_pixel_embed
+
+                        if self.use_query_proj:
+                            tp_queries = self.query_proj(tp_queries)
+
+
+                        if self.use_cos_sim:
+                            tp_queries = F.normalize(tp_queries, dim=-1, p=2)
+
+                        query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, SAM_text_classifier) # bs, N, C
+                        
+                        if self.use_cos_sim:
+                            cur_logit_scale = self.logit_scale.exp()
+                            cur_logit_scale = torch.clamp(cur_logit_scale, max=100.0)
+                            query_names_results = cur_logit_scale * query_names_results
+                            if self.logit_bias is not None:
+                                cur_logit_bias = self.logit_bias
+                                query_names_results = query_names_results + cur_logit_bias
+                        else:
+                            if self.logit_bias is not None:
+                                cur_logit_bias = self.logit_bias
+                                query_names_results = query_names_results + self.logit_bias
 
                     cur_obj_logits = obj_logits[i] if obj_logits is not None else None
-
-                    if self.use_query_proj:
-                        tp_queries = self.query_proj(tp_queries)
-
-
-                    if self.use_cos_sim:
-                        tp_queries = F.normalize(tp_queries, dim=-1, p=2)
-
-                    query_names_results = torch.einsum("bnd,cd->bnc", tp_queries, SAM_text_classifier) # bs, N, C
-                    
-                    if self.use_cos_sim:
-                        cur_logit_scale = self.logit_scale.exp()
-                        cur_logit_scale = torch.clamp(cur_logit_scale, max=100.0)
-                        query_names_results = cur_logit_scale * query_names_results
-                        if self.logit_bias is not None:
-                            cur_logit_bias = self.logit_bias
-                            query_names_results = query_names_results + cur_logit_bias
-                    else:
-                        if self.logit_bias is not None:
-                            cur_logit_bias = self.logit_bias
-                            query_names_results = query_names_results + self.logit_bias
 
                     query_cls_results= []
                     cur_idx = 0
@@ -1745,42 +1752,39 @@ class RADIOSAM(nn.Module):
                     semseg = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_prob)
                     res["sem_seg"] = semseg
 
-                    # =========== 修改开始：为可视化准备 Square 数据 ===========
-                    
-                    # 1. 获取当前输入 Tensor 的尺寸 (即正方形尺寸，例如 1024x1024)
-                    # batched_inputs[i]["image"] 是经过 mapper 处理后的图
-                    tensor_h, tensor_w = batched_inputs[i]["image"].shape[-2:]
-                    
-                    # 2. 将 Logits 插值到 Tensor 尺寸 (而不是原图尺寸)
-                    # 注意：这里要用原始的 mask_pred_logits[i]，不要用已经 resize 过的 mask_pred_i
-                    mask_pred_i_square = F.interpolate(
-                        mask_pred_logits[i].unsqueeze(0), 
-                        size=(tensor_h, tensor_w), 
-                        mode="bilinear", 
-                        align_corners=False
-                    ).squeeze(0).sigmoid()
-                    
-                    # 3. 计算 Square 的语义分割结果
-                    semseg_square = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_i_square)
-                    pred_result_square = semseg_square.argmax(0).cpu()
-
-                    # 6. 获取类别名称
-                    current_dataname = batched_inputs[i]["meta"]["dataname"]
-                    if current_dataname in self.test_metadata:
-                        meta = self.test_metadata[current_dataname]
-                    else:
-                        meta = MetadataCatalog.get(current_dataname)
-                    
-                    try:
-                        current_class_names = meta.stuff_classes
-                    except:
-                        current_class_names = meta.thing_classes
-
                     # 7. 绘图 (全部传入 Square 的数据)
                     visualize_semantic = False
                     # visualize_semantic = True
 
                     if visualize_semantic:
+
+                        tensor_h, tensor_w = batched_inputs[i]["image"].shape[-2:]
+                        
+                        # 2. 将 Logits 插值到 Tensor 尺寸 (而不是原图尺寸)
+                        # 注意：这里要用原始的 mask_pred_logits[i]，不要用已经 resize 过的 mask_pred_i
+                        mask_pred_i_square = F.interpolate(
+                            mask_pred_logits[i].unsqueeze(0), 
+                            size=(tensor_h, tensor_w), 
+                            mode="bilinear", 
+                            align_corners=False
+                        ).squeeze(0).sigmoid()
+                        
+                        # 3. 计算 Square 的语义分割结果
+                        semseg_square = torch.einsum("qc,qhw->chw", mask_cls_prob, mask_pred_i_square)
+                        pred_result_square = semseg_square.argmax(0).cpu()
+
+                        # 6. 获取类别名称
+                        current_dataname = batched_inputs[i]["meta"]["dataname"]
+                        if current_dataname in self.test_metadata:
+                            meta = self.test_metadata[current_dataname]
+                        else:
+                            meta = MetadataCatalog.get(current_dataname)
+                        
+                        try:
+                            current_class_names = meta.stuff_classes
+                        except:
+                            current_class_names = meta.thing_classes
+
                         visualize_segmentation(
                             pred_result=pred_result_square,       # 修改点：传入 Square 预测
                             gt_result= batched_inputs[i]["sem_seg"].to(self.device),           # 本身就是 Square
