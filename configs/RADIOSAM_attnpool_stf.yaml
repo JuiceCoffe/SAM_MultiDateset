@@ -16,7 +16,7 @@ MODEL:
     USE_SOFTMAX: True
     ADD_PIXELFEAT: True
 
-    ALPHA: 0.8
+    ALPHA: 1.0
     BETA: 1.0
     # ORACLE_SELECT: True
 
@@ -32,8 +32,8 @@ MODEL:
   # WEIGHTS: /root/hmp/SAMweight/RADIOSAM_copa2ep.pth
 
 DATASETS:
-  # 只保留 COCO Panoptic
   TRAIN: ("coco_2017_train_panoptic", )
+  # TRAIN: ("openvocab_coco_2017_train_stuff_sem_seg",)
   TEST: ("openvocab_ade20k_panoptic_val",) 
   # TEST: ("openvocab_ade20k_full_sem_seg_val","openvocab_pascal20_sem_seg_val",'openvocab_pascal_ctx459_sem_seg_val', 'openvocab_pascal_ctx59_sem_seg_val',)
   # TEST: ("openvocab_ade20k_panoptic_val", "openvocab_ade20k_full_sem_seg_val","openvocab_pascal20_sem_seg_val",'openvocab_pascal_ctx459_sem_seg_val', 'openvocab_pascal_ctx59_sem_seg_val',)
@@ -50,12 +50,12 @@ SOLVER:
   IMS_PER_BATCH: 48
   BASE_LR: 0.0001
   LR_SCHEDULER_NAME: WarmupPolyLR
-  STEPS: (20000, 25000)
+  STEPS: (15000, 22500)
   MAX_ITER: 30000
   CHECKPOINT_PERIOD: 7500
   
 
-  CLASS_WEIGHT: 3.0
+  CLASS_WEIGHT: 2.0
   MASK_WEIGHT: 5.0
   DICE_WEIGHT: 5.0
   BBOX_WEIGHT: 5.0
@@ -108,6 +108,6 @@ TEST:
 # 修改输出目录名称以区分实验
 VERSION: 2
 
-# OUTPUT_DIR: ./out/test/
-OUTPUT_DIR: ./out/RADIOSAM/copa_attn_cdt
+OUTPUT_DIR: ./out/test/
+# OUTPUT_DIR: ./out/RADIOSAM/cost_attn_cdt
   

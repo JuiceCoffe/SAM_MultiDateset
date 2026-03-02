@@ -59,8 +59,8 @@ class RADIO_Adaptor(nn.Module):
         # Normalize inputs to [0, 1]
         images = (images + 1) / 2
 
-        if images.shape[-2:] != self.input_size:
-            images = F.interpolate(images, self.input_size, mode='bilinear', align_corners=False)
+        # if images.shape[-2:] != self.input_size:
+        #     images = F.interpolate(images, self.input_size, mode='bilinear', align_corners=False)
 
         with torch.autocast('cuda', dtype=torch.bfloat16):
             student_output = self.student(images)
