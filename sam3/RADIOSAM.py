@@ -50,6 +50,8 @@ from maft.utils.text_templetes import VILD_PROMPT
 
 from .loss.matcher import HungarianMatcher
 from .loss.criterion import SetCriterion
+from .loss.fcclip_criterion import FcclipSetCriterion
+from .loss.fcclip_matcher import FcclipHungarianMatcher
 from sam3.model.content_dependent_transfer import ContentDependentTransfer
 from sam3.model.box_ops import masks_to_boxes, box_xyxy_to_cxcywh
 
@@ -264,24 +266,6 @@ class RADIOSAM(nn.Module):
         
         self.train_mask = cfg.SOLVER.TRAIN_MASK
 
-        self.train_out_vocab= cfg.SOLVER.TRAIN_OUT_VOCAB
-        if self.train_out_vocab:
-            self.iou_threshold = cfg.MODEL.MASK_ADAPTER.IOU_THRESHOLD
-            self.mask_threshold = 0.50
-            self.num_gt_masks = cfg.MODEL.MASK_ADAPTER.NUM_GT_MASKS
-            self.num_pred_masks = cfg.MODEL.MASK_ADAPTER.NUM_PRED_MASKS
-
-            self.out_vocab_weight_dict = {
-                "loss_ce": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT, 
-            }
-            tp_out_vocab_weight_dict = {}
-            for k in self.out_vocab_weight_dict.keys():
-                for i in range(5):
-                    tp_out_vocab_weight_dict[f"{k}_{i}"] = self.out_vocab_weight_dict[k]
-            self.out_vocab_weight_dict.update(tp_out_vocab_weight_dict)
-            
-            self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-
         # -------------------------------------------------------
         # criterion损失函数
         # -------------------------------------------------------
@@ -318,7 +302,7 @@ class RADIOSAM(nn.Module):
             "loss_dice": dice_weight,
             'loss_bbox':bbox_weight, 
             'loss_giou':giou_weight,
-            "loss_attn_cls": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT,
+            # "loss_attn_cls": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT * 0.1,
         }
         if self.new_score_head:
             criterion_weight_dict["loss_objectness"] = objectness_weight
@@ -331,9 +315,6 @@ class RADIOSAM(nn.Module):
 
         # building criterion
         if self.use_softmax:
-            from .loss.fcclip_criterion import FcclipSetCriterion
-            from .loss.fcclip_matcher import FcclipHungarianMatcher
-
             no_object_weight = 0.1
 
             matcher = FcclipHungarianMatcher(
@@ -373,6 +354,49 @@ class RADIOSAM(nn.Module):
                 importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
                 tau=cfg.SOLVER.CONTRAST_TEMPERATURE,
             )
+
+        self.train_out_vocab= cfg.SOLVER.TRAIN_OUT_VOCAB
+        if self.train_out_vocab:
+            self.iou_threshold = cfg.MODEL.MASK_ADAPTER.IOU_THRESHOLD
+            self.mask_threshold = 0.50
+            self.num_gt_masks = cfg.MODEL.MASK_ADAPTER.NUM_GT_MASKS
+            self.num_pred_masks = cfg.MODEL.MASK_ADAPTER.NUM_PRED_MASKS
+
+            self.out_vocab_weight_dict = {
+                "loss_ce": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT * 1.0, 
+                "loss_attn_cls": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT * 0.1,
+            }
+            tp_out_vocab_weight_dict = {}
+            for k in self.out_vocab_weight_dict.keys():
+                for i in range(5):
+                    tp_out_vocab_weight_dict[f"{k}_{i}"] = self.out_vocab_weight_dict[k]
+            self.out_vocab_weight_dict.update(tp_out_vocab_weight_dict)
+            
+            self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+            no_object_weight = 0.0
+
+            matcher = FcclipHungarianMatcher(
+                cost_class=0,
+                cost_mask=mask_weight,
+                cost_dice=dice_weight,
+                cost_bbox=bbox_weight,
+                cost_giou=giou_weight,
+                num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
+            )
+
+            losses = ["labels", ]
+            self.out_vocab_criterion = FcclipSetCriterion(
+                num_classes = 133,
+                matcher=matcher,
+                weight_dict=self.out_vocab_weight_dict,
+                eos_coef=no_object_weight,
+                losses=losses,
+                num_points=cfg.SOLVER.TRAIN_NUM_POINTS,
+                oversample_ratio=cfg.SOLVER.OVERSAMPLE_RATIO,
+                importance_sample_ratio=cfg.SOLVER.IMPORTANCE_SAMPLE_RATIO,
+            )
+
 
         if self.use_attnpool:
             if self.new_pool_decoder:
@@ -1443,21 +1467,33 @@ class RADIOSAM(nn.Module):
 
                 # print("img_feat_for_pool shape:", img_feat_for_pool.shape)
                 gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-                targets, masks, labels = self.prepare_targets_for_maskadapter(gt_instances, images)
+                targets_adapter, _, _ = self.prepare_targets_for_maskadapter(gt_instances, images)
 
                 for i in range(6):
                     # 获取当前层的预测结果
+                    layer_loss_dict = {}
                     mask_pred_results = outputs["pred_masks"] if i == 5 else outputs['aux_outputs'][i]["pred_masks"]
                     mask_cls_results = attn_cls_results[i]
 
+                    criterion_pred = {
+                        'pred_logits': query_cls_results_final,
+                        'pred_masks': outputs["pred_masks"],
+                        'pred_boxes': outputs['pred_boxes'],
+                        'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
+                        "attn_cls_logits": attn_cls_results[-1],
+                        'aux_outputs': aux_outputs if use_aux is True else None,
+                    }
+
+                    out_vocab_criterion_losses = self.out_vocab_criterion(criterion_pred, targets)
+                    layer_loss_dict.update(out_vocab_criterion_losses)
+
                     # 进行匹配
                     src_masks, src_cls, target_masks, mask_labels = self.match_via_iou(
-                        mask_pred_results, mask_cls_results, targets, 
+                        mask_pred_results, mask_cls_results, targets_adapter, 
                         iou_threshold=self.iou_threshold, max_matches=self.num_pred_masks
                     )
                     
-                    # --- [核心修改] 立即计算当前层的 Loss ---
-                    layer_loss_dict = self.cross_entropy_loss(src_cls, mask_labels)
+                    layer_loss_dict.update(self.cross_entropy_loss(src_cls, mask_labels))
 
                     for k, v in layer_loss_dict.items():
                         if i < 5:
