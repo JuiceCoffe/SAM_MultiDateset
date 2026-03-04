@@ -363,8 +363,8 @@ class RADIOSAM(nn.Module):
             self.num_pred_masks = cfg.MODEL.MASK_ADAPTER.NUM_PRED_MASKS
 
             self.out_vocab_weight_dict = {
-                "loss_ce": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT * 1.0, 
-                "loss_attn_cls": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT * 0.1,
+                # "loss_ce": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT * 1.0, 
+                "loss_attn_cls": cfg.MODEL.ATTNPOOL.CLASS_WEIGHT,
             }
             tp_out_vocab_weight_dict = {}
             for k in self.out_vocab_weight_dict.keys():
@@ -1355,7 +1355,7 @@ class RADIOSAM(nn.Module):
                     'pred_masks': outputs["pred_masks"],
                     'pred_boxes': outputs['pred_boxes'],
                     'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
-                    "attn_cls_logits": attn_cls_results[-1],
+                    # "attn_cls_logits": attn_cls_results[-1],
                     'aux_outputs': aux_outputs if use_aux is True else None,
                 }
                 if obj_logits_final is not None:
@@ -1465,9 +1465,8 @@ class RADIOSAM(nn.Module):
             if self.train_out_vocab:
                 out_vocab_losses = {}
 
-                # print("img_feat_for_pool shape:", img_feat_for_pool.shape)
-                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-                targets_adapter, _, _ = self.prepare_targets_for_maskadapter(gt_instances, images)
+                # gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                # targets_adapter, _, _ = self.prepare_targets_for_maskadapter(gt_instances, images)
 
                 for i in range(6):
                     # 获取当前层的预测结果
@@ -1487,13 +1486,13 @@ class RADIOSAM(nn.Module):
                     out_vocab_criterion_losses = self.out_vocab_criterion(criterion_pred, targets)
                     layer_loss_dict.update(out_vocab_criterion_losses)
 
-                    # 进行匹配
-                    src_masks, src_cls, target_masks, mask_labels = self.match_via_iou(
-                        mask_pred_results, mask_cls_results, targets_adapter, 
-                        iou_threshold=self.iou_threshold, max_matches=self.num_pred_masks
-                    )
+                    # # 进行匹配
+                    # src_masks, src_cls, target_masks, mask_labels = self.match_via_iou(
+                    #     mask_pred_results, mask_cls_results, targets_adapter, 
+                    #     iou_threshold=self.iou_threshold, max_matches=self.num_pred_masks
+                    # )
                     
-                    layer_loss_dict.update(self.cross_entropy_loss(src_cls, mask_labels))
+                    # layer_loss_dict.update(self.cross_entropy_loss(src_cls, mask_labels))
 
                     for k, v in layer_loss_dict.items():
                         if i < 5:
