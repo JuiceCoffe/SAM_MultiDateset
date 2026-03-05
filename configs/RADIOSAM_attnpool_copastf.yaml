@@ -30,18 +30,18 @@ MODEL:
     CLASS_WEIGHT: 1.0
 
   # WEIGHTS: "/data/hmp/sam3.pt"
-  WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
+  # WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
   # WEIGHTS: /root/autodl-tmp/sam3.pt
-  # WEIGHTS: /root/hmp/SAMweight/copa2ep_attn_cdt_noTXTcrossALL.pth
+  WEIGHTS: /root/hmp/SAMweight/copa_attn_cdt/model_0022499.pth
 
 DATASETS:
-  # 只保留 COCO Panoptic
-  TRAIN: ("coco_2017_train_panoptic", )
+  TRAIN: ("coco_2017_train_panoptic", "openvocab_coco_2017_train_stuff_sem_seg",)
   TEST: ("openvocab_ade20k_panoptic_val",) 
   # TEST: ("openvocab_cityscapes_fine_panoptic_val",)
   # TEST: ("openvocab_ade20k_full_sem_seg_val","openvocab_pascal20_sem_seg_val",'openvocab_pascal_ctx459_sem_seg_val', 'openvocab_pascal_ctx59_sem_seg_val',)
   # TEST: ("openvocab_ade20k_panoptic_val", "openvocab_ade20k_full_sem_seg_val","openvocab_pascal20_sem_seg_val",'openvocab_pascal_ctx459_sem_seg_val', 'openvocab_pascal_ctx59_sem_seg_val',)
 
+  COCO_STUFF_ONLY_CLS: True
 
 SOLVER:
   CLIP_GRADIENTS:
@@ -52,10 +52,10 @@ SOLVER:
   AMP:
     ENABLED: True
   IMS_PER_BATCH: 48
-  BASE_LR: 0.00005
+  BASE_LR: 0.0001
   LR_SCHEDULER_NAME: WarmupPolyLR
-  STEPS: (40000, 50000)
-  MAX_ITER: 60000
+  STEPS: (20000, 25000)
+  MAX_ITER: 30000
   CHECKPOINT_PERIOD: 7500
   
 
@@ -87,16 +87,16 @@ DATALOADER:
   SAMPLER_TRAIN: "MultiDatasetSampler"
   
   # 只有一个数据集，比例设为 1.0
-  DATASET_RATIO: [1.0]
+  DATASET_RATIO: [3.0, 1.0]
 
   # # Batch Size 对应单个数据集
-  DATASET_BS: [4]
+  DATASET_BS: [4, 4]
   
   # COCO 通常不需要 RFS (Repeat Factor Sampling)
-  USE_RFS: [False]
+  USE_RFS: [False, False]
   
   # COCO Panoptic 包含 box 和 mask，这里根据你代码对标注类型的定义填写
-  DATASET_ANN: ['box'] 
+  DATASET_ANN: ['box', 'box'] 
   
   NUM_WORKERS: 4
   FILTER_EMPTY_ANNOTATIONS: True
@@ -106,13 +106,13 @@ DATALOADER:
   USE_DIFF_BS_SIZE: True
 
 TEST:
-  EVAL_PERIOD: 7500
+  EVAL_PERIOD: 75
   SEMANTIC_ON: True   
   # INSTANCE_ON: True   
-  PANOPTIC_ON: True   
+  # PANOPTIC_ON: True   
 # 修改输出目录名称以区分实验
 VERSION: 2
 
 OUTPUT_DIR: ./out/test/
-# OUTPUT_DIR: ./out/test/RADIOSAM/copa_attn_cdt_noTXTcrossALL/
+# OUTPUT_DIR: ./out/RADIOSAM/copa_attn_cdt_iou/
   

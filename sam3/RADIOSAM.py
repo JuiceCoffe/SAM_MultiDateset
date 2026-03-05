@@ -473,62 +473,31 @@ class RADIOSAM(nn.Module):
         logger.info('='*40)
         
 
-    def prepare_targets(self, targets, images, batched_inputs):
+    def prepare_targets(self, targets, images, batched_inputs, stuff_start_idx=80):
         h_pad, w_pad = images.tensor.shape[-2:]
-        new_targets = []
+        new_targets =[]
         
-        # 遍历 batch 中的每一张图
         for i, targets_per_image in enumerate(targets):
-            # 获取当前图片的数据集名称
-            dataname = get_dataname(batched_inputs[i])
-            
-            # ---------------- 过滤逻辑开始 ----------------
-            # 这里的逻辑是：如果开启了 only_instance，且当前数据集是 COCO Stuff
-            # 那么我们就把其中的 Thing 类别（Person, Car 等）过滤掉，只保留 Stuff
-            # 避免与 Object365 的 Instance 标注冲突
-            
             gt_classes = targets_per_image.gt_classes
             gt_masks = targets_per_image.gt_masks
-            if isinstance(gt_masks, BitMasks):
+            if isinstance(gt_masks, BitMasks): # 假设你有 BitMasks 依赖
                 gt_masks = gt_masks.tensor
             
-            # 生成一个全是 True 的 mask
-            keep_indices = torch.ones(len(gt_classes), dtype=torch.bool, device=gt_classes.device)
-
-            # ---------------- 修改开始 ----------------
-            if self.only_instance:
-                # 判断是否为 COCO Stuff 数据集
-                is_coco_stuff = "openvocab_coco_2017_train_stuff_sem_seg" in dataname
-                
-                if is_coco_stuff:
-                    # 1. 筛选逻辑：只保留 ID >= 80 的 Stuff
-                    keep_indices = gt_classes >= 80
-                    
-                    # 应用筛选
-                    gt_classes = gt_classes[keep_indices]
-                    gt_masks = gt_masks[keep_indices]
-                    
-                    # 2. 【关键修正】Label Shift (标签对齐)
-                    # 因为我们在 get_text_classifier 中移除了前 80 个类 (Things)
-                    # 所以原来的 Label 80 (Stuff start) 现在必须变成 Label 0
-                    gt_classes = gt_classes - 80
-
-                    # if len(gt_classes) > 0:
-                    #     print(f"DEBUG: [Targets] 原本最小ID >= 80, 现已 Shift。当前图片最小 Label: {gt_classes.min().item()}, 最大 Label: {gt_classes.max().item()}")
-                else:
-                    # 对于非 COCO Stuff 数据集（如 Obj365），不做特殊处理，直接应用 keep_indices (全True)
-                    gt_classes = gt_classes[keep_indices]
-                    gt_masks = gt_masks[keep_indices]
-            # ---------------- 过滤逻辑结束 ----------------
+            # 【新增】在此处切分 Stuff
+            if gt_masks.shape[0] > 0:
+                gt_classes, gt_masks = split_disconnected_stuff(
+                    gt_classes, 
+                    gt_masks, 
+                    stuff_start_idx=stuff_start_idx, 
+                    min_area=900 # 建议设置一定的阈值过滤孤立噪点像素
+                )
 
             # pad gt
             padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
-            # 注意：这里的 gt_masks 已经是过滤后的了
             if gt_masks.shape[0] > 0:
                 padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
             
             # 1. 从 Mask 生成绝对坐标的 Box (xyxy格式)
-            # 注意：masks_to_boxes 需要处理空 mask 的情况，虽然理论上 targets 不会为空，但过滤后可能为空
             if padded_masks.shape[0] > 0:
                 gt_boxes_xyxy = masks_to_boxes(padded_masks)
                 
@@ -539,17 +508,132 @@ class RADIOSAM(nn.Module):
                 # 3. 转换为 (cx, cy, w, h)
                 gt_boxes_cxcywh = box_xyxy_to_cxcywh(gt_boxes_norm)
             else:
-                # 如果过滤后没有物体了，给空 tensor
                 gt_boxes_cxcywh = torch.zeros((0, 4), device=padded_masks.device)
 
             new_targets.append(
                 {
-                    "labels": gt_classes, # 过滤后的 labels
-                    "masks": padded_masks, # 过滤后的 masks
-                    "boxes": gt_boxes_cxcywh, # 过滤后的 boxes
+                    "labels": gt_classes, 
+                    "masks": padded_masks, 
+                    "boxes": gt_boxes_cxcywh, 
                 }
             )
+
+        # # ================== 【新增】 调试可视化调用 ==================
+        # self.visualize_debug_targets(images, batched_inputs, new_targets, stuff_start_idx)
+        # # ============================================================
+
         return new_targets
+
+    def visualize_debug_targets(self, images, batched_inputs, new_targets, stuff_start_idx, save_dir="./debug_vis"):
+        """
+        用于调试 prepare_targets 结果的可视化函数
+        """
+        import os
+        import cv2
+        import numpy as np
+        
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 1. 反归一化参数 (从 self 获取)
+        pixel_mean = self.pixel_mean.cpu().view(1, -1, 1, 1) # [1, 3, 1, 1]
+        pixel_std = self.pixel_std.cpu().view(1, -1, 1, 1)
+        
+        # 2. 遍历 Batch
+        for i, target in enumerate(new_targets):
+            file_name = batched_inputs[i]["file_name"].split('/')[-1]
+            dataname = get_dataname(batched_inputs[i])
+            
+            # --- A. 获取元数据 (Metadata) 以验证 ID ---
+            if dataname in self.train_metadata_dict:
+                meta = self.train_metadata_dict[dataname]
+            else:
+                meta = MetadataCatalog.get(dataname)
+
+            # 获取真实的 Thing 和 Stuff 列表
+            thing_classes = meta.get("thing_classes", [])
+            stuff_classes = meta.get("stuff_classes", [])
+
+            print("thing_classes 80:",thing_classes[80])
+            print("stuff_classes 80:",stuff_classes[80])
+            
+            # --- B. 还原图像 ---
+            # image tensor: (3, H, W) -> 反归一化
+            img_tensor = images.tensor[i].cpu() # Normalized
+            # 广播反归一化: pixel * std + mean
+            img_tensor = img_tensor.view(3, -1, 1) * pixel_std.view(3, 1, 1) + pixel_mean.view(3, 1, 1)
+            img_tensor = img_tensor.view(3, images.tensor.shape[-2], images.tensor.shape[-1])
+            
+            # 转为 numpy (C, H, W) -> (H, W, C) -> BGR for OpenCV
+            img_np = img_tensor.permute(1, 2, 0).numpy()
+            img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+            img_vis = img_np.copy() # 用于画图
+            img_vis = cv2.cvtColor(img_vis, cv2.COLOR_RGB2BGR)
+
+            h, w = img_vis.shape[:2]
+
+            # --- C. 遍历处理后的 Targets ---
+            labels = target["labels"].cpu()
+            masks = target["masks"].cpu()
+            boxes_cxcywh = target["boxes"].cpu() # 归一化的 cx, cy, w, h
+            
+            # 生成颜色
+            np.random.seed(42)
+            colors = np.random.randint(0, 255, (200, 3))
+
+            print(f"[DEBUG] Target Count: {len(labels)}")
+
+            for j, label_idx in enumerate(labels):
+                cls_id = label_idx.item()
+                
+                # --- 核心：判断是 Thing 还是 Stuff ---
+                # 逻辑：如果 ID 在 thing_classes 范围内，则是 Thing，否则尝试去 stuff_classes 找
+                label_name = "Unknown"
+                type_str = "???"
+                
+                is_thing_by_meta = False
+                
+                if cls_id < 80:
+                    label_name = thing_classes[cls_id]
+                    type_str = "THING"
+                    is_thing_by_meta = True
+                else:
+                    label_name = stuff_classes[cls_id]
+                    type_str = "STUFF"
+
+                # 检查你的切分阈值逻辑是否符合 Meta
+                is_stuff_by_logic = (cls_id >= stuff_start_idx)
+                logic_check_str = "MATCH" if (not is_thing_by_meta) == is_stuff_by_logic else "MISMATCH!"
+                
+                print(f"  - Obj {j}: ID={cls_id} | Name={label_name} | Type={type_str} | Split_Logic={logic_check_str}")
+
+                color = colors[j % 200].tolist()
+
+                # --- D. 绘制 Mask ---
+                mask = masks[j].numpy().astype(np.uint8)
+                # 创建半透明遮罩
+                colored_mask = np.zeros_like(img_vis)
+                colored_mask[mask > 0] = color
+                img_vis = cv2.addWeighted(img_vis, 1.0, colored_mask, 0.5, 0)
+
+                # --- E. 绘制 Box ---
+                cx, cy, bw, bh = boxes_cxcywh[j]
+                # 反归一化 Box
+                x1 = int((cx - bw/2) * w)
+                y1 = int((cy - bh/2) * h)
+                x2 = int((cx + bw/2) * w)
+                y2 = int((cy + bh/2) * h)
+                
+                cv2.rectangle(img_vis, (x1, y1), (x2, y2), color, 2)
+                
+                # --- F. 绘制文字 ---
+                text = f"{cls_id}-{label_name}({type_str})"
+                cv2.putText(img_vis, text, (x1, max(y1-5, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                cv2.putText(img_vis, text, (x1, max(y1-5, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+            # --- G. 保存图片 ---
+            save_path = os.path.join(save_dir, f"debug_{file_name}.jpg")
+            cv2.imwrite(save_path, img_vis)
+            print(f"[DEBUG] Saved visualization to {save_path}")
 
     def prepare_targets_for_maskadapter(self, targets, images):
         h_pad, w_pad = images.tensor.shape[-2:]
@@ -2827,3 +2911,56 @@ def load_partial_weights(target_module, source_state_dict):
         logger.warning("\n".join(log_info))
 
     return msg
+
+def split_disconnected_stuff(gt_classes, gt_masks, stuff_start_idx=80, min_area=10):
+    """
+    将不连续的 Stuff mask 切分为多个独立的 mask。
+    
+    参数:
+    gt_classes: tensor of shape (N,)
+    gt_masks: tensor of shape (N, H, W), bool or numeric
+    stuff_start_idx: int, COCO数据集中stuff开始的类别索引（通常thing是0-79，stuff是80以上）
+    min_area: int, 过滤掉过小的连通域噪点（避免生成几十个一两个像素的无用box）
+    
+    返回:
+    new_classes, new_masks
+    """
+    new_classes =[]
+    new_masks =[]
+    
+    device = gt_masks.device
+    
+    for cls, mask in zip(gt_classes, gt_masks):
+        # 如果是 thing，直接保留原样
+        if cls.item() < stuff_start_idx:
+            new_classes.append(cls)
+            new_masks.append(mask)
+            continue
+            
+        # 如果是 stuff，进行连通域分析
+        # 转换到 CPU 并变成 uint8 格式供 OpenCV 使用
+        mask_np = mask.cpu().numpy().astype(np.uint8)
+        
+        # 8邻域连通域分析
+        num_labels, comp_img = cv2.connectedComponents(mask_np, connectivity=8)
+        
+        # label 0 是背景，从 1 开始遍历真正的连通域
+        has_valid_component = False
+        for i in range(1, num_labels):
+            component_mask = (comp_img == i)
+            # 过滤面积过小的噪点区域
+            if component_mask.sum() >= min_area:
+                new_masks.append(torch.from_numpy(component_mask).to(device))
+                new_classes.append(cls)
+                has_valid_component = True
+        
+        # 如果切分后所有区域都太小被过滤了，为了防止丢失该类别，强行保留原始 mask
+        if not has_valid_component and mask.sum() > 0:
+            new_classes.append(cls)
+            new_masks.append(mask)
+
+    if len(new_classes) == 0:
+        return torch.empty((0,), dtype=gt_classes.dtype, device=device), \
+               torch.empty((0, gt_masks.shape[1], gt_masks.shape[2]), dtype=gt_masks.dtype, device=device)
+
+    return torch.stack(new_classes), torch.stack(new_masks)
