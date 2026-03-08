@@ -200,6 +200,7 @@ class RADIOSAM(nn.Module):
                         attnpool_weight_dict_aux[f"{k}_{i}"] = self.attnpool_weight_dict[k]
                 self.attnpool_weight_dict.update(attnpool_weight_dict_aux) 
             self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+            self.attn_pool_logit_scale = nn.Parameter(torch.ones([]) * np.log(1))
 
             if self.add_radio_feat:
                 from .attn_adapter import AttnAdapter
@@ -211,7 +212,6 @@ class RADIOSAM(nn.Module):
 
             if self.new_pool_decoder:
                 self.pooling_decoder = _create_pool_decoder()
-                self.attn_pool_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
                 self.pooling_decoder_synced = False if self.build_pool_decoder_from_maskdecoder else True
         else:
             self.new_pool_decoder = False
@@ -1253,6 +1253,8 @@ class RADIOSAM(nn.Module):
 
                 radio_img_feat = radio_img_feat.view(bs, 1536, -1).permute(0,2,1) # bs, l, d
 
+                attn_pool_logit_scale = torch.clamp(self.attn_pool_logit_scale.exp(), max=100)
+                cross_attn_weights = (torch.log(cross_attn_weights + 1e-6) * attn_pool_logit_scale).softmax(-1)
                 pooled_img_feat = torch.einsum("bld, kbnl->kbnd", radio_img_feat, cross_attn_weights) # k, bs, N, D
 
                 text_classifier, num_templates = self.get_text_classifier(dataname)
