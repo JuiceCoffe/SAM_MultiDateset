@@ -113,6 +113,7 @@ def load_radio_model(model_version: str, device: str = 'cuda', vitdet: Optional[
         'radio_model',
         model_version,
         adaptor_names=['sam3','siglip2-g'],
+        source='local',
         **extra,
     )
     model = model.to(device)
