@@ -60,7 +60,7 @@ def add_sam3_config(cfg):
     cfg.SOLVER.WEIGHT_DECAY_EMBED = 0.0
     # optimizer
     cfg.SOLVER.OPTIMIZER = "ADAMW"
-    cfg.SOLVER.BACKBONE_MULTIPLIER = 0.0
+    cfg.SOLVER.BACKBONE_MULTIPLIER = 0.1
     cfg.SOLVER.NO_OBJECT_WEIGHT = 0.1
     cfg.SOLVER.CLASS_WEIGHT = 2.0
     cfg.SOLVER.CONTRAST_WEIGHT = 0.0
@@ -120,3 +120,6 @@ def add_sam3_config(cfg):
     cfg.MODEL.ATTNPOOL.ADD_RADIO_FEAT = False
     cfg.MODEL.ATTNPOOL.NEW_POOL_DECODER = False
     cfg.MODEL.ATTNPOOL.BUILD_POOL_DECODER_FROM_MASKDECODER = False
+
+    cfg.MODEL.VPT = CN()
+    cfg.MODEL.VPT.ENABLE = False

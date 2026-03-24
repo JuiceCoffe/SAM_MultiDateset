@@ -45,7 +45,7 @@ class RADIO_Adaptor(nn.Module):
         text_tokens = self.sig2_adaptor.encode_text(text_input, normalize=True)
         return text_tokens
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def forward(self, images: torch.Tensor):
         """
         Forward pass that mimics ViT trunk output.

@@ -67,6 +67,31 @@ class RADIOModel(nn.Module):
         else:
             self.max_token_slot = -1
 
+        # ================= [VPT 修改开始] =================
+        # 1. 冻结原始 Backbone 和所有 Adaptor 的梯度（非常重要！）
+        from .vpt import PromptInjector
+        for param in self.parameters():
+            param.requires_grad = False
+            
+        # 2. 获取参数并替换 blocks
+        embed_dim = self.embed_dim # 自动获取，此处为 1280
+        num_prompts_to_insert = 200 # 你可以自由调整想要插入的 Prompt 数量 (比如 10 到 50)
+        
+        # 确认模型包含 blocks 才能替换
+        if hasattr(self.model, 'blocks'):
+            # 🌟 新增：获取需要跳过的非空间 token 数量 (包含 CLS 和 Register tokens)
+            skip_tokens = self.num_summary_tokens
+            
+            self.model.blocks = PromptInjector(
+                original_blocks=self.model.blocks,
+                num_prompts=num_prompts_to_insert,
+                embed_dim=embed_dim,
+                num_skip=skip_tokens  # 🔑 传入 num_skip 给 Hook 切片使用
+            )
+            print(f"✅ VPT 注入成功！注入了 {num_prompts_to_insert} 个 Prompts (Deep={True}), 跳过前 {skip_tokens} 个 Tokens。")
+        else:
+            print("❌ 警告：未找到模型 blocks，VPT 注入失败。")
+        # ================= [VPT 修改结束] =================
     @property
     def num_summary_tokens(self) -> int:
         if hasattr(self.model, 'num_summary_tokens'):

@@ -118,6 +118,33 @@ try:
 except AttributeError:
     pass  # 如果 numpy 版本较低本身支持，则忽略
 
+from detectron2.engine import HookBase
+class PromptMonitorHook(HookBase):
+    def __init__(self, check_period=100):
+        self.check_period = check_period
+        self.initial_weights = None
+
+    def before_train(self):
+        # 提取 DDP 模型或普通模型
+        self.model = self.trainer.model.module if hasattr(self.trainer.model, "module") else self.trainer.model
+        # 记录初始权重，用于比对
+        self.initial_weights = self.model.detector.backbone.vision_backbone.trunk.student.model.blocks.tuner.prompts.clone().detach()
+
+    def after_step(self):
+        if self.trainer.iter % self.check_period == 0:
+            prompts = self.model.detector.backbone.vision_backbone.trunk.student.model.blocks.tuner.prompts
+            
+            # 1. 检查梯度
+            if prompts.grad is not None:
+                grad_norm = prompts.grad.norm().item()
+            else:
+                grad_norm = "None (No Gradient!)"
+            
+            # 2. 检查权重是否发生实质性改变
+            weight_diff = torch.abs(prompts.data - self.initial_weights).sum().item()
+            
+            print(f"[Iter {self.trainer.iter}] Prompt Grad Norm: {grad_norm} | Weight Diff from Start: {weight_diff:.6f}")
+
 
 class Trainer(DefaultTrainer):
     """
@@ -377,6 +404,9 @@ def main(args):
         return res
 
     trainer = Trainer(cfg)
+
+    trainer.register_hooks([PromptMonitorHook(check_period=200)])
+
     trainer.resume_or_load(resume=args.resume)
     return trainer.train()
 
