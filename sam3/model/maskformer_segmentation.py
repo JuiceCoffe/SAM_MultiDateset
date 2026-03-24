@@ -281,13 +281,13 @@ class UniversalSegmentationHead(SegmentationHead):
 
         if self.cross_attend_prompt is not None:
             tgt2 = self.cross_attn_norm(encoder_hidden_states)
-            tgt2 = self.cross_attend_prompt(
-                query=tgt2,
-                key=prompt,
-                value=prompt,
-                key_padding_mask=prompt_mask,
-            )[0]
-            encoder_hidden_states = tgt2 + encoder_hidden_states
+            # tgt2 = self.cross_attend_prompt(
+            #     query=tgt2,
+            #     key=prompt,
+            #     value=prompt,
+            #     key_padding_mask=prompt_mask,
+            # )[0]
+            # encoder_hidden_states = tgt2 + encoder_hidden_states
 
         presence_logit = None
         if self.presence_head is not None:

@@ -141,6 +141,11 @@ class RADIOSAM(nn.Module):
         else:
             self.query_proj = None
 
+        self.use_pixel_proj = cfg.MODEL.SAM3.USE_PIXEL_PROJ
+        if self.use_pixel_proj:
+            self.pixel_proj = MLP(256, 256, 256, 3)
+        else:
+            self.pixel_proj = None
 
         self.num_decoder_layers = 6 # SAM3/DETR 标准层数
     
@@ -692,23 +697,15 @@ class RADIOSAM(nn.Module):
 
     def get_text_classifier(self, dataname):
         if self.training:
-            # =======================================================
-            # 【新增】跨阶段显存清理：进入 Train 时，释放 Eval 占用的 GPU 显存
-            # =======================================================
             if getattr(self, 'test_text_classifier', None) is not None:
                 self.test_text_classifier = None
-                self.language_features = None
-                self.language_mask = None
-                # 由于模式切换频率很低（通常一个 Epoch 一次），这里清空缓存不会影响速度，但能极大缓解碎片化
-                torch.cuda.empty_cache() 
+                torch.cuda.empty_cache()
 
             if self.train_dataname != dataname or getattr(self, 'train_text_classifier', None) is None:
                 if dataname in self.text_encoder_cache:
                     cache = self.text_encoder_cache[dataname]
-                    self.language_features = cache["language_features"].to(self.device)
-                    self.language_mask = cache["language_mask"].to(self.device)
                     self.train_text_classifier = cache["text_classifier"].to(self.device)
-                    self.train_num_templates = cache["num_templates"] 
+                    self.train_num_templates = cache["num_templates"]
                     self.train_class_names = cache["class_names"]
                 else:
                     if dataname in self.train_metadata_dict:
@@ -722,7 +719,7 @@ class RADIOSAM(nn.Module):
 
                     is_coco_stuff = "openvocab_coco_2017_train_stuff_sem_seg" in dataname
                     if self.only_instance and is_coco_stuff:
-                        num_things_classes = 80 
+                        num_things_classes = 80
                         if len(self.train_num_templates) > num_things_classes:
                             print(f"[{dataname}] Filtering out {num_things_classes} Thing classes for Stuff training.")
                             num_synonyms_to_skip = sum(self.train_num_templates[:num_things_classes])
@@ -734,109 +731,96 @@ class RADIOSAM(nn.Module):
                     bs = 128
                     print("Generating text classifier for", dataname, "with", len(self.train_class_names), "classes.")
                     for idx in range(0, len(self.train_class_names), bs):
-                        batch_text_feat = self.radio_adaptor.get_text_classifier(self.train_class_names[idx:idx+bs], device=self.device)
+                        batch_text_feat = self.radio_adaptor.get_text_classifier(
+                            self.train_class_names[idx:idx+bs],
+                            device=self.device,
+                        )
                         text_classifier.append(batch_text_feat)
+
                     text_classifier = torch.cat(text_classifier, dim=0)
-                    text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.PROMPT), len(self.PROMPT), -1, text_classifier.shape[-1])
-                    print("text_classifier:",text_classifier.shape)
-                    language_features = text_classifier.mean(1)
-                    text_classifier = text_classifier.mean(-2) 
+                    text_classifier = text_classifier.reshape(
+                        text_classifier.shape[0] // len(self.PROMPT),
+                        len(self.PROMPT),
+                        -1,
+                        text_classifier.shape[-1],
+                    )
+                    print("text_classifier:", text_classifier.shape)
+                    text_classifier = text_classifier.mean(-2)
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                     text_classifier = text_classifier.mean(1)
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
-                    
-                    self.language_features = language_features.detach()
-                    self.language_mask = torch.zeros(
-                        self.language_features.shape[0], self.language_features.shape[1], 
-                        dtype=torch.bool, device=self.device
-                    )
-                    self.train_text_classifier = text_classifier.detach()
 
+                    self.train_text_classifier = text_classifier.detach()
                     self.text_encoder_cache[dataname] = {
-                        "language_features": self.language_features.cpu(),
-                        "language_mask": self.language_mask.cpu(),
                         "text_classifier": self.train_text_classifier.cpu(),
                         "num_templates": self.train_num_templates,
-                        "class_names": self.train_class_names     
+                        "class_names": self.train_class_names,
                     }
 
                 self.train_dataname = dataname
-            return self.train_text_classifier.clone(), self.train_num_templates
-        
+            return self.train_text_classifier, self.train_num_templates
+
         else:
-            # =======================================================
-            # 【新增】跨阶段显存清理：进入 Eval 时，释放 Train 占用的 GPU 显存
-            # =======================================================
             if getattr(self, 'train_text_classifier', None) is not None:
                 self.train_text_classifier = None
-                self.language_features = None
-                self.language_mask = None
                 torch.cuda.empty_cache()
 
             if self.test_dataname != dataname or getattr(self, 'test_text_classifier', None) is None:
-                # =======================================================
-                # 【新增】Eval 阶段同样接入 CPU 缓存逻辑
-                # =======================================================
                 if dataname in self.text_encoder_cache:
                     cache = self.text_encoder_cache[dataname]
-                    self.language_features = cache["language_features"].to(self.device)
-                    self.language_mask = cache["language_mask"].to(self.device)
                     self.test_text_classifier = cache["text_classifier"].to(self.device)
                     self.test_num_templates = cache["num_templates"]
                     self.test_class_names = cache["class_names"]
                 else:
-                    self.category_overlapping_mask, self.test_num_templates, self.test_class_names = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata, self.PROMPT)
+                    self.category_overlapping_mask, self.test_num_templates, self.test_class_names = (
+                        self.prepare_class_names_from_metadata(
+                            self.test_metadata[dataname], self.train_metadata, self.PROMPT
+                        )
+                    )
                     text_classifier = []
                     bs = 128
                     print("Generating text classifier for", dataname, "with", len(self.test_class_names), "classes.")
                     for idx in range(0, len(self.test_class_names), bs):
-                        batch_text_feat = self.radio_adaptor.get_text_classifier(self.test_class_names[idx:idx+bs], device=self.device)
+                        batch_text_feat = self.radio_adaptor.get_text_classifier(
+                            self.test_class_names[idx:idx+bs],
+                            device=self.device,
+                        )
                         text_classifier.append(batch_text_feat)
+
                     text_classifier = torch.cat(text_classifier, dim=0)
-                    text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.PROMPT), len(self.PROMPT), -1, text_classifier.shape[-1])
-                    language_features = text_classifier.mean(1)
-                    text_classifier = text_classifier.mean(-2) 
+                    text_classifier = text_classifier.reshape(
+                        text_classifier.shape[0] // len(self.PROMPT),
+                        len(self.PROMPT),
+                        -1,
+                        text_classifier.shape[-1],
+                    )
+                    text_classifier = text_classifier.mean(-2)
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                     text_classifier = text_classifier.mean(1)
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
-                    
-                    self.language_features = language_features.detach()
-                    self.language_mask = torch.zeros(
-                            self.language_features.shape[0], self.language_features.shape[1], 
-                            dtype=torch.bool, device=self.device
-                        )
-                    self.test_text_classifier = text_classifier.detach()
 
-                    # 【新增】计算完成后存入 CPU 缓存
+                    self.test_text_classifier = text_classifier.detach()
                     self.text_encoder_cache[dataname] = {
-                        "language_features": self.language_features.cpu(),
-                        "language_mask": self.language_mask.cpu(),
                         "text_classifier": self.test_text_classifier.cpu(),
                         "num_templates": self.test_num_templates,
-                        "class_names": self.test_class_names     
+                        "class_names": self.test_class_names,
                     }
 
                 self.test_dataname = dataname
-            return self.test_text_classifier.clone(), self.test_num_templates
+            return self.test_text_classifier, self.test_num_templates
+
 
     def get_SAM_text_classifier(self, dataname):
         if self.training:
-            # =======================================================
-            # 【新增】跨阶段显存清理：进入 Train 时释放 Eval 显存
-            # =======================================================
             if getattr(self, 'SAM_test_text_classifier', None) is not None:
                 self.SAM_test_text_classifier = None
-                self.SAM_language_features = None
-                self.SAM_language_mask = None
                 torch.cuda.empty_cache()
 
             if self.SAM_train_dataname != dataname or getattr(self, 'SAM_train_text_classifier', None) is None:
                 if dataname in self.SAM_text_encoder_cache:
                     cache = self.SAM_text_encoder_cache[dataname]
-                    self.SAM_language_features = cache["language_features"].to(self.device)
-                    self.SAM_language_mask = cache["language_mask"].to(self.device)
                     self.SAM_train_text_classifier = cache["text_classifier"].to(self.device)
-                    self.SAM_train_num_templates = cache["num_templates"] 
+                    self.SAM_train_num_templates = cache["num_templates"]
                     self.SAM_train_class_names = cache["class_names"]
                 else:
                     if dataname in self.train_metadata_dict:
@@ -844,13 +828,15 @@ class RADIOSAM(nn.Module):
                     else:
                         current_metadata = MetadataCatalog.get(dataname)
 
-                    _, self.SAM_train_num_templates, self.SAM_train_class_names = self.prepare_class_names_from_metadata(
-                        current_metadata, current_metadata, self.SAM_PROMPT
+                    _, self.SAM_train_num_templates, self.SAM_train_class_names = (
+                        self.prepare_class_names_from_metadata(
+                            current_metadata, current_metadata, self.SAM_PROMPT
+                        )
                     )
 
                     is_coco_stuff = "openvocab_coco_2017_train_stuff_sem_seg" in dataname
                     if self.only_instance and is_coco_stuff:
-                        num_things_classes = 80 
+                        num_things_classes = 80
                         if len(self.SAM_train_num_templates) > num_things_classes:
                             print(f"[{dataname}] Filtering out {num_things_classes} Thing classes for Stuff training.")
                             num_synonyms_to_skip = sum(self.SAM_train_num_templates[:num_things_classes])
@@ -859,128 +845,123 @@ class RADIOSAM(nn.Module):
                             self.SAM_train_num_templates = self.SAM_train_num_templates[num_things_classes:]
 
                     text_classifier = []
-                    text_feat = []
                     language_mask = []
                     bs = 128
                     print("Generating text classifier for", dataname, "with", len(self.SAM_train_class_names), "classes.")
                     for idx in range(0, len(self.SAM_train_class_names), bs):
-                        state_text = self.detector.backbone.forward_text(self.SAM_train_class_names[idx:idx+bs], device=self.device)
+                        state_text = self.detector.backbone.forward_text(
+                            self.SAM_train_class_names[idx:idx+bs],
+                            device=self.device,
+                        )
 
                         batch_text_feat = state_text["language_features"].detach()
                         mask = state_text["language_mask"]
-                        batch_text_feat = batch_text_feat.permute(1,0,2) 
+                        batch_text_feat = batch_text_feat.permute(1, 0, 2)
                         if self.use_pe_text:
                             text_classifier.append(state_text["pe_text_out"]["pe_textfeat"])
-                        else:    
+                        else:
                             text_classifier.append(batch_text_feat)
-                        text_feat.append(batch_text_feat)
-                        language_mask.append(mask) 
-                    text_classifier = torch.cat(text_classifier, dim=0)
-                    text_feat = torch.cat(text_feat, dim=0)
-                    language_mask = torch.cat(language_mask, dim=0)
-                    
-                    text_feat = text_feat.reshape(text_feat.shape[0]//len(self.SAM_PROMPT), len(self.SAM_PROMPT), text_feat.shape[-2], text_feat.shape[-1]) 
-                    text_feat /= (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
-                    text_feat[language_mask.view(text_feat.shape[0],text_feat.shape[1],text_feat.shape[2])] = 0.0 
-                    
-                    language_features = text_feat.mean(1)
+                        language_mask.append(mask)
 
-                    text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.SAM_PROMPT), len(self.SAM_PROMPT), text_classifier.shape[-2], text_classifier.shape[-1]) 
+                    text_classifier = torch.cat(text_classifier, dim=0)
+                    language_mask = torch.cat(language_mask, dim=0)
+
+                    text_classifier = text_classifier.reshape(
+                        text_classifier.shape[0] // len(self.SAM_PROMPT),
+                        len(self.SAM_PROMPT),
+                        text_classifier.shape[-2],
+                        text_classifier.shape[-1],
+                    )
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
-                    text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 
-                    text_classifier = text_classifier.mean(-2) 
+                    text_classifier[
+                        language_mask.view(
+                            text_classifier.shape[0],
+                            text_classifier.shape[1],
+                            text_classifier.shape[2],
+                        )
+                    ] = 0.0
+                    text_classifier = text_classifier.mean(-2)
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                     text_classifier = text_classifier.mean(1)
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
-                    
-                    self.SAM_language_features = language_features.detach() 
-                    self.SAM_language_mask = torch.min(language_mask.view(language_features.shape[0],len(self.SAM_PROMPT),language_features.shape[1]), dim=1).values
-                    self.SAM_train_text_classifier = text_classifier.detach()
 
+                    self.SAM_train_text_classifier = text_classifier.detach()
                     self.SAM_text_encoder_cache[dataname] = {
-                        "language_features": self.SAM_language_features.cpu(),
-                        "language_mask": self.SAM_language_mask.cpu(),
                         "text_classifier": self.SAM_train_text_classifier.cpu(),
-                        "num_templates": self.SAM_train_num_templates, 
-                        "class_names": self.SAM_train_class_names     
+                        "num_templates": self.SAM_train_num_templates,
+                        "class_names": self.SAM_train_class_names,
                     }
 
                 self.SAM_train_dataname = dataname
-            return self.SAM_train_text_classifier.clone(), self.SAM_train_num_templates
-        
+            return self.SAM_train_text_classifier, self.SAM_train_num_templates
+
         else:
-            # =======================================================
-            # 【新增】跨阶段显存清理：进入 Eval 时释放 Train 显存
-            # =======================================================
             if getattr(self, 'SAM_train_text_classifier', None) is not None:
                 self.SAM_train_text_classifier = None
-                self.SAM_language_features = None
-                self.SAM_language_mask = None
                 torch.cuda.empty_cache()
 
             if self.SAM_test_dataname != dataname or getattr(self, 'SAM_test_text_classifier', None) is None:
-                # =======================================================
-                # 【新增】Eval 阶段同样接入 CPU 缓存逻辑
-                # =======================================================
                 if dataname in self.SAM_text_encoder_cache:
                     cache = self.SAM_text_encoder_cache[dataname]
-                    self.SAM_language_features = cache["language_features"].to(self.device)
-                    self.SAM_language_mask = cache["language_mask"].to(self.device)
                     self.SAM_test_text_classifier = cache["text_classifier"].to(self.device)
                     self.SAM_test_num_templates = cache["num_templates"]
                     self.SAM_test_class_names = cache["class_names"]
                 else:
-                    self.SAM_category_overlapping_mask, self.SAM_test_num_templates, self.SAM_test_class_names = self.prepare_class_names_from_metadata(self.test_metadata[dataname], self.train_metadata, self.SAM_PROMPT)
+                    self.SAM_category_overlapping_mask, self.SAM_test_num_templates, self.SAM_test_class_names = (
+                        self.prepare_class_names_from_metadata(
+                            self.test_metadata[dataname], self.train_metadata, self.SAM_PROMPT
+                        )
+                    )
                     text_classifier = []
-                    text_feat = []
                     language_mask = []
                     bs = 128
                     print("Generating text classifier for", dataname, "with", len(self.SAM_test_class_names), "classes.")
                     for idx in range(0, len(self.SAM_test_class_names), bs):
-                        state_text = self.detector.backbone.forward_text(self.SAM_test_class_names[idx:idx+bs], device=self.device)
+                        state_text = self.detector.backbone.forward_text(
+                            self.SAM_test_class_names[idx:idx+bs],
+                            device=self.device,
+                        )
 
                         batch_text_feat = state_text["language_features"].detach()
                         mask = state_text["language_mask"]
-                        batch_text_feat = batch_text_feat.permute(1,0,2) 
+                        batch_text_feat = batch_text_feat.permute(1, 0, 2)
                         if self.use_pe_text:
                             text_classifier.append(state_text["pe_text_out"]["pe_textfeat"])
-                        else:    
+                        else:
                             text_classifier.append(batch_text_feat)
-                        text_feat.append(batch_text_feat)
-                        language_mask.append(mask) 
-                    text_classifier = torch.cat(text_classifier, dim=0)
-                    text_feat = torch.cat(text_feat, dim=0)
-                    language_mask = torch.cat(language_mask, dim=0)
-                    
-                    text_feat = text_feat.reshape(text_feat.shape[0]//len(self.SAM_PROMPT), len(self.SAM_PROMPT), text_feat.shape[-2], text_feat.shape[-1]) 
-                    text_feat /= (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
-                    text_feat[language_mask.view(text_feat.shape[0],text_feat.shape[1],text_feat.shape[2])] = 0.0 
-                    
-                    language_features = text_feat.mean(1)
+                        language_mask.append(mask)
 
-                    text_classifier = text_classifier.reshape(text_classifier.shape[0]//len(self.SAM_PROMPT), len(self.SAM_PROMPT), text_classifier.shape[-2], text_classifier.shape[-1])
+                    text_classifier = torch.cat(text_classifier, dim=0)
+                    language_mask = torch.cat(language_mask, dim=0)
+
+                    text_classifier = text_classifier.reshape(
+                        text_classifier.shape[0] // len(self.SAM_PROMPT),
+                        len(self.SAM_PROMPT),
+                        text_classifier.shape[-2],
+                        text_classifier.shape[-1],
+                    )
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
-                    text_classifier[language_mask.view(text_classifier.shape[0],text_classifier.shape[1],text_classifier.shape[2])] = 0.0 
-                    text_classifier = text_classifier.mean(-2) 
+                    text_classifier[
+                        language_mask.view(
+                            text_classifier.shape[0],
+                            text_classifier.shape[1],
+                            text_classifier.shape[2],
+                        )
+                    ] = 0.0
+                    text_classifier = text_classifier.mean(-2)
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
                     text_classifier = text_classifier.mean(1)
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
-                    
-                    self.SAM_language_features = language_features.detach() 
-                    self.SAM_language_mask = torch.min(language_mask.view(language_features.shape[0],len(self.SAM_PROMPT),language_features.shape[1]), dim=1).values
-                    self.SAM_test_text_classifier = text_classifier.detach()
 
-                    # 【新增】计算完成后存入 CPU 缓存
+                    self.SAM_test_text_classifier = text_classifier.detach()
                     self.SAM_text_encoder_cache[dataname] = {
-                        "language_features": self.SAM_language_features.cpu(),
-                        "language_mask": self.SAM_language_mask.cpu(),
                         "text_classifier": self.SAM_test_text_classifier.cpu(),
                         "num_templates": self.SAM_test_num_templates,
-                        "class_names": self.SAM_test_class_names     
+                        "class_names": self.SAM_test_class_names,
                     }
 
                 self.SAM_test_dataname = dataname
-            return self.SAM_test_text_classifier.clone(), self.SAM_test_num_templates
+            return self.SAM_test_text_classifier, self.SAM_test_num_templates
 
 
     @property
@@ -1080,43 +1061,26 @@ class RADIOSAM(nn.Module):
             batch_gt_names_idx.append(gt_names_idx)
 
         # =======================================================
-        
-        language_features_input = []
 
-        # USE_GT_NAMES_ONLY = True
-        USE_GT_NAMES_ONLY = False
-        
-        if USE_GT_NAMES_ONLY:
-            language_features_input = [self.language_features[batch_gt_names_idx[i],:,:] for i in range(bs)]
-            language_features_input = torch.cat(language_features_input, dim=0) # (bs, num_names * L, dim)
-            language_mask_input = [self.language_mask[batch_gt_names_idx[i],:] for i in range(bs)]
-            language_mask_input = torch.cat(language_mask_input, dim=0) # (bs, num_names * L)
-            if bs == 1:
-                language_features_input = language_features_input.unsqueeze(0)
-                language_mask_input = language_mask_input.unsqueeze(0)
+        # 当前实现不再依赖 language_features 参与主干计算，直接传空文本 prompt。
+        language_features_input = torch.empty(
+            bs, 0, img_feat.shape[1], device=self.device, dtype=img_feat.dtype
+        )
+        language_mask_input = torch.empty(
+            bs, 0, device=self.device, dtype=torch.bool
+        )
 
-        else:
-            language_features_input = self.SAM_language_features.expand(bs, -1, -1, -1) # (bs, num_names, L, dim)
-            language_mask_input = self.SAM_language_mask.expand(bs, -1, -1) # (bs, num_names, L)
-
-        # language_features_input = self.text_feat_resizer(language_features_input) # (bs, num_names, L, 1024) -> (bs, num_names, L, 256)
-
-        # print("shape of input:",language_features_input.shape, language_mask_input.shape)
-        language_features_input = language_features_input.reshape(bs, -1, language_features_input.shape[-1]) # (bs, num_names * L, dim)
-        language_mask_input = language_mask_input.reshape(bs, -1) # (bs, num_names * L)
-        # print("shape of input after reshape:",language_features_input.shape, language_mask_input.shape)
-        
-
-        backbone_out={
+        backbone_out = {
             "img_batch_all_stages": img_feat,
             "vision_pos_enc": backbone_out_vision["vision_pos_enc"],
             "backbone_fpn": backbone_fpn,
-            "language_features": language_features_input.permute(1, 0, 2), # (num_names * L, bs, dim)
-            "language_mask": language_mask_input, # bs, (num_names * L)
+            "language_features": language_features_input.permute(1, 0, 2),  # (0, bs, dim)
+            "language_mask": language_mask_input,  # bs, 0
         }
 
-        #=================================
-        with torch.set_grad_enabled(self.train_mask):
+        enable_mask_grad = self.training and self.train_mask
+
+        with torch.set_grad_enabled(enable_mask_grad):
 
             find_input = self.find_stage
 
@@ -1236,10 +1200,7 @@ class RADIOSAM(nn.Module):
             else:
                 targets = self._prepare_targets_from_sem_seg(batched_inputs, images)
 
-            out_masks = outputs["pred_masks"].clone()
-
-            out_masks = out_masks.sigmoid()
-            bs, N, H, W = out_masks.shape
+            N = outputs["pred_masks"].shape[1]
 
             # presence_score = outputs["presence_logit_dec"].sigmoid().unsqueeze(1) # 在多类别情况下认为失效
 
@@ -1259,8 +1220,6 @@ class RADIOSAM(nn.Module):
 
             C_ = SAM_text_classifier.shape[0] # num_names 
 
-            queries_masks = out_masks # out_probs是通过与池化prompt投影卷积实现的，多类别下失效，直接用原始mask_logits
-
             queries = outputs["obj_queries"] # 6, bs, N, D
             
             # instance_embeds = outputs["instance_embeds"] 
@@ -1274,39 +1233,51 @@ class RADIOSAM(nn.Module):
 
             if self.use_attnpool:
                 radio_img_feat = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
-                radio_feat_D, radio_feat_H, radio_feat_W = radio_img_feat.shape[-3:]
-                
+
+                pool_cross_attn_weights = cross_attn_weights if self.training else cross_attn_weights[-1:].contiguous()
+
                 if self.add_radio_feat:
                     feat_weight_map = self.feat_weight_adapter(
                         radio_img_feat,
                         out["encoder_hidden_states"],
-                    )
-                    cross_attn_weights = feat_weight_map.flatten(2).sigmoid() * cross_attn_weights
-                    cross_attn_weights = torch.log(cross_attn_weights + 1e-8).softmax(-1)
+                    ).flatten(2)
+                    if not self.training:
+                        feat_weight_map = feat_weight_map[-1:]
+                    pool_cross_attn_weights = feat_weight_map.sigmoid() * pool_cross_attn_weights
+                    pool_cross_attn_weights = torch.log(pool_cross_attn_weights + 1e-8).softmax(-1)
 
-                radio_img_feat = radio_img_feat.view(bs, 1536, -1).permute(0,2,1) # bs, l, d
+                radio_img_feat = radio_img_feat.view(bs, 1536, -1).permute(0, 2, 1)
 
                 attn_pool_logit_scale = torch.clamp(self.attn_pool_logit_scale.exp(), max=100)
-                cross_attn_weights = (torch.log(cross_attn_weights + 1e-6) * attn_pool_logit_scale).softmax(-1)
-                pooled_img_feat = torch.einsum("bld, kbnl->kbnd", radio_img_feat, cross_attn_weights) # k, bs, N, D
+                pool_cross_attn_weights = (torch.log(pool_cross_attn_weights + 1e-6) * attn_pool_logit_scale).softmax(-1)
+                pooled_img_feat = torch.einsum("bld,kbnl->kbnd", radio_img_feat, pool_cross_attn_weights)
 
                 text_classifier, num_templates = self.get_text_classifier(dataname)
 
                 if self.cdt is not None:
                     text_classifier = self.cdt(
-                        backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"], 
+                        backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"],
                         text_classifier
                     )
                     attn_cls_results = []
-                    for i in range(bs):
-                        attn_cls_result = get_classification_logits(pooled_img_feat[:,i,:,:], text_classifier[i], self.out_vocab_logit_scale, num_templates)
+                    for b in range(bs):
+                        attn_cls_result = get_classification_logits(
+                            pooled_img_feat[:, b, :, :],
+                            text_classifier[b],
+                            self.out_vocab_logit_scale,
+                            num_templates,
+                        )
                         attn_cls_results.append(attn_cls_result)
-                    attn_cls_results = torch.stack(attn_cls_results, dim = 1)
-
+                    attn_cls_results = torch.stack(attn_cls_results, dim=1)
                 else:
-                    attn_cls_results = get_classification_logits(pooled_img_feat.reshape(-1 , N, pooled_img_feat.shape[-1]), text_classifier, self.out_vocab_logit_scale, num_templates)
+                    attn_cls_results = get_classification_logits(
+                        pooled_img_feat.reshape(-1, N, pooled_img_feat.shape[-1]),
+                        text_classifier,
+                        self.out_vocab_logit_scale,
+                        num_templates,
+                    )
+                    attn_cls_results = attn_cls_results.view(pooled_img_feat.shape[0], bs, N, attn_cls_results.shape[-1])
 
-                attn_cls_results = attn_cls_results.view(-1, bs, N, attn_cls_results.shape[-1])
 
             for i in range(6):
                 assert queries.shape[0] == 6
@@ -1315,14 +1286,18 @@ class RADIOSAM(nn.Module):
                     if self.use_dot_prod_head:
                         query_names_results = dot_prod[i,:,:,:] # bs, N, C
                     else:
-                        tp_queries = queries[i,:,:,:].clone() 
+                        tp_queries = queries[i]
 
                         if self.add_pixelfeat:
                             pixel_embed = outputs["pixel_embed"] # bs, D, H', W'
 
                             pooled_pixel_embed = self.mask_pooling(pixel_embed, outputs["pred_masks"] if i ==5 else outputs['aux_outputs'][i]["pred_masks"])
+
+                            if self.use_pixel_proj:
+                                pooled_pixel_embed = self.pixel_proj(pooled_pixel_embed)
+
                             tp_queries = tp_queries + pooled_pixel_embed
-                            tp_queries = tp_queries + pooled_pixel_embed
+                            
 
                         if self.use_query_proj:
                             tp_queries = self.query_proj(tp_queries)
@@ -1408,143 +1383,33 @@ class RADIOSAM(nn.Module):
                         fcclip_losses.pop(k)
 
                 losses.update(fcclip_losses)
-
-            # if self.use_attnpool:
-
-            #     img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]          
-
-
-            #     box_criterion_pred = {
-            #         "pred_logits": attn_cls_results[-1],
-            #         'pred_boxes': cls_box,
-            #     }
-
-            #     if attn_cls_results.shape[0]>1:
-            #         box_criterion_pred["aux_outputs"] = []
-            #         for i in range(0, attn_cls_results.shape[0]-1, 1):
-            #             box_criterion_pred["aux_outputs"].append(
-            #                 {
-            #                     "pred_logits": attn_cls_results[i],
-            #                     'pred_boxes': out2['aux_outputs'][i]['pred_boxes'],
-            #                 }
-            #             )
-
-            #     attnpool_losses = self.box_criterion(box_criterion_pred, targets)
-
-            #     for k in list(attnpool_losses.keys()):
-            #         if k in self.attnpool_weight_dict:
-            #             losses['attn_'+k] = self.attnpool_weight_dict[k] * attnpool_losses[k]
-            #         else:
-            #             attnpool_losses.pop(k)
-
-            #     losses.update(attnpool_losses)
-
-            # if self.use_MaskAdapter:
-            #     mask_adapter_losses = {}
-
-            #     img_feat_for_pool = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]  
-            #     # print("img_feat_for_pool shape:", img_feat_for_pool.shape)
-            #     gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-            #     targets, masks, labels = self.prepare_targets_for_maskadapter(gt_instances, images)
-
-            #     mask_pred_results = outputs["pred_masks"]
-            #     mask_cls_results = query_cls_results_final
-
-            #     src_masks, _ , target_masks, mask_labels = self.match_via_iou(mask_pred_results, mask_cls_results, targets, iou_threshold=self.iou_threshold,max_matches=self.num_pred_masks)
-            #     binary_src_masks = src_masks.sigmoid() > self.mask_threshold
-            #     binary_src_masks = binary_src_masks.float()
-
-            #     binary_src_masks = F.interpolate(binary_src_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
-            #     target_masks = F.interpolate(target_masks, size=masks.shape[-2:], mode='bilinear', align_corners=False)
-
-            #     mask_pred = torch.cat((masks, binary_src_masks, target_masks),dim=1)
-            #     all_labels = torch.cat((labels, mask_labels, mask_labels),dim=1)
-                    
-            #     # maps_for_pooling = self.mask_adapter(img_feat_for_pool, mask_pred)
-            #     maps_for_pooling = []
-            #     for i in range(bs):
-            #         maps_for_pooling_batch = self.mask_adapter(img_feat_for_pool[i:i+1, :, :, :], mask_pred[i:i+1, :, :, :])
-            #         maps_for_pooling.append(maps_for_pooling_batch)
-            #     maps_for_pooling = torch.cat(maps_for_pooling, dim=0)
-                
-            #     maps_for_pooling = F.interpolate(maps_for_pooling, size=img_feat_for_pool.shape[-2:],
-            #                                         mode='bilinear', align_corners=False)
-
-            
-            #     N = maps_for_pooling.size(1)
-            #     num_instances = N // self.num_output_maps
-            #     maps_for_pooling = F.softmax(F.logsigmoid(maps_for_pooling).view(bs, N,-1), dim=-1)
-            #     pooled_img_feature = torch.bmm(maps_for_pooling, img_feat_for_pool.view(bs, img_feat_for_pool.size(1), -1).permute(0, 2, 1))
-            #     pooled_img_feature = (pooled_img_feature.reshape(bs, num_instances, self.num_output_maps, -1).mean(dim=-2).contiguous())
-
-            #     loss_cosine_similarity = self.cosine_similarity_loss(pooled_img_feature[:, 16:24, :], pooled_img_feature[:, 24:, :])
-
-            #     text_classifier, num_templates = self.get_text_classifier(dataname)
-            #     mask_cls_results = get_classification_logits(pooled_img_feature , text_classifier, self.out_vocab_logit_scale, num_templates)
-
-            #     loss_mask_cls = self.cross_entropy_loss(mask_cls_results, all_labels)
-
-            #     mask_adapter_losses.update(loss_cosine_similarity)
-            #     mask_adapter_losses.update(loss_mask_cls)
-
-            #     for k in list(mask_adapter_losses.keys()):
-            #         # print("loss:", k, losses[k].item())
-            #         if k in self.mask_adapter_weight_dict:
-            #             mask_adapter_losses[k] *= self.mask_adapter_weight_dict[k]
-            #         else:
-            #             # remove this loss if not specified in `weight_dict`
-            #             mask_adapter_losses.pop(k)
-
-            #     losses.update(mask_adapter_losses)
+ 
 
             if self.train_out_vocab:
-                out_vocab_losses = {}
+                # 1. 仅构建一次预测字典，包含最终输出和辅助输出（aux_outputs）
+                criterion_pred = {
+                    'pred_logits': query_cls_results_final,
+                    'pred_masks': outputs["pred_masks"],
+                    'pred_boxes': outputs['pred_boxes'],
+                    'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
+                    "attn_cls_logits": attn_cls_results[-1], 
+                    'aux_outputs': aux_outputs if use_aux is True else None,
+                }
 
-                # gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-                # targets_adapter, _, _ = self.prepare_targets_for_maskadapter(gt_instances, images)
+                # 2. 让 FcclipSetCriterion 自动处理内部的 auxiliary 循环。
+                # 它会输出一个扁平的字典，包含类似于 'loss_attn_cls', 'loss_attn_cls_0' 等键。
+                out_vocab_losses = self.out_vocab_criterion(criterion_pred, targets)
 
-                for i in range(6):
-                    # 获取当前层的预测结果
-                    layer_loss_dict = {}
-                    mask_pred_results = outputs["pred_masks"] if i == 5 else outputs['aux_outputs'][i]["pred_masks"]
-                    mask_cls_results = attn_cls_results[i]
-
-                    criterion_pred = {
-                        'pred_logits': query_cls_results_final,
-                        'pred_masks': outputs["pred_masks"],
-                        'pred_boxes': outputs['pred_boxes'],
-                        'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
-                        "attn_cls_logits": attn_cls_results[-1],
-                        'aux_outputs': aux_outputs if use_aux is True else None,
-                    }
-
-                    out_vocab_criterion_losses = self.out_vocab_criterion(criterion_pred, targets)
-                    layer_loss_dict.update(out_vocab_criterion_losses)
-
-                    # # 进行匹配
-                    # src_masks, src_cls, target_masks, mask_labels = self.match_via_iou(
-                    #     mask_pred_results, mask_cls_results, targets_adapter, 
-                    #     iou_threshold=self.iou_threshold, max_matches=self.num_pred_masks
-                    # )
-                    
-                    # layer_loss_dict.update(self.cross_entropy_loss(src_cls, mask_labels))
-
-                    for k, v in layer_loss_dict.items():
-                        if i < 5:
-                            out_vocab_losses[f"{k}_{i}"] = v
-                        else:
-                            out_vocab_losses[k] = v
-
-
+                # 3. 应用权重并过滤掉不需要的损失
                 for k in list(out_vocab_losses.keys()):
-                    # print("loss:", k, losses[k].item())
                     if k in self.out_vocab_weight_dict:
                         out_vocab_losses[k] *= self.out_vocab_weight_dict[k]
                     else:
-                        # remove this loss if not specified in `weight_dict`
+                        # 如果不在 `weight_dict` 中指定，则移除该损失
                         out_vocab_losses.pop(k)
 
-                losses.update(out_vocab_losses)                
+                # 4. 更新主损失字典
+                losses.update(out_vocab_losses)        
      
 
             # loss排序

@@ -8,6 +8,7 @@ MODEL:
     ENABLE_SEGMENTATION: True
     NUM_CDT: 1
     # USE_QUERY_PROJ: True
+    USE_PIXEL_PROJ: True
     USE_PE_TEXT: False
     # DYNAMIC_QUERY: True
     # ENCODER_LOSS: True
@@ -42,7 +43,7 @@ DATASETS:
   TRAIN: ("coco_2017_train_panoptic", )
   TEST: ("openvocab_ade20k_panoptic_val",) 
   # TEST: ("openvocab_cityscapes_fine_panoptic_val",)
-  TEST: ("openvocab_ade20k_full_sem_seg_val","openvocab_pascal20_sem_seg_val",'openvocab_pascal_ctx459_sem_seg_val', 'openvocab_pascal_ctx59_sem_seg_val',)
+  # TEST: ("openvocab_ade20k_full_sem_seg_val","openvocab_pascal20_sem_seg_val",'openvocab_pascal_ctx459_sem_seg_val', 'openvocab_pascal_ctx59_sem_seg_val',)
   # TEST: ("openvocab_ade20k_panoptic_val", "openvocab_ade20k_full_sem_seg_val","openvocab_pascal20_sem_seg_val",'openvocab_pascal_ctx459_sem_seg_val', 'openvocab_pascal_ctx59_sem_seg_val',)
 
 
@@ -118,6 +119,6 @@ TEST:
   # PANOPTIC_ON: True   
 VERSION: 2
 
-OUTPUT_DIR: ./out/test/test
-# OUTPUT_DIR: ./out/RADIOSAM/copa_attn_cdt_vpt/
+# OUTPUT_DIR: ./out/test/test
+OUTPUT_DIR: ./out/RADIOSAM/copa_attn_cdt_vpt50/
   
