@@ -774,6 +774,7 @@ class RADIOSAM(nn.Module):
                     self.test_text_classifier = cache["text_classifier"].to(self.device)
                     self.test_num_templates = cache["num_templates"]
                     self.test_class_names = cache["class_names"]
+                    self.category_overlapping_mask = cache["category_overlapping_mask"]
                 else:
                     self.category_overlapping_mask, self.test_num_templates, self.test_class_names = (
                         self.prepare_class_names_from_metadata(
@@ -807,6 +808,7 @@ class RADIOSAM(nn.Module):
                         "text_classifier": self.test_text_classifier.cpu(),
                         "num_templates": self.test_num_templates,
                         "class_names": self.test_class_names,
+                        "category_overlapping_mask": self.category_overlapping_mask,
                     }
 
                 self.test_dataname = dataname
@@ -909,6 +911,7 @@ class RADIOSAM(nn.Module):
                     self.SAM_test_text_classifier = cache["text_classifier"].to(self.device)
                     self.SAM_test_num_templates = cache["num_templates"]
                     self.SAM_test_class_names = cache["class_names"]
+                    self.SAM_category_overlapping_mask = cache["category_overlapping_mask"]
                 else:
                     self.SAM_category_overlapping_mask, self.SAM_test_num_templates, self.SAM_test_class_names = (
                         self.prepare_class_names_from_metadata(
@@ -961,6 +964,7 @@ class RADIOSAM(nn.Module):
                         "text_classifier": self.SAM_test_text_classifier.cpu(),
                         "num_templates": self.SAM_test_num_templates,
                         "class_names": self.SAM_test_class_names,
+                        "category_overlapping_mask": self.SAM_category_overlapping_mask,
                     }
 
                 self.SAM_test_dataname = dataname
