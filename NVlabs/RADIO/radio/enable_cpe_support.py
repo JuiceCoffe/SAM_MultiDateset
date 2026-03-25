@@ -26,8 +26,14 @@ from .dual_hybrid_vit import HybridModel
 def _forward_cpe(self: VisionTransformer, x: torch.Tensor) -> torch.Tensor:
     x = self.patch_generator(x)
     if getattr(self, 'grad_checkpointing', False) and not torch.jit.is_scripting():
-        x = checkpoint_seq(self.blocks, x)
+        if getattr(self.blocks, 'supports_gradient_checkpointing', False):
+            self.blocks.grad_checkpointing = True
+            x = self.blocks(x)
+        else:
+            x = checkpoint_seq(self.blocks, x)
     else:
+        if hasattr(self.blocks, 'grad_checkpointing'):
+            self.blocks.grad_checkpointing = False
         x = self.blocks(x)
     x = self.norm(x)
     return x

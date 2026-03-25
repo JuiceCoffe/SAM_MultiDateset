@@ -124,3 +124,4 @@ def add_sam3_config(cfg):
 
     cfg.MODEL.VPT = CN()
     cfg.MODEL.VPT.ENABLE = False
+    cfg.MODEL.VPT.GRAD_CHECKPOINT = False

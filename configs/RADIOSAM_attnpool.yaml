@@ -32,6 +32,7 @@ MODEL:
 
   VPT:
     ENABLE: True
+    GRAD_CHECKPOINT: True
 
   WEIGHTS: "/data/hmp/sam3.pt"
   # WEIGHTS: "/root/hub_home/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt" 
@@ -59,8 +60,8 @@ SOLVER:
   BASE_LR: 0.0001
   LR_SCHEDULER_NAME: WarmupPolyLR
   STEPS: (40000, 50000)
-  MAX_ITER: 50000
-  CHECKPOINT_PERIOD: 2500
+  MAX_ITER: 60000
+  CHECKPOINT_PERIOD: 5000
   
   WEIGHT_DECAY: 0.0001
   WARMUP_ITERS: 2500
@@ -97,7 +98,7 @@ DATALOADER:
   DATASET_RATIO: [1.0]
 
   # # Batch Size 对应单个数据集
-  DATASET_BS: [2]
+  DATASET_BS: [4]
   
   # COCO 通常不需要 RFS (Repeat Factor Sampling)
   USE_RFS: [False]
@@ -120,5 +121,5 @@ TEST:
 VERSION: 2
 
 # OUTPUT_DIR: ./out/test/test
-OUTPUT_DIR: ./out/RADIOSAM/copa_attn_cdt_vpt50/
+OUTPUT_DIR: ./out/RADIOSAM/copa_attn_cdt_vpt50_clear/
   

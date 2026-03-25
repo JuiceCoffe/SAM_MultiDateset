@@ -67,7 +67,7 @@ from .mask_adapter_head import build_mask_adapter
 from .convnext import ConvNextBlock
 
 
-from.RADIOwrapper import replace_sam3_encoder, load_radio_model
+from.RADIOwrapper import replace_sam3_encoder, load_radio_model, set_radio_grad_checkpointing
 
 @META_ARCH_REGISTRY.register()
 class RADIOSAM(nn.Module):
@@ -231,6 +231,9 @@ class RADIOSAM(nn.Module):
         self.use_dot_prod_head = cfg.MODEL.SAM3.USE_DOT_PROD_HEAD
 
         self.vpt_enable = cfg.MODEL.VPT.ENABLE
+        self.vpt_grad_checkpoint = getattr(cfg.MODEL.VPT, "GRAD_CHECKPOINT", False)
+        if self.vpt_enable and self.vpt_grad_checkpoint:
+            set_radio_grad_checkpointing(self.radio_adaptor.student, True)
         # -------------------------------------------------------
         # 计算逻辑
         # -------------------------------------------------------
@@ -964,6 +967,20 @@ class RADIOSAM(nn.Module):
             return self.SAM_test_text_classifier, self.SAM_test_num_templates
 
 
+    def clear_inference_cache(self):
+        attrs_to_clear = [
+            "train_text_classifier",
+            "test_text_classifier",
+            "SAM_train_text_classifier",
+            "SAM_test_text_classifier",
+            "SAM_category_overlapping_mask",
+            "category_overlapping_mask",
+            "find_stage",
+        ]
+        for attr_name in attrs_to_clear:
+            if hasattr(self, attr_name):
+                setattr(self, attr_name, None)
+
     @property
     def device(self):
         return self.pixel_mean.device
@@ -1018,14 +1035,16 @@ class RADIOSAM(nn.Module):
             # others
             geometric_prompt = self.detector._get_dummy_prompt(bs)
 
-        if self.vpt_enable:
+        if self.vpt_enable and self.training:
             images.tensor.requires_grad_(True)
-            backbone_out_vision = checkpoint(
-                self.detector.backbone.forward_image, 
-                images.tensor, 
-                use_reentrant=False
-            )
-            # backbone_out_vision = self.detector.backbone.forward_image(images.tensor)
+            if self.vpt_grad_checkpoint:
+                backbone_out_vision = checkpoint(
+                    self.detector.backbone.forward_image,
+                    images.tensor,
+                    use_reentrant=False,
+                )
+            else:
+                backbone_out_vision = self.detector.backbone.forward_image(images.tensor)
         else:
             with torch.no_grad():
                 backbone_out_vision = self.detector.backbone.forward_image(images.tensor)

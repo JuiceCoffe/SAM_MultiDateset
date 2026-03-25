@@ -1,5 +1,6 @@
 import warnings
 import os
+import gc
 
 warnings.filterwarnings("ignore")
 
@@ -144,6 +145,30 @@ class PromptMonitorHook(HookBase):
             weight_diff = torch.abs(prompts.data - self.initial_weights).sum().item()
             
             print(f"[Iter {self.trainer.iter}] Prompt Grad Norm: {grad_norm} | Weight Diff from Start: {weight_diff:.6f}")
+
+
+class EvalMemoryCleanupHook(HookBase):
+    def __init__(self, eval_period=0):
+        self.eval_period = eval_period
+
+    def _cleanup(self):
+        model = self.trainer.model.module if hasattr(self.trainer.model, "module") else self.trainer.model
+        if hasattr(model, "clear_inference_cache"):
+            model.clear_inference_cache()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+    def after_step(self):
+        if self.eval_period <= 0:
+            return
+        next_iter = self.trainer.iter + 1
+        if next_iter % self.eval_period == 0 and next_iter != self.trainer.max_iter:
+            self._cleanup()
+
+    def after_train(self):
+        self._cleanup()
 
 
 class Trainer(DefaultTrainer):
@@ -405,7 +430,7 @@ def main(args):
 
     trainer = Trainer(cfg)
 
-    trainer.register_hooks([PromptMonitorHook(check_period=200)])
+    trainer.register_hooks([PromptMonitorHook(check_period=200), EvalMemoryCleanupHook(cfg.TEST.EVAL_PERIOD)])
 
     trainer.resume_or_load(resume=args.resume)
     return trainer.train()

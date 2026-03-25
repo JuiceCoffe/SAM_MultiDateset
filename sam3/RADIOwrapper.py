@@ -69,6 +69,8 @@ class RADIO_Adaptor(nn.Module):
             
             _, backbone_features = student_output['backbone']
             sig2_vis_features = self.sig2_adaptor.head_mlp(backbone_features)
+            del student_output
+            del backbone_features
 
 
         patch_size = int(round(math.sqrt(images.shape[-2] * images.shape[-1] / features.shape[1])))
@@ -80,12 +82,9 @@ class RADIO_Adaptor(nn.Module):
         features = rearrange(features, 'b (r c) d -> b d r c', r=rows, c=cols)
 
         sig2_vis_features = rearrange(sig2_vis_features, 'b (r c) d -> b d r c', r=rows, c=cols)
-        other_output={
-            "siglip2-g":{
+        other_output = {
+            "siglip2-g": {
                 "features": sig2_vis_features.float(),
-            },
-            "backbone":{
-                "features": backbone_features.float(),
             }
         }
         # Return as a list (ViT returns list of outputs from global attention blocks)
@@ -120,6 +119,21 @@ def load_radio_model(model_version: str, device: str = 'cuda', vitdet: Optional[
     model.eval()
     print("RADIO model loaded successfully!")
     return model
+
+
+def set_radio_grad_checkpointing(radio_model: torch.nn.Module, enable: bool = True):
+    inner_model = getattr(radio_model, "model", radio_model)
+    set_fn = getattr(inner_model, "set_grad_checkpointing", None)
+    if callable(set_fn):
+        set_fn(enable)
+    elif hasattr(inner_model, "grad_checkpointing"):
+        inner_model.grad_checkpointing = enable
+    else:
+        print("Warning: RADIO model does not expose grad checkpointing control.")
+
+    blocks = getattr(inner_model, "blocks", None)
+    if hasattr(blocks, "grad_checkpointing"):
+        blocks.grad_checkpointing = enable
 
 
 def replace_sam3_encoder(sam3_model, radio_model, device: str = 'cuda'):
