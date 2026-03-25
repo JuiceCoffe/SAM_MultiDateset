@@ -75,7 +75,7 @@ class RADIOModel(nn.Module):
             
         # 2. 获取参数并替换 blocks
         embed_dim = self.embed_dim # 自动获取，此处为 1280
-        num_prompts_to_insert = 50 # 你可以自由调整想要插入的 Prompt 数量 (比如 10 到 50)
+        num_prompts_to_insert = 200 # 你可以自由调整想要插入的 Prompt 数量 (比如 10 到 50)
         
         # 确认模型包含 blocks 才能替换
         if hasattr(self.model, 'blocks'):
