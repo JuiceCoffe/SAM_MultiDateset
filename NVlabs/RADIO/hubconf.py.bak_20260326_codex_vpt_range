@@ -33,8 +33,6 @@ def radio_model(
     adaptor_names: Union[str, List[str]] = None,
     vitdet_window_size: Optional[int] = None,
     num_prompts_to_insert: int = 200,
-    insert_start_layer: int = 1,
-    insert_end_layer: int = -1,
     return_checkpoint: bool = False,
     **kwargs,
 ) -> RADIOModel:
@@ -182,8 +180,6 @@ def radio_model(
         feature_normalizer=feature_normalizer,
         inter_feature_normalizer=inter_feature_normalizer,
         num_prompts_to_insert=num_prompts_to_insert,
-        insert_start_layer=insert_start_layer,
-        insert_end_layer=insert_end_layer,
     )
 
     if vitdet_window_size is not None:

@@ -121,14 +121,7 @@ class RADIOSAM(nn.Module):
             self.detector.eval()
         print("SAM3创建成功!")
 
-        radio_model = load_radio_model(
-            "c-radio_v4-h",
-            device=self.pixel_mean.device,
-            vitdet=None,
-            num_prompts_to_insert=cfg.MODEL.VPT.NUM_PROMPTS_TO_INSERT,
-            insert_start_layer=cfg.MODEL.VPT.START_LAYER,
-            insert_end_layer=cfg.MODEL.VPT.END_LAYER,
-        )
+        radio_model = load_radio_model("c-radio_v4-h", device=self.pixel_mean.device, vitdet=None)
         self.detector, self.radio_adaptor = replace_sam3_encoder(self.detector, radio_model, device=self.pixel_mean.device)
 
         # -------------------------------------------------------
@@ -705,32 +698,6 @@ class RADIOSAM(nn.Module):
     #     self.test_text_classifier = None
     #     return
 
-    def _compress_language_features(self, language_features, language_mask):
-        valid_mask = ~language_mask
-        valid_lengths = valid_mask.sum(dim=1)
-        max_valid_len = int(valid_lengths.max().item()) if valid_lengths.numel() > 0 else 0
-
-        compressed_features = language_features[:, :max_valid_len, :].new_zeros(
-            language_features.shape[0],
-            max_valid_len,
-            language_features.shape[-1],
-        )
-        compressed_mask = torch.ones(
-            language_mask.shape[0],
-            max_valid_len,
-            dtype=torch.bool,
-            device=language_mask.device,
-        )
-
-        for idx in range(language_features.shape[0]):
-            curr_len = int(valid_lengths[idx].item())
-            if curr_len == 0:
-                continue
-            compressed_features[idx, :curr_len] = language_features[idx, valid_mask[idx]]
-            compressed_mask[idx, :curr_len] = False
-
-        return compressed_features, compressed_mask
-
     def get_text_classifier(self, dataname):
         if self.training:
             if getattr(self, 'test_text_classifier', None) is not None:
@@ -855,16 +822,8 @@ class RADIOSAM(nn.Module):
                 torch.cuda.empty_cache()
 
             if self.SAM_train_dataname != dataname or getattr(self, 'SAM_train_text_classifier', None) is None:
-                if (
-                    dataname in self.SAM_text_encoder_cache
-                    and "language_features" in self.SAM_text_encoder_cache[dataname]
-                    and "language_mask" in self.SAM_text_encoder_cache[dataname]
-                ):
+                if dataname in self.SAM_text_encoder_cache:
                     cache = self.SAM_text_encoder_cache[dataname]
-                    self.SAM_language_features, self.SAM_language_mask = self._compress_language_features(
-                        cache["language_features"].to(self.device),
-                        cache["language_mask"].to(self.device),
-                    )
                     self.SAM_train_text_classifier = cache["text_classifier"].to(self.device)
                     self.SAM_train_num_templates = cache["num_templates"]
                     self.SAM_train_class_names = cache["class_names"]
@@ -891,7 +850,6 @@ class RADIOSAM(nn.Module):
                             self.SAM_train_num_templates = self.SAM_train_num_templates[num_things_classes:]
 
                     text_classifier = []
-                    text_feat = []
                     language_mask = []
                     bs = 128
                     print("Generating text classifier for", dataname, "with", len(self.SAM_train_class_names), "classes.")
@@ -908,28 +866,10 @@ class RADIOSAM(nn.Module):
                             text_classifier.append(state_text["pe_text_out"]["pe_textfeat"])
                         else:
                             text_classifier.append(batch_text_feat)
-                        text_feat.append(batch_text_feat)
                         language_mask.append(mask)
 
                     text_classifier = torch.cat(text_classifier, dim=0)
-                    text_feat = torch.cat(text_feat, dim=0)
                     language_mask = torch.cat(language_mask, dim=0)
-
-                    text_feat = text_feat.reshape(
-                        text_feat.shape[0] // len(self.SAM_PROMPT),
-                        len(self.SAM_PROMPT),
-                        text_feat.shape[-2],
-                        text_feat.shape[-1],
-                    )
-                    text_feat /= (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
-                    text_feat[
-                        language_mask.view(
-                            text_feat.shape[0],
-                            text_feat.shape[1],
-                            text_feat.shape[2],
-                        )
-                    ] = 0.0
-                    language_features = text_feat.mean(1)
 
                     text_classifier = text_classifier.reshape(
                         text_classifier.shape[0] // len(self.SAM_PROMPT),
@@ -950,22 +890,8 @@ class RADIOSAM(nn.Module):
                     text_classifier = text_classifier.mean(1)
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
 
-                    sam_language_mask = torch.min(
-                        language_mask.view(
-                            language_features.shape[0],
-                            len(self.SAM_PROMPT),
-                            language_features.shape[1],
-                        ),
-                        dim=1,
-                    ).values
-                    self.SAM_language_features, self.SAM_language_mask = self._compress_language_features(
-                        language_features.detach(),
-                        sam_language_mask,
-                    )
                     self.SAM_train_text_classifier = text_classifier.detach()
                     self.SAM_text_encoder_cache[dataname] = {
-                        "language_features": self.SAM_language_features.cpu(),
-                        "language_mask": self.SAM_language_mask.cpu(),
                         "text_classifier": self.SAM_train_text_classifier.cpu(),
                         "num_templates": self.SAM_train_num_templates,
                         "class_names": self.SAM_train_class_names,
@@ -980,25 +906,12 @@ class RADIOSAM(nn.Module):
                 torch.cuda.empty_cache()
 
             if self.SAM_test_dataname != dataname or getattr(self, 'SAM_test_text_classifier', None) is None:
-                if (
-                    dataname in self.SAM_text_encoder_cache
-                    and "language_features" in self.SAM_text_encoder_cache[dataname]
-                    and "language_mask" in self.SAM_text_encoder_cache[dataname]
-                ):
+                if dataname in self.SAM_text_encoder_cache:
                     cache = self.SAM_text_encoder_cache[dataname]
-                    self.SAM_language_features, self.SAM_language_mask = self._compress_language_features(
-                        cache["language_features"].to(self.device),
-                        cache["language_mask"].to(self.device),
-                    )
                     self.SAM_test_text_classifier = cache["text_classifier"].to(self.device)
                     self.SAM_test_num_templates = cache["num_templates"]
                     self.SAM_test_class_names = cache["class_names"]
-                    if "category_overlapping_mask" in cache:
-                        self.SAM_category_overlapping_mask = cache["category_overlapping_mask"]
-                    else:
-                        self.SAM_category_overlapping_mask, _, _ = self.prepare_class_names_from_metadata(
-                            self.test_metadata[dataname], self.train_metadata, self.SAM_PROMPT
-                        )
+                    self.SAM_category_overlapping_mask = cache["category_overlapping_mask"]
                 else:
                     self.SAM_category_overlapping_mask, self.SAM_test_num_templates, self.SAM_test_class_names = (
                         self.prepare_class_names_from_metadata(
@@ -1006,7 +919,6 @@ class RADIOSAM(nn.Module):
                         )
                     )
                     text_classifier = []
-                    text_feat = []
                     language_mask = []
                     bs = 128
                     print("Generating text classifier for", dataname, "with", len(self.SAM_test_class_names), "classes.")
@@ -1023,28 +935,10 @@ class RADIOSAM(nn.Module):
                             text_classifier.append(state_text["pe_text_out"]["pe_textfeat"])
                         else:
                             text_classifier.append(batch_text_feat)
-                        text_feat.append(batch_text_feat)
                         language_mask.append(mask)
 
                     text_classifier = torch.cat(text_classifier, dim=0)
-                    text_feat = torch.cat(text_feat, dim=0)
                     language_mask = torch.cat(language_mask, dim=0)
-
-                    text_feat = text_feat.reshape(
-                        text_feat.shape[0] // len(self.SAM_PROMPT),
-                        len(self.SAM_PROMPT),
-                        text_feat.shape[-2],
-                        text_feat.shape[-1],
-                    )
-                    text_feat /= (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
-                    text_feat[
-                        language_mask.view(
-                            text_feat.shape[0],
-                            text_feat.shape[1],
-                            text_feat.shape[2],
-                        )
-                    ] = 0.0
-                    language_features = text_feat.mean(1)
 
                     text_classifier = text_classifier.reshape(
                         text_classifier.shape[0] // len(self.SAM_PROMPT),
@@ -1065,22 +959,8 @@ class RADIOSAM(nn.Module):
                     text_classifier = text_classifier.mean(1)
                     text_classifier /= (text_classifier.norm(dim=-1, keepdim=True) + 1e-6)
 
-                    sam_language_mask = torch.min(
-                        language_mask.view(
-                            language_features.shape[0],
-                            len(self.SAM_PROMPT),
-                            language_features.shape[1],
-                        ),
-                        dim=1,
-                    ).values
-                    self.SAM_language_features, self.SAM_language_mask = self._compress_language_features(
-                        language_features.detach(),
-                        sam_language_mask,
-                    )
                     self.SAM_test_text_classifier = text_classifier.detach()
                     self.SAM_text_encoder_cache[dataname] = {
-                        "language_features": self.SAM_language_features.cpu(),
-                        "language_mask": self.SAM_language_mask.cpu(),
                         "text_classifier": self.SAM_test_text_classifier.cpu(),
                         "num_templates": self.SAM_test_num_templates,
                         "class_names": self.SAM_test_class_names,
@@ -1097,8 +977,6 @@ class RADIOSAM(nn.Module):
             "test_text_classifier",
             "SAM_train_text_classifier",
             "SAM_test_text_classifier",
-            "SAM_language_features",
-            "SAM_language_mask",
             "SAM_category_overlapping_mask",
             "category_overlapping_mask",
             "find_stage",
@@ -1207,42 +1085,20 @@ class RADIOSAM(nn.Module):
 
         # =======================================================
 
-        language_features_input = []
-
-        USE_GT_NAMES_ONLY = False
-        if USE_GT_NAMES_ONLY:
-            language_features_input = [self.language_features[batch_gt_names_idx[i], :, :] for i in range(bs)]
-            language_features_input = torch.cat(language_features_input, dim=0)
-            language_mask_input = [self.language_mask[batch_gt_names_idx[i], :] for i in range(bs)]
-            language_mask_input = torch.cat(language_mask_input, dim=0)
-            if bs == 1:
-                language_features_input = language_features_input.unsqueeze(0)
-                language_mask_input = language_mask_input.unsqueeze(0)
-        else:
-            flat_language_features = self.SAM_language_features.reshape(
-                -1, self.SAM_language_features.shape[-1]
-            )
-            flat_language_mask = self.SAM_language_mask.reshape(-1)
-            flat_language_features = flat_language_features[~flat_language_mask]
-            language_features_input = flat_language_features.unsqueeze(0).expand(bs, -1, -1)
-            language_mask_input = torch.zeros(
-                bs,
-                language_features_input.shape[1],
-                dtype=torch.bool,
-                device=self.device,
-            )
-
-        language_features_input = language_features_input.reshape(
-            bs, -1, language_features_input.shape[-1]
+        # 当前实现不再依赖 language_features 参与主干计算，直接传空文本 prompt。
+        language_features_input = torch.empty(
+            bs, 0, img_feat.shape[1], device=self.device, dtype=img_feat.dtype
         )
-        language_mask_input = language_mask_input.reshape(bs, -1)
+        language_mask_input = torch.empty(
+            bs, 0, device=self.device, dtype=torch.bool
+        )
 
         backbone_out = {
             "img_batch_all_stages": img_feat,
             "vision_pos_enc": backbone_out_vision["vision_pos_enc"],
             "backbone_fpn": backbone_fpn,
-            "language_features": language_features_input.permute(1, 0, 2),
-            "language_mask": language_mask_input,
+            "language_features": language_features_input.permute(1, 0, 2),  # (0, bs, dim)
+            "language_mask": language_mask_input,  # bs, 0
         }
 
         enable_mask_grad = self.training and self.train_mask
