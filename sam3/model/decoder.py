@@ -145,13 +145,13 @@ class TransformerDecoderLayer(nn.Module):
                 tgt = self.norm2(tgt)
 
         if self.use_text_cross_attention:
-            # tgt2 = self.ca_text(
-            #     self.with_pos_embed(tgt, tgt_query_pos),
-            #     memory_text,
-            #     memory_text,
-            #     key_padding_mask=text_attention_mask,
-            # )[0]
-            # tgt = tgt + self.catext_dropout(tgt2)
+            tgt2 = self.ca_text(
+                self.with_pos_embed(tgt, tgt_query_pos),
+                memory_text,
+                memory_text,
+                key_padding_mask=text_attention_mask,
+            )[0]
+            tgt = tgt + self.catext_dropout(tgt2)
             tgt = self.catext_norm(tgt)
 
         if presence_token is not None:
