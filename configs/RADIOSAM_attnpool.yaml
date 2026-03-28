@@ -125,5 +125,5 @@ TEST:
 VERSION: 2
 
 # OUTPUT_DIR: ./out/test/test
-OUTPUT_DIR: ./out/RADIOSAM/copa_attn_cdt_vpt5/
+OUTPUT_DIR: ./out/RADIOSAM/copa_attn_cdt_txt_vpt5/
   
