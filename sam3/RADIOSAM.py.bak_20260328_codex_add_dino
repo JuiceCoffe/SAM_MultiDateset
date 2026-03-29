@@ -65,7 +65,6 @@ import math
 
 from .mask_adapter_head import build_mask_adapter
 from .convnext import ConvNextBlock
-from .feature_adder import FeatureAdder
 
 
 from.RADIOwrapper import replace_sam3_encoder, load_radio_model, set_radio_grad_checkpointing
@@ -142,21 +141,16 @@ class RADIOSAM(nn.Module):
         self.out_vocab_logit_scale = None
 
 
+        # 通过 cfg 控制是否启用，硬编码输入输出维度为 256
         self.use_query_proj = cfg.MODEL.SAM3.USE_QUERY_PROJ
         if self.use_query_proj:
-            self.query_proj = nn.Sequential(
-                nn.LayerNorm(256),
-                nn.Linear(256, 256),
-            )
+            self.query_proj = MLP(256, 256, 1024, 3)
         else:
             self.query_proj = None
 
         self.use_pixel_proj = cfg.MODEL.SAM3.USE_PIXEL_PROJ
         if self.use_pixel_proj:
-            self.pixel_proj = nn.Sequential(
-                nn.LayerNorm(256),
-                nn.Linear(256, 256),
-            )
+            self.pixel_proj = MLP(256, 256, 256, 3)
         else:
             self.pixel_proj = None
 
@@ -254,28 +248,6 @@ class RADIOSAM(nn.Module):
         self.SAM_PROMPT = ['{}']
 
         self.add_pixelfeat = cfg.MODEL.SAM3.ADD_PIXELFEAT
-        self.add_dino = getattr(cfg.MODEL.SAM3, "ADD_DINO", False)
-        self.add_siglip = getattr(cfg.MODEL.SAM3, "ADD_SIGLIP", False)
-        if self.add_dino:
-            self.dino_feature_adder = FeatureAdder(
-                in_channels_x=4096,
-                in_channels_cond = 256,
-                out_channels=256,
-                mid_channels=512,
-                use_checkpoint=getattr(cfg.MODEL.VPT, "GRAD_CHECKPOINT", False),
-            )
-        else:
-            self.dino_feature_adder = None
-        if self.add_siglip:
-            self.siglip_feature_adder = FeatureAdder(
-                in_channels_x=1536,
-                in_channels_cond = 256,
-                out_channels=256,
-                mid_channels=512,
-                use_checkpoint=getattr(cfg.MODEL.VPT, "GRAD_CHECKPOINT", False),
-            )
-        else:
-            self.siglip_feature_adder = None
         self.alpha = cfg.MODEL.SAM3.ALPHA
         self.beta = cfg.MODEL.SAM3.BETA
         self.OracleSelect_on = cfg.MODEL.SAM3.ORACLE_SELECT
@@ -1289,25 +1261,11 @@ class RADIOSAM(nn.Module):
                     backbone_out, find_input, prompt, prompt_mask
                 )
 
-            if self.add_dino:
-                dino_feat = backbone_out_vision["vit_feature"][0]["dino_v3_7b"]["features"].detach()
-                dino_cond = encoder_out["encoder_hidden_states"].unflatten(
-                    0, dino_feat.shape[-2:]
-                ).permute(2, 3, 0, 1)
-                dino_delta = self.dino_feature_adder(dino_feat, dino_cond)
-                dino_delta = dino_delta.flatten(2).permute(2, 0, 1)
-                dino_delta = dino_delta.to(dtype=encoder_out["encoder_hidden_states"].dtype)
-                encoder_out["encoder_hidden_states"] = encoder_out["encoder_hidden_states"] + dino_delta
+            fusion_feat = encoder_out["encoder_hidden_states"] # H'*W', bs, D
+            fusion_feat = fusion_feat.permute(1,0,2) # bs, H'*W', D
+            if self.use_cos_sim:
+                fusion_feat = F.normalize(fusion_feat, dim=-1)
 
-            if self.add_siglip:
-                siglip_feat = backbone_out_vision["vit_feature"][0]["siglip2-g"]["features"].detach()
-                siglip_cond = encoder_out["encoder_hidden_states"].unflatten(
-                    0, siglip_feat.shape[-2:]
-                ).permute(2, 3, 0, 1)
-                siglip_delta = self.siglip_feature_adder(siglip_feat, siglip_cond)
-                siglip_delta = siglip_delta.flatten(2).permute(2, 0, 1)
-                siglip_delta = siglip_delta.to(dtype=encoder_out["encoder_hidden_states"].dtype)
-                encoder_out["encoder_hidden_states"] = encoder_out["encoder_hidden_states"] + siglip_delta
             
             out = {
                 "encoder_hidden_states": encoder_out["encoder_hidden_states"],
@@ -1321,7 +1279,7 @@ class RADIOSAM(nn.Module):
             with torch.profiler.record_function("SAM3Image._run_decoder"):            
                 # out, hs = self.detector._run_decoder(
                 #     memory=out["encoder_hidden_states"],
-                #     pos_embed=encoder_out["pos_embed"],name
+                #     pos_embed=encoder_out["pos_embed"],
                 #     src_mask=encoder_out["padding_mask"],
                 #     out=out,
                 #     prompt=prompt,
@@ -1643,6 +1601,7 @@ class RADIOSAM(nn.Module):
             # 释放不再需要的显存大户
             if 'backbone_out' in locals(): del backbone_out
             if 'encoder_out' in locals(): del encoder_out
+            if 'fusion_feat' in locals(): del fusion_feat
             if 'backbone_fpn' in locals(): del backbone_fpn
             # 强制清理 CUDA 缓存（虽然有开销，但能有效防止 OOM）
             torch.cuda.empty_cache()

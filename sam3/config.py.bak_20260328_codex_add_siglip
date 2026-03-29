@@ -34,7 +34,6 @@ def add_sam3_config(cfg):
     cfg.MODEL.SAM3.USE_SOFTMAX = False
     cfg.MODEL.SAM3.ADD_PIXELFEAT = False
     cfg.MODEL.SAM3.ADD_DINO = False
-    cfg.MODEL.SAM3.ADD_SIGLIP = False
     cfg.MODEL.SAM3.USE_DOT_PROD_HEAD = False
 
     cfg.MODEL.SAM3.ALPHA = 0.0

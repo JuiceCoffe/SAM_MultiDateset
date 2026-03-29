@@ -1,0 +1,102 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
+class LayerNorm2d(nn.Module):
+    def __init__(self, num_channels: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(num_channels))
+        self.bias = nn.Parameter(torch.zeros(num_channels))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        x = self.weight[:, None, None] * x + self.bias[:, None, None]
+        return x
+
+
+class FeatureAdder(nn.Module):
+    def __init__(self, 
+                 in_channels_x: int, 
+                 in_channels_cond: int, 
+                 out_channels: int = None, 
+                 mid_channels: int = None, 
+                 use_checkpoint: bool = True):
+        """
+        专为残差注入设计的 SPADE 变体 (去除了基础 scale 1，实现完美的零初始化)。
+        
+        Args:
+            in_channels_x: 被调制特征 x 的通道数 (例如 SigLIP 特征)
+            in_channels_cond: 条件特征 cond 的通道数 (例如主特征图)
+            out_channels: 输出特征的通道数，默认与 x 一致
+            mid_channels: 计算 actv 时的中间层通道数
+            use_checkpoint: 是否启用显存节省技术
+        """
+        super().__init__()
+        self.use_checkpoint = use_checkpoint
+        
+        if out_channels is None:
+            out_channels = in_channels_x
+            
+        # 1. 无参数归一化
+        self.param_free_norm = LayerNorm2d(in_channels_x)
+        
+        # 2. 联合生成 actv 的投影层
+        self.proj_x = nn.Conv2d(in_channels_x, mid_channels, kernel_size=3, stride=1, padding=1)
+        self.proj_cond = nn.Conv2d(in_channels_cond, mid_channels, kernel_size=3, stride=1, padding=1)
+        self.act = nn.GELU()
+        
+        # 3. 生成 gamma 和 beta 的网络
+        self.mlp_gamma = nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1)
+        self.mlp_beta = nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1)
+        
+        # 4. 执行严格的零初始化
+        self._zero_initialize_modulation_layers()
+
+    def _zero_initialize_modulation_layers(self):
+        """
+        严格的零初始化：
+        因为我们去掉了公式中的 (1 + gamma)，所以只要 gamma 和 beta 全为 0，
+        整个模块的初始输出就严格等于 0，完美契合残差旁路的设计。
+        """
+        nn.init.zeros_(self.mlp_gamma.weight)
+        if self.mlp_gamma.bias is not None:
+            nn.init.zeros_(self.mlp_gamma.bias)
+            
+        nn.init.zeros_(self.mlp_beta.weight)
+        if self.mlp_beta.bias is not None:
+            nn.init.zeros_(self.mlp_beta.bias)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        if self.use_checkpoint and self.training:
+            # 确保传入 checkpoint 的 tensor 都 requires_grad
+            if not x.requires_grad:
+                x = x.detach().requires_grad_(True)
+            if not cond.requires_grad:
+                cond = cond.detach().requires_grad_(True)
+                
+            return checkpoint(self._forward_impl, x, cond, use_reentrant=False)
+        else:
+            return self._forward_impl(x, cond)
+
+    def _forward_impl(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        # Part 1: 归一化被调制的特征
+        normalized = self.param_free_norm(x)
+        
+        # Part 2: 空间分辨率对齐 (cond 对齐到 x 的分辨率)
+        assert cond.shape[2:] == x.shape[2:]
+            
+        # Part 3: 投影并融合特征生成 actv
+        actv = self.act(self.proj_x(x) + self.proj_cond(cond))
+        
+        # Part 4: 预测空间自适应的缩放和平移系数
+        gamma = self.mlp_gamma(actv)
+        beta = self.mlp_beta(actv)
+        
+        # Part 5: 执行特征调制 (去掉了 + 1)
+        out = normalized * gamma + beta
+        
+        return out

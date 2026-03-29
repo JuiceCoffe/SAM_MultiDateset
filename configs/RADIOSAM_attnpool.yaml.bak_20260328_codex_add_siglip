@@ -8,7 +8,7 @@ MODEL:
     ENABLE_SEGMENTATION: True
     NUM_CDT: 1
     # USE_QUERY_PROJ: True
-    USE_PIXEL_PROJ: True
+    # USE_PIXEL_PROJ: True
     USE_PE_TEXT: False
     # DYNAMIC_QUERY: True
     # ENCODER_LOSS: True
@@ -17,7 +17,6 @@ MODEL:
     USE_SOFTMAX: True
     ADD_PIXELFEAT: True
     ADD_DINO: True
-    ADD_SIGLIP: True
     # USE_DOT_PROD_HEAD: True
 
     ALPHA: 0.8
@@ -33,7 +32,7 @@ MODEL:
     CLASS_WEIGHT: 1.0
 
   VPT:
-    # ENABLE: True
+    ENABLE: True
     GRAD_CHECKPOINT: True
     NUM_PROMPTS_TO_INSERT: 5
     START_LAYER: 1  # 1-based from input side, inclusive
@@ -66,7 +65,7 @@ SOLVER:
   BASE_LR: 0.0001
   LR_SCHEDULER_NAME: WarmupPolyLR
   STEPS: (40000, 50000)
-  MAX_ITER: 45000
+  MAX_ITER: 60000
   CHECKPOINT_PERIOD: 2500
   
   WEIGHT_DECAY: 0.0001
@@ -126,6 +125,6 @@ TEST:
   # PANOPTIC_ON: True   
 VERSION: 2
 
-# OUTPUT_DIR: ./out/test/test
-OUTPUT_DIR: ./out/RADIOSAM/copa_attn_cdt_txt_addfeat/
+OUTPUT_DIR: ./out/test/test
+# OUTPUT_DIR: ./out/RADIOSAM/copa_attn_cdt_txt_vpt5/
   
