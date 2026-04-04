@@ -146,16 +146,7 @@ class RADIOSAM(nn.Module):
         else:
             self.pixel_proj = None
 
-        self.num_decoder_layers = len(self.detector.transformer.decoder.layers)
-        self.num_decoder_cross_attn_heads = (
-            self.detector.transformer.decoder.layers[0].cross_attn.num_heads
-        )
-        self.cross_attn_head_pool_logits = nn.Parameter(
-            torch.ones(
-                self.num_decoder_layers,
-                self.num_decoder_cross_attn_heads,
-            )
-        )
+        self.num_decoder_layers = 6 # SAM3/DETR 标准层数
     
         self.num_cdt = cfg.MODEL.SAM3.NUM_CDT    
         self.use_cdt = False if cfg.MODEL.SAM3.NUM_CDT == 0 else True
@@ -1179,13 +1170,6 @@ class RADIOSAM(nn.Module):
                 query_embed = self.detector.transformer.decoder.query_embed.weight
                 query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
 
-                cross_attn_head_pool_weights = torch.sigmoid(
-                    self.cross_attn_head_pool_logits
-                )
-                cross_attn_head_pool_weights = cross_attn_head_pool_weights / (
-                    cross_attn_head_pool_weights.sum(dim=-1, keepdim=True)
-                )
-
                 hs, reference_boxes, dec_presence_out, dec_presence_feats, cross_attn_weights = (
                     self.detector.transformer.decoder(
                         tgt=query_embed,
@@ -1200,7 +1184,6 @@ class RADIOSAM(nn.Module):
                         memory_text=prompt,
                         text_attention_mask=prompt_mask,
                         apply_dac=False,
-                        cross_attn_head_pool_weights=cross_attn_head_pool_weights,
 
                         use_presence_token = False,
                     )
@@ -1423,9 +1406,8 @@ class RADIOSAM(nn.Module):
                     'pred_boxes': outputs['pred_boxes'],
                     'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
                     # "attn_cls_logits": attn_cls_results[-1],
+                    'aux_outputs': aux_outputs if use_aux is True else None,
                 }
-                if use_aux:
-                    criterion_pred['aux_outputs'] = aux_outputs
                 if obj_logits_final is not None:
                     criterion_pred['pred_objectness_logits'] = obj_logits_final
 
@@ -1444,17 +1426,30 @@ class RADIOSAM(nn.Module):
 
 
             if self.train_out_vocab:
+                out_vocab_losses = {}
+
+
+                layer_loss_dict = {}
+
                 criterion_pred = {
                     'pred_logits': query_cls_results_final,
                     'pred_masks': outputs["pred_masks"],
                     'pred_boxes': outputs['pred_boxes'],
                     'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
                     "attn_cls_logits": attn_cls_results[-1],
+                    'aux_outputs': aux_outputs if use_aux is True else None,
                 }
-                if use_aux:
-                    criterion_pred['aux_outputs'] = aux_outputs
 
-                out_vocab_losses = self.out_vocab_criterion(criterion_pred, targets)
+                out_vocab_criterion_losses = self.out_vocab_criterion(criterion_pred, targets)
+                layer_loss_dict.update(out_vocab_criterion_losses)
+
+
+                for k, v in layer_loss_dict.items():
+                    if i < 5:
+                        out_vocab_losses[f"{k}_{i}"] = v
+                    else:
+                        out_vocab_losses[k] = v
+
 
                 for k in list(out_vocab_losses.keys()):
                     # print("loss:", k, losses[k].item())

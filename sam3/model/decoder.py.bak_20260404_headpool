@@ -100,7 +100,6 @@ class TransformerDecoderLayer(nn.Module):
         dac=False,
         dac_use_selfatt_ln=True,
         presence_token=None,
-        cross_attn_head_pool_weights: Optional[Tensor] = None,
         # skip inside deformable attn
         identity=0.0,
         **kwargs,  # additional kwargs for compatibility
@@ -161,7 +160,7 @@ class TransformerDecoderLayer(nn.Module):
                 [presence_token_mask, cross_attn_mask], dim=1
             )  # (bs*nheads, 1+nq, hw)
         # Cross attention to image
-        cross_attn_kwargs = dict(
+        tgt2, cross_attn_weights = self.cross_attn(
             query=self.with_pos_embed(tgt, tgt_query_pos),
             key=self.with_pos_embed(memory, memory_pos),
             value=memory,
@@ -173,20 +172,6 @@ class TransformerDecoderLayer(nn.Module):
             ),
             need_weights=True,
         )
-        if cross_attn_head_pool_weights is not None:
-            tgt2, cross_attn_weights = self.cross_attn(
-                **cross_attn_kwargs,
-                average_attn_weights=False,
-            )
-            head_pool_weights = cross_attn_head_pool_weights.to(
-                device=cross_attn_weights.device,
-                dtype=cross_attn_weights.dtype,
-            )
-            cross_attn_weights = torch.einsum(
-                "h,bhnl->bnl", head_pool_weights, cross_attn_weights
-            )
-        else:
-            tgt2, cross_attn_weights = self.cross_attn(**cross_attn_kwargs)
 
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
@@ -447,7 +432,6 @@ class TransformerDecoder(nn.Module):
         obj_roi_memory_feat=None,
         obj_roi_memory_mask=None,
         box_head_trk=None,
-        cross_attn_head_pool_weights: Optional[Tensor] = None,
 
         use_presence_token = True,
         fixed_reference_boxes = False,
@@ -565,11 +549,6 @@ class TransformerDecoder(nn.Module):
                 dac=apply_dac,
                 dac_use_selfatt_ln=self.dac_use_selfatt_ln,
                 presence_token=presence_out,
-                cross_attn_head_pool_weights=(
-                    None
-                    if cross_attn_head_pool_weights is None
-                    else cross_attn_head_pool_weights[layer_idx]
-                ),
                 **(decoder_extra_kwargs or {}),
                 act_ckpt_enable=self.training and self.use_act_checkpoint,
                 # ROI memory bank
