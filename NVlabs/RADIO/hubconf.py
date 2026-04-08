@@ -35,6 +35,11 @@ def radio_model(
     num_prompts_to_insert: int = 200,
     insert_start_layer: int = 1,
     insert_end_layer: int = -1,
+    num_attn_queries: int = 0,
+    attn_query_dim: int = -1,
+    text_feature_dim: int = 1536,
+    attn_num_heads: int = 8,
+    attn_dropout: float = 0.1,
     return_checkpoint: bool = False,
     **kwargs,
 ) -> RADIOModel:
@@ -184,6 +189,11 @@ def radio_model(
         num_prompts_to_insert=num_prompts_to_insert,
         insert_start_layer=insert_start_layer,
         insert_end_layer=insert_end_layer,
+        num_attn_queries=num_attn_queries,
+        attn_query_dim=attn_query_dim,
+        text_feature_dim=text_feature_dim,
+        attn_num_heads=attn_num_heads,
+        attn_dropout=attn_dropout,
     )
 
     if vitdet_window_size is not None:

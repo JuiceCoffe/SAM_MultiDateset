@@ -121,13 +121,19 @@ class RADIOSAM(nn.Module):
             self.detector.eval()
         print("SAM3创建成功!")
 
+        vpt_query_num_tokens = getattr(cfg.MODEL.VPT, "QUERY_NUM_TOKENS", 0)
         radio_model = load_radio_model(
             "c-radio_v4-h",
             device=self.pixel_mean.device,
             vitdet=None,
-            num_prompts_to_insert=cfg.MODEL.VPT.NUM_PROMPTS_TO_INSERT,
+            num_prompts_to_insert=cfg.MODEL.VPT.NUM_PROMPTS_TO_INSERT if cfg.MODEL.VPT.ENABLE else 0,
             insert_start_layer=cfg.MODEL.VPT.START_LAYER,
             insert_end_layer=cfg.MODEL.VPT.END_LAYER,
+            num_attn_queries=vpt_query_num_tokens if cfg.MODEL.VPT.ENABLE else 0,
+            attn_query_dim=getattr(cfg.MODEL.VPT, "QUERY_DIM", 256),
+            text_feature_dim=getattr(cfg.MODEL.VPT, "QUERY_TEXT_DIM", 1536),
+            attn_num_heads=getattr(cfg.MODEL.VPT, "QUERY_NUM_HEADS", 8),
+            attn_dropout=getattr(cfg.MODEL.VPT, "QUERY_DROPOUT", 0.1),
         )
         self.detector, self.radio_adaptor = replace_sam3_encoder(self.detector, radio_model, device=self.pixel_mean.device)
 
@@ -239,6 +245,7 @@ class RADIOSAM(nn.Module):
 
         self.vpt_enable = cfg.MODEL.VPT.ENABLE
         self.vpt_grad_checkpoint = getattr(cfg.MODEL.VPT, "GRAD_CHECKPOINT", False)
+        self.vpt_query_enable = self.vpt_enable and int(vpt_query_num_tokens) > 0
         if self.vpt_enable and self.vpt_grad_checkpoint:
             set_radio_grad_checkpointing(self.radio_adaptor.student, True)
         # -------------------------------------------------------
@@ -1153,6 +1160,12 @@ class RADIOSAM(nn.Module):
             
             # print("keys of meta:", meta.keys())
             dataname = get_dataname(batched_inputs[0])
+
+            if self.vpt_query_enable:
+                text_classifier_for_vpt, _ = self.get_text_classifier(dataname)
+                self.radio_adaptor.set_vpt_text_classifier(text_classifier_for_vpt)
+            else:
+                self.radio_adaptor.clear_vpt_text_classifier()
 
             SAM_text_classifier, SAM_num_templates = self.get_SAM_text_classifier(dataname)
             if self.void_embedding is not None:

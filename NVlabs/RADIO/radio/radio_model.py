@@ -42,6 +42,11 @@ class RADIOModel(nn.Module):
         num_prompts_to_insert: int = 200,
         insert_start_layer: int = 1,
         insert_end_layer: int = -1,
+        num_attn_queries: int = 0,
+        attn_query_dim: int = -1,
+        text_feature_dim: int = 1536,
+        attn_num_heads: int = 8,
+        attn_dropout: float = 0.1,
     ):
         super().__init__()
 
@@ -80,6 +85,7 @@ class RADIOModel(nn.Module):
         num_prompts_to_insert = self.num_prompts_to_insert
         self.insert_start_layer = int(insert_start_layer)
         self.insert_end_layer = int(insert_end_layer)
+        self.num_attn_queries = int(num_attn_queries)
         
         if hasattr(self.model, 'blocks'):
             skip_tokens = self.num_summary_tokens
@@ -91,6 +97,11 @@ class RADIOModel(nn.Module):
                 num_skip=skip_tokens,  
                 insert_start_layer=self.insert_start_layer,
                 insert_end_layer=self.insert_end_layer,
+                num_attn_queries=self.num_attn_queries,
+                attn_query_dim=attn_query_dim,
+                text_feature_dim=text_feature_dim,
+                attn_num_heads=attn_num_heads,
+                attn_dropout=attn_dropout,
             )
             self.model.blocks = injector
             start_layer = injector.active_layers[0] + 1
@@ -103,6 +114,15 @@ class RADIOModel(nn.Module):
                 f"total ViT layers={total_layers}, "
                 f"skip tokens={skip_tokens}."
             )
+            if self.num_attn_queries > 0:
+                print(
+                    "Attn query injection enabled: "
+                    f"{self.num_attn_queries} query tokens per selected layer, "
+                    f"text feature dim={text_feature_dim}, "
+                    f"query dim={injector.attn_query_tuner.query_dim}, "
+                    f"heads={attn_num_heads}, "
+                    f"dropout={attn_dropout}."
+                )
         else:
             print("Warning: model.blocks was not found, VPT injection was skipped.")
        
@@ -234,6 +254,15 @@ class RADIOModel(nn.Module):
         y = self.model.forward_features(x)
         ret = self._extract_final(x, y, feature_fmt=feature_fmt)
         return ret
+
+    def set_vpt_text_classifier(self, text_classifier: Optional[torch.Tensor]):
+        blocks = getattr(self.model, "blocks", None)
+        set_fn = getattr(blocks, "set_text_classifier", None)
+        if callable(set_fn):
+            set_fn(text_classifier)
+
+    def clear_vpt_text_classifier(self):
+        self.set_vpt_text_classifier(None)
 
     def _extract_final(self, x: torch.Tensor, y: torch.Tensor, feature_fmt: str = 'NLC'):
         if isinstance(self.model, VisionTransformer):

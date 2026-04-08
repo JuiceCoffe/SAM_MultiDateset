@@ -45,6 +45,14 @@ class RADIO_Adaptor(nn.Module):
         text_tokens = self.sig2_adaptor.encode_text(text_input, normalize=True)
         return text_tokens
 
+    def set_vpt_text_classifier(self, text_classifier: Optional[torch.Tensor]):
+        set_fn = getattr(self.student, "set_vpt_text_classifier", None)
+        if callable(set_fn):
+            set_fn(text_classifier)
+
+    def clear_vpt_text_classifier(self):
+        self.set_vpt_text_classifier(None)
+
     # @torch.no_grad()
     def forward(self, images: torch.Tensor):
         """
@@ -98,6 +106,11 @@ def load_radio_model(
     num_prompts_to_insert: int = 200,
     insert_start_layer: int = 1,
     insert_end_layer: int = -1,
+    num_attn_queries: int = 0,
+    attn_query_dim: int = -1,
+    text_feature_dim: int = 1536,
+    attn_num_heads: int = 8,
+    attn_dropout: float = 0.1,
 ):
     """
     Load RADIO model from torch.hub.
@@ -118,6 +131,16 @@ def load_radio_model(
         extra['insert_start_layer'] = int(insert_start_layer)
     if insert_end_layer is not None:
         extra['insert_end_layer'] = int(insert_end_layer)
+    if num_attn_queries is not None:
+        extra['num_attn_queries'] = int(num_attn_queries)
+    if attn_query_dim is not None:
+        extra['attn_query_dim'] = int(attn_query_dim)
+    if text_feature_dim is not None:
+        extra['text_feature_dim'] = int(text_feature_dim)
+    if attn_num_heads is not None:
+        extra['attn_num_heads'] = int(attn_num_heads)
+    if attn_dropout is not None:
+        extra['attn_dropout'] = float(attn_dropout)
 
     print(f"Loading RADIO model from {model_version}...")
     model: torch.nn.Module = torch.hub.load(
