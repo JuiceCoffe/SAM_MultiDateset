@@ -66,7 +66,7 @@ class RADIO_Adaptor(nn.Module):
             student_output = self.student(images)
             if isinstance(student_output, dict):
                 features = student_output['sam3'][1]
-            
+                dino_features = student_output['dino_v3_7b'][1]
             _, backbone_features = student_output['backbone']
             sig2_vis_features = self.sig2_adaptor.head_mlp(backbone_features)
             del student_output
@@ -82,9 +82,15 @@ class RADIO_Adaptor(nn.Module):
         features = rearrange(features, 'b (r c) d -> b d r c', r=rows, c=cols)
 
         sig2_vis_features = rearrange(sig2_vis_features, 'b (r c) d -> b d r c', r=rows, c=cols)
+
+        dino_features = rearrange(dino_features, 'b (r c) d -> b d r c', r=rows, c=cols)
+
         other_output = {
             "siglip2-g": {
                 "features": sig2_vis_features.float(),
+            },
+            "dino_v3_7b":{
+                "features": dino_features.float(),
             }
         }
         # Return as a list (ViT returns list of outputs from global attention blocks)
@@ -124,7 +130,7 @@ def load_radio_model(
         'NVlabs/RADIO',
         'radio_model',
         model_version,
-        adaptor_names=['sam3','siglip2-g'],
+        adaptor_names=['sam3','siglip2-g','dino_v3_7b'],
         source='local',
         **extra,
     )

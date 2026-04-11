@@ -30,17 +30,6 @@ MODEL:
     NUM_PRED_MASKS: 32
     CLASS_WEIGHT: 1.0
 
-  MAP_ADAPTER:
-    ENABLE: True
-    NAME: "MAP_ADAPTER"
-    FEAT_DIM: 4096
-    NUM_ATTN_MAPS: 9
-    MASK_IN_CHANNELS: 16
-    NUM_CHANNELS: 512
-    USE_CHECKPOINT: True
-    NUM_OUTPUT_MAPS: 16
-    CHUNK_SIZE: 16
-
   VPT:
     ENABLE: True
     GRAD_CHECKPOINT: True
@@ -75,7 +64,7 @@ SOLVER:
   BASE_LR: 0.0001
   LR_SCHEDULER_NAME: WarmupPolyLR
   STEPS: (40000, 50000)
-  MAX_ITER: 15000
+  MAX_ITER: 60000
   CHECKPOINT_PERIOD: 2500
   
   WEIGHT_DECAY: 0.0001
@@ -113,7 +102,7 @@ DATALOADER:
   DATASET_RATIO: [1.0]
 
   # # Batch Size 对应单个数据集
-  DATASET_BS: [2]
+  DATASET_BS: [4]
   
   # COCO 通常不需要 RFS (Repeat Factor Sampling)
   USE_RFS: [False]
@@ -135,6 +124,6 @@ TEST:
   # PANOPTIC_ON: True   
 VERSION: 2
 
-# OUTPUT_DIR: ./out/test/test
-OUTPUT_DIR: ./out/RADIOSAM/copa_attnadapter_cdt_vpt5/
+OUTPUT_DIR: ./out/test/test
+# OUTPUT_DIR: ./out/RADIOSAM/copa_attn_cdt_vpt5/
   

@@ -52,7 +52,6 @@ from maft.utils.text_templetes import VILD_PROMPT
 from .loss.matcher import HungarianMatcher
 from .loss.criterion import SetCriterion
 from .loss.fcclip_criterion import FcclipSetCriterion
-from .loss.fcclip_map_criterion import MapAdapterFcclipSetCriterion
 from .loss.fcclip_matcher import FcclipHungarianMatcher
 from sam3.model.content_dependent_transfer import ContentDependentTransfer
 from sam3.model.box_ops import masks_to_boxes, box_xyxy_to_cxcywh
@@ -65,7 +64,6 @@ import random
 import math
 
 from .mask_adapter_head import build_mask_adapter
-from .map_adapter import build_map_adapter
 from .convnext import ConvNextBlock
 
 
@@ -191,17 +189,7 @@ class RADIOSAM(nn.Module):
 
             self.mask_adapter_weight_dict = {"loss_ce": cfg.MODEL.MASK_ADAPTER.CLASS_WEIGHT, "loss_cosine": cfg.MODEL.MASK_ADAPTER.COS_WEIGHT}
             self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-
-        self.use_map_adapter = cfg.MODEL.MAP_ADAPTER.ENABLE
-        if self.use_map_adapter:
-            self.map_adapter = build_map_adapter(cfg, cfg.MODEL.MAP_ADAPTER.NAME)
-            self.map_num_output_maps = cfg.MODEL.MAP_ADAPTER.NUM_OUTPUT_MAPS
-            self.map_mask_threshold = cfg.MODEL.MASK_ADAPTER.MASK_THRESHOLD
-        else:
-            self.map_adapter = None
-            self.map_num_output_maps = 0
-            self.map_mask_threshold = cfg.MODEL.MASK_ADAPTER.MASK_THRESHOLD
-
+   
 
         self.use_attnpool = cfg.MODEL.ATTNPOOL.ENABLE
         if self.use_attnpool:
@@ -408,9 +396,8 @@ class RADIOSAM(nn.Module):
             )
 
             losses = ["labels", ]
-            out_vocab_criterion_cls = MapAdapterFcclipSetCriterion if self.use_map_adapter else FcclipSetCriterion
-            self.out_vocab_criterion = out_vocab_criterion_cls(
-                num_classes=133,
+            self.out_vocab_criterion = FcclipSetCriterion(
+                num_classes = 133,
                 matcher=matcher,
                 weight_dict=self.out_vocab_weight_dict,
                 eos_coef=no_object_weight,
@@ -653,86 +640,6 @@ class RADIOSAM(nn.Module):
         labels = labels.long()
 
         return new_targets, masks, labels
-
-    def _build_query_map_inputs(self, attn_weights, pred_masks, query_indices_per_image, feat_hw):
-        if attn_weights is None:
-            raise ValueError("attn_weights is required for map-adapter pooling")
-        if attn_weights.dim() != 4:
-            raise ValueError(
-                f"Expected per-layer multi-head attention maps with shape [B, H, Q, L], got {tuple(attn_weights.shape)}"
-            )
-
-        bs, num_heads, num_queries, num_tokens = attn_weights.shape
-        feat_h, feat_w = feat_hw
-        if num_tokens != feat_h * feat_w:
-            raise ValueError(
-                f"Attention token count {num_tokens} does not match feature size {feat_h}x{feat_w}"
-            )
-
-        mask_h, mask_w = pred_masks.shape[-2:]
-        attn_maps = attn_weights.view(bs, num_heads, num_queries, feat_h, feat_w)
-        attn_maps = attn_maps.permute(0, 2, 1, 3, 4).reshape(bs * num_queries, num_heads, feat_h, feat_w)
-        attn_maps = F.interpolate(attn_maps.float(), size=(mask_h, mask_w), mode="bilinear", align_corners=False)
-        attn_maps = attn_maps.view(bs, num_queries, num_heads, mask_h, mask_w)
-
-        binary_masks = (pred_masks.sigmoid() > self.map_mask_threshold).unsqueeze(2).float()
-        query_map_inputs = torch.cat([attn_maps, binary_masks], dim=2)
-
-        return [query_map_inputs[b, query_indices] for b, query_indices in enumerate(query_indices_per_image)]
-
-    def _pool_map_adapter_features(self, map_src_feature, pool_feature, query_map_inputs):
-        map_adapter_outputs = self.map_adapter(map_src_feature, query_map_inputs)
-        pooled_query_features = []
-        for b, maps_for_pooling in enumerate(map_adapter_outputs):
-            num_queries = query_map_inputs[b].shape[0]
-            if num_queries == 0:
-                pooled_query_features.append(pool_feature.new_empty((0, pool_feature.shape[1])))
-                continue
-
-            maps_for_pooling = F.interpolate(
-                maps_for_pooling,
-                size=pool_feature.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-            num_maps = maps_for_pooling.size(1)
-            weights = F.softmax(F.logsigmoid(maps_for_pooling).view(1, num_maps, -1), dim=-1)
-            pooled = torch.bmm(weights, pool_feature[b:b+1].flatten(2).transpose(1, 2))
-            pooled = pooled.view(1, num_queries, self.map_num_output_maps, -1).mean(dim=2).squeeze(0).contiguous()
-            pooled_query_features.append(pooled)
-        return pooled_query_features
-
-    def _compute_map_adapter_cls_logits(self, attn_weights, pred_masks, map_src_feature, pool_feature, text_classifier, num_templates, query_indices_per_image=None):
-        bs, _, num_queries, _ = attn_weights.shape
-        if query_indices_per_image is None:
-            query_indices_per_image = [
-                torch.arange(num_queries, device=pred_masks.device, dtype=torch.long)
-                for _ in range(bs)
-            ]
-
-        query_map_inputs = self._build_query_map_inputs(
-            attn_weights,
-            pred_masks,
-            query_indices_per_image,
-            map_src_feature.shape[-2:],
-        )
-        pooled_query_features = self._pool_map_adapter_features(map_src_feature, pool_feature, query_map_inputs)
-
-        num_classes = len(num_templates)
-        pooled_logits = pred_masks.new_zeros((bs, num_queries, num_classes))
-        for b, query_indices in enumerate(query_indices_per_image):
-            if len(query_indices) == 0:
-                continue
-            cur_text_classifier = text_classifier[b:b + 1] if text_classifier.dim() == 3 else text_classifier
-            cur_logits = get_classification_logits(
-                pooled_query_features[b].unsqueeze(0),
-                cur_text_classifier,
-                self.out_vocab_logit_scale,
-                num_templates,
-            ).squeeze(0)
-            pooled_logits[b, query_indices] = cur_logits
-
-        return pooled_logits
 
     def prepare_class_names_from_metadata(self, metadata, train_metadata, prompt_list):
         def split_labels(x):
@@ -1483,44 +1390,42 @@ class RADIOSAM(nn.Module):
             if self.new_score_head:
                 obj_logits = self.score_head(queries).squeeze(-1)
 
-            attn_cls_results = None
             if self.use_attnpool:
-                if not self.use_map_adapter:
-                    radio_img_feat = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
-                    pool_cross_attn_weights = cross_attn_weights if self.training else cross_attn_weights[-1:].contiguous()
-                    pool_cross_attn_weights = pool_cross_attn_weights.mean(dim=2)
+                radio_img_feat = backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"]
 
-                    radio_img_feat = radio_img_feat.view(bs, 1536, -1).permute(0, 2, 1)
+                pool_cross_attn_weights = cross_attn_weights if self.training else cross_attn_weights[-1:].contiguous()
 
-                    attn_pool_logit_scale = torch.clamp(self.attn_pool_logit_scale.exp(), max=100)
-                    pool_cross_attn_weights = (torch.log(pool_cross_attn_weights + 1e-6) * attn_pool_logit_scale).softmax(-1)
-                    pooled_img_feat = torch.einsum("bld,kbnl->kbnd", radio_img_feat, pool_cross_attn_weights)
+                radio_img_feat = radio_img_feat.view(bs, 1536, -1).permute(0, 2, 1)
 
-                    text_classifier, num_templates = self.get_text_classifier(dataname)
+                attn_pool_logit_scale = torch.clamp(self.attn_pool_logit_scale.exp(), max=100)
+                pool_cross_attn_weights = (torch.log(pool_cross_attn_weights + 1e-6) * attn_pool_logit_scale).softmax(-1)
+                pooled_img_feat = torch.einsum("bld,kbnl->kbnd", radio_img_feat, pool_cross_attn_weights)
 
-                    if self.cdt is not None:
-                        text_classifier = self.cdt(
-                            backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"],
-                            text_classifier
-                        )
-                        attn_cls_results = []
-                        for b in range(bs):
-                            attn_cls_result = get_classification_logits(
-                                pooled_img_feat[:, b, :, :],
-                                text_classifier[b],
-                                self.out_vocab_logit_scale,
-                                num_templates,
-                            )
-                            attn_cls_results.append(attn_cls_result)
-                        attn_cls_results = torch.stack(attn_cls_results, dim=1)
-                    else:
-                        attn_cls_results = get_classification_logits(
-                            pooled_img_feat.reshape(-1, N, pooled_img_feat.shape[-1]),
-                            text_classifier,
+                text_classifier, num_templates = self.get_text_classifier(dataname)
+
+                if self.cdt is not None:
+                    text_classifier = self.cdt(
+                        backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"],
+                        text_classifier
+                    )
+                    attn_cls_results = []
+                    for b in range(bs):
+                        attn_cls_result = get_classification_logits(
+                            pooled_img_feat[:, b, :, :],
+                            text_classifier[b],
                             self.out_vocab_logit_scale,
                             num_templates,
                         )
-                        attn_cls_results = attn_cls_results.view(pooled_img_feat.shape[0], bs, N, attn_cls_results.shape[-1])
+                        attn_cls_results.append(attn_cls_result)
+                    attn_cls_results = torch.stack(attn_cls_results, dim=1)
+                else:
+                    attn_cls_results = get_classification_logits(
+                        pooled_img_feat.reshape(-1, N, pooled_img_feat.shape[-1]),
+                        text_classifier,
+                        self.out_vocab_logit_scale,
+                        num_templates,
+                    )
+                    attn_cls_results = attn_cls_results.view(pooled_img_feat.shape[0], bs, N, attn_cls_results.shape[-1])
 
 
             for i in range(6):
@@ -1589,11 +1494,8 @@ class RADIOSAM(nn.Module):
                             'pred_masks': outputs['aux_outputs'][i]["pred_masks"], 
                             'pred_boxes': outputs['aux_outputs'][i]['pred_boxes'],
                             'pred_boxes_xyxy': outputs['aux_outputs'][i]["pred_boxes_xyxy"],
+                            "attn_cls_logits": attn_cls_results[i],
                         }
-                        if attn_cls_results is not None:
-                            aux_out["attn_cls_logits"] = attn_cls_results[i]
-                        if self.use_map_adapter:
-                            aux_out["map_attn_weights"] = cross_attn_weights[i]
                         if cur_obj_logits is not None:
                             aux_out['pred_objectness_logits'] = cur_obj_logits
                         
@@ -1633,47 +1535,29 @@ class RADIOSAM(nn.Module):
  
 
             if self.train_out_vocab:
+                # 1. 仅构建一次预测字典，包含最终输出和辅助输出（aux_outputs）
                 criterion_pred = {
                     'pred_logits': query_cls_results_final,
                     'pred_masks': outputs["pred_masks"],
                     'pred_boxes': outputs['pred_boxes'],
                     'pred_boxes_xyxy': outputs["pred_boxes_xyxy"],
+                    "attn_cls_logits": attn_cls_results[-1], 
                     'aux_outputs': aux_outputs if use_aux is True else None,
                 }
-                out_vocab_extra_context = None
-                if self.use_map_adapter:
-                    text_classifier, num_templates = self.get_text_classifier(dataname)
-                    if self.cdt is not None:
-                        text_classifier = self.cdt(
-                            backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"],
-                            text_classifier,
-                        )
-                    criterion_pred["map_attn_weights"] = cross_attn_weights[-1]
-                    out_vocab_extra_context = {
-                        "use_map_adapter": True,
-                        "map_adapter": self.map_adapter,
-                        "map_src_feature": backbone_out_vision['vit_feature'][0]["dino_v3_7b"]["features"],
-                        "pool_feature": backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"],
-                        "text_classifier": text_classifier,
-                        "num_templates": num_templates,
-                        "out_vocab_logit_scale": self.out_vocab_logit_scale,
-                        "mask_threshold": self.map_mask_threshold,
-                        "num_output_maps": self.map_num_output_maps,
-                    }
-                elif attn_cls_results is not None:
-                    criterion_pred["attn_cls_logits"] = attn_cls_results[-1]
 
-                if self.use_map_adapter:
-                    out_vocab_losses = self.out_vocab_criterion(criterion_pred, targets, out_vocab_extra_context)
-                else:
-                    out_vocab_losses = self.out_vocab_criterion(criterion_pred, targets)
+                # 2. 让 FcclipSetCriterion 自动处理内部的 auxiliary 循环。
+                # 它会输出一个扁平的字典，包含类似于 'loss_attn_cls', 'loss_attn_cls_0' 等键。
+                out_vocab_losses = self.out_vocab_criterion(criterion_pred, targets)
 
+                # 3. 应用权重并过滤掉不需要的损失
                 for k in list(out_vocab_losses.keys()):
                     if k in self.out_vocab_weight_dict:
                         out_vocab_losses[k] *= self.out_vocab_weight_dict[k]
                     else:
+                        # 如果不在 `weight_dict` 中指定，则移除该损失
                         out_vocab_losses.pop(k)
 
+                # 4. 更新主损失字典
                 losses.update(out_vocab_losses)        
      
 
@@ -1708,23 +1592,7 @@ class RADIOSAM(nn.Module):
                 self.out_vocab_logit_scale = nn.Parameter(torch.ones([]) * np.log(100))
 
             if self.use_attnpool:
-                if self.use_map_adapter:
-                    text_classifier, num_templates = self.get_text_classifier(dataname)
-                    if self.cdt is not None:
-                        text_classifier = self.cdt(
-                            backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"],
-                            text_classifier,
-                        )
-                    pool_cls_logits = self._compute_map_adapter_cls_logits(
-                        cross_attn_weights[-1],
-                        outputs["pred_masks"],
-                        backbone_out_vision['vit_feature'][0]["dino_v3_7b"]["features"],
-                        backbone_out_vision['vit_feature'][0]["siglip2-g"]["features"],
-                        text_classifier,
-                        num_templates,
-                    )
-                else:
-                    pool_cls_logits = attn_cls_results[-1]
+                pool_cls_logits = attn_cls_results[-1]
                             
             elif self.use_MaskAdapter:
                 mask_cls_results = outputs["pred_logits"]
@@ -2354,8 +2222,6 @@ class RADIOSAM(nn.Module):
         # 获取 Attention weights
         if cross_attn_weights is not None:
             attn_weights = cross_attn_weights[-1] # 取最后一层
-            if attn_weights.dim() == 4:
-                attn_weights = attn_weights.mean(dim=1)
         else:
             print("cross_attn_weights is None.")
             return

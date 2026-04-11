@@ -171,7 +171,6 @@ class TransformerDecoderLayer(nn.Module):
                 else None
             ),
             need_weights=True,
-            average_attn_weights=False,
         )
 
         tgt = tgt + self.dropout1(tgt2)
