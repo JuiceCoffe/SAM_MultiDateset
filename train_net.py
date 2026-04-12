@@ -115,6 +115,7 @@ from sam3.SAM3CLIP import SAM3CLIP
 from sam3.DINOSAM import DINOSAM
 from sam3.DINOTXTSAM import DINOTXTSAM
 from sam3.RADIOSAM import RADIOSAM
+from sam3.OVSMapAdapter import OVSMapAdapter
 
 from sam3.mask_adapter_head import MASKAdapterHead
 

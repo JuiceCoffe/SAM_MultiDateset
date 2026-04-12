@@ -132,6 +132,7 @@ def add_sam3_config(cfg):
     cfg.MODEL.MAP_ADAPTER.USE_CHECKPOINT = False
     cfg.MODEL.MAP_ADAPTER.NUM_OUTPUT_MAPS = 16
     cfg.MODEL.MAP_ADAPTER.CHUNK_SIZE = 0
+    cfg.MODEL.MAP_ADAPTER.TRAIN_ONLY = False
 
     cfg.MODEL.VPT = CN()
     cfg.MODEL.VPT.ENABLE = False

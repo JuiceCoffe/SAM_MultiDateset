@@ -1,7 +1,7 @@
 MODEL:
   PIXEL_MEAN : [127.5, 127.5, 127.5]
   PIXEL_STD : [127.5, 127.5, 127.5]
-  META_ARCHITECTURE: "RADIOSAM"
+  META_ARCHITECTURE: "OVSMapAdapter"
   
   SAM3:
     BPE_PATH: "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
@@ -42,7 +42,7 @@ MODEL:
     CHUNK_SIZE: 16
 
   VPT:
-    ENABLE: True
+    # ENABLE: True
     GRAD_CHECKPOINT: True
     NUM_PROMPTS_TO_INSERT: 5
     START_LAYER: 1  # 1-based from input side, inclusive
@@ -75,8 +75,8 @@ SOLVER:
   BASE_LR: 0.0001
   LR_SCHEDULER_NAME: WarmupPolyLR
   STEPS: (40000, 50000)
-  MAX_ITER: 15000
-  CHECKPOINT_PERIOD: 2500
+  MAX_ITER: 45000
+  CHECKPOINT_PERIOD: 5000
   
   WEIGHT_DECAY: 0.0001
   WARMUP_ITERS: 2500
@@ -113,7 +113,7 @@ DATALOADER:
   DATASET_RATIO: [1.0]
 
   # # Batch Size 对应单个数据集
-  DATASET_BS: [1]
+  DATASET_BS: [4]
   
   # COCO 通常不需要 RFS (Repeat Factor Sampling)
   USE_RFS: [False]
@@ -129,12 +129,12 @@ DATALOADER:
   USE_DIFF_BS_SIZE: True
 
 TEST:
-  EVAL_PERIOD: 2500
+  EVAL_PERIOD: 5000
   SEMANTIC_ON: True   
   # INSTANCE_ON: True   
   # PANOPTIC_ON: True   
 VERSION: 2
 
 # OUTPUT_DIR: ./out/test/test
-OUTPUT_DIR: ./out/OVSAttnAdapter/copa_mapadapter_cdt/
+OUTPUT_DIR: ./out/OVSAttnAdapter/copa_attn_cdt/
   

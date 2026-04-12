@@ -1,14 +1,14 @@
 MODEL:
   PIXEL_MEAN : [127.5, 127.5, 127.5]
   PIXEL_STD : [127.5, 127.5, 127.5]
-  META_ARCHITECTURE: "RADIOSAM"
+  META_ARCHITECTURE: "OVSMapAdapter"
   
   SAM3:
     BPE_PATH: "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
     ENABLE_SEGMENTATION: True
     NUM_CDT: 1
     # USE_QUERY_PROJ: True
-    USE_PIXEL_PROJ: True
+    # USE_PIXEL_PROJ: True
     USE_PE_TEXT: False
     # DYNAMIC_QUERY: True
     # ENCODER_LOSS: True
@@ -31,7 +31,8 @@ MODEL:
     CLASS_WEIGHT: 1.0
 
   MAP_ADAPTER:
-    # ENABLE: True
+    ENABLE: True
+    TRAIN_ONLY: True
     NAME: "MAP_ADAPTER"
     FEAT_DIM: 4096
     NUM_ATTN_MAPS: 9
@@ -42,7 +43,7 @@ MODEL:
     CHUNK_SIZE: 16
 
   VPT:
-    ENABLE: True
+    # ENABLE: True
     GRAD_CHECKPOINT: True
     NUM_PROMPTS_TO_INSERT: 5
     START_LAYER: 1  # 1-based from input side, inclusive
@@ -136,5 +137,5 @@ TEST:
 VERSION: 2
 
 # OUTPUT_DIR: ./out/test/test
-OUTPUT_DIR: ./out/OVSAttnAdapter/copa_mapadapter_cdt/
+OUTPUT_DIR: ./out/RADIOSAM/copa_attn_attnadapter_cdt/
   
