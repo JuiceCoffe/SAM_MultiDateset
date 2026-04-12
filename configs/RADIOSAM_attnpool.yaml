@@ -42,7 +42,7 @@ MODEL:
     CHUNK_SIZE: 16
 
   VPT:
-    ENABLE: True
+    # ENABLE: True
     GRAD_CHECKPOINT: True
     NUM_PROMPTS_TO_INSERT: 5
     START_LAYER: 1  # 1-based from input side, inclusive
@@ -71,7 +71,7 @@ SOLVER:
     NORM_TYPE: 2.0
   AMP:
     ENABLED: True
-  IMS_PER_BATCH: 48
+  IMS_PER_BATCH: 8
   BASE_LR: 0.0001
   LR_SCHEDULER_NAME: WarmupPolyLR
   STEPS: (40000, 50000)
@@ -113,7 +113,7 @@ DATALOADER:
   DATASET_RATIO: [1.0]
 
   # # Batch Size 对应单个数据集
-  DATASET_BS: [2]
+  DATASET_BS: [1]
   
   # COCO 通常不需要 RFS (Repeat Factor Sampling)
   USE_RFS: [False]
@@ -136,5 +136,5 @@ TEST:
 VERSION: 2
 
 # OUTPUT_DIR: ./out/test/test
-OUTPUT_DIR: ./out/RADIOSAM/copa_attnadapter_cdt_vpt5/
+OUTPUT_DIR: ./out/RADIOSAM/copa_attnadapter_cdt/
   

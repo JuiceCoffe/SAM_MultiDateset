@@ -243,8 +243,16 @@ class RADIOSAM(nn.Module):
 
         self.vpt_enable = cfg.MODEL.VPT.ENABLE
         self.vpt_grad_checkpoint = getattr(cfg.MODEL.VPT, "GRAD_CHECKPOINT", False)
+        radio_blocks = getattr(getattr(self.radio_adaptor, "student", None), "model", None)
+        radio_blocks = getattr(radio_blocks, "blocks", None)
+        if hasattr(radio_blocks, "is_active"):
+            radio_blocks.is_active = self.vpt_enable
+            if not self.vpt_enable:
+                print("VPT is disabled. Prompt injector is inactive and prompt tokens will not affect backbone forward.")
         if self.vpt_enable and self.vpt_grad_checkpoint:
             set_radio_grad_checkpointing(self.radio_adaptor.student, True)
+        elif hasattr(radio_blocks, "grad_checkpointing"):
+            radio_blocks.grad_checkpointing = False
         # -------------------------------------------------------
         # 计算逻辑
         # -------------------------------------------------------

@@ -44,12 +44,9 @@ if eval_instance:
 
 
 import copy
-import contextlib
 import itertools
 import logging
 import os
-import time
-import weakref
 # os.environ['CUDA_VISIBLE_DEVICES'] = '2,4,6'
 
 from collections import OrderedDict
@@ -62,9 +59,7 @@ from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
 from detectron2.data import MetadataCatalog, build_detection_train_loader
 from detectron2.engine import (
-    AMPTrainer,
     DefaultTrainer,
-    SimpleTrainer,
     default_argument_parser,
     default_setup,
     launch,
@@ -81,8 +76,6 @@ from detectron2.evaluation import (
 )
 from detectron2.projects.deeplab import add_deeplab_config, build_lr_scheduler
 from detectron2.solver.build import maybe_add_gradient_clipping
-from detectron2.engine.defaults import create_ddp_model
-from detectron2.utils.events import get_event_storage
 from detectron2.utils.logger import setup_logger
 
 # from detectron2.data.datasets import register_lvis_instances
@@ -178,239 +171,10 @@ class EvalMemoryCleanupHook(HookBase):
         self._cleanup()
 
 
-
-def infer_gradient_accumulation(cfg, world_size):
-    if world_size <= 0:
-        raise ValueError(f"world_size must be positive, got {world_size}")
-
-    total_batch_size = int(cfg.SOLVER.IMS_PER_BATCH)
-    if total_batch_size <= 0:
-        raise ValueError(f"SOLVER.IMS_PER_BATCH must be positive, got {total_batch_size}")
-    if total_batch_size % world_size != 0:
-        raise ValueError(
-            f"SOLVER.IMS_PER_BATCH={total_batch_size} must be divisible by world_size={world_size}"
-        )
-
-    target_batch_per_gpu = total_batch_size // world_size
-    use_diff_bs_size = bool(getattr(cfg.DATALOADER, "USE_DIFF_BS_SIZE", False))
-    dataset_bs = [int(bs) for bs in getattr(cfg.DATALOADER, "DATASET_BS", [])]
-
-    if cfg.DATALOADER.SAMPLER_TRAIN == "MultiDatasetSampler" and use_diff_bs_size:
-        if not dataset_bs:
-            raise ValueError(
-                "DATALOADER.DATASET_BS must be non-empty when USE_DIFF_BS_SIZE=True"
-            )
-        unique_bs = sorted(set(dataset_bs))
-        if any(bs <= 0 for bs in unique_bs):
-            raise ValueError(f"DATALOADER.DATASET_BS must all be positive, got {dataset_bs}")
-        if len(unique_bs) != 1:
-            raise ValueError(
-                "Gradient accumulation with USE_DIFF_BS_SIZE=True currently requires all "
-                f"DATASET_BS values to be identical so that IMS_PER_BATCH maps to an exact "
-                f"effective batch size. Got {dataset_bs}"
-            )
-        micro_batch_size = unique_bs[0]
-        micro_batch_source = "DATALOADER.DATASET_BS"
-    else:
-        micro_batch_size = target_batch_per_gpu
-        micro_batch_source = "SOLVER.IMS_PER_BATCH/world_size"
-
-    if micro_batch_size > target_batch_per_gpu:
-        raise ValueError(
-            f"Per-GPU micro-batch {micro_batch_size} exceeds target per-GPU effective batch "
-            f"{target_batch_per_gpu}. Increase SOLVER.IMS_PER_BATCH or reduce DATASET_BS."
-        )
-    if target_batch_per_gpu % micro_batch_size != 0:
-        raise ValueError(
-            f"Target per-GPU effective batch {target_batch_per_gpu} must be divisible by the "
-            f"per-GPU micro-batch {micro_batch_size} inferred from {micro_batch_source}."
-        )
-
-    accumulation_steps = target_batch_per_gpu // micro_batch_size
-    return {
-        "world_size": world_size,
-        "total_batch_size": total_batch_size,
-        "target_batch_per_gpu": target_batch_per_gpu,
-        "micro_batch_size": micro_batch_size,
-        "accumulation_steps": accumulation_steps,
-        "effective_batch_size": micro_batch_size * world_size * accumulation_steps,
-        "micro_batch_source": micro_batch_source,
-    }
-
-
-class _GradientAccumulationMixin:
-    def __init__(self, *args, accumulation_steps=1, **kwargs):
-        self.accumulation_steps = int(accumulation_steps)
-        if self.accumulation_steps <= 0:
-            raise ValueError(
-                f"accumulation_steps must be >= 1, got {self.accumulation_steps}"
-            )
-        super().__init__(*args, **kwargs)
-
-    @staticmethod
-    def _get_micro_batch_size(data):
-        if isinstance(data, (list, tuple)):
-            return len(data)
-        try:
-            return len(data)
-        except TypeError:
-            return 1
-
-    def _no_sync_context(self, is_last_micro_step):
-        if is_last_micro_step or not hasattr(self.model, "no_sync"):
-            return contextlib.nullcontext()
-        return self.model.no_sync()
-
-    def _write_aggregated_metrics(self, loss_sums, total_samples, data_time):
-        normalizer = max(total_samples, 1)
-        reduced_loss_dict = {
-            key: value / normalizer for key, value in loss_sums.items()
-        }
-
-        if self.async_write_metrics:
-            self.concurrent_executor.submit(
-                self._write_metrics, reduced_loss_dict, data_time, iter=self.iter
-            )
-        else:
-            self._write_metrics(reduced_loss_dict, data_time)
-
-
-class GradientAccumulationSimpleTrainer(_GradientAccumulationMixin, SimpleTrainer):
-    def run_step(self):
-        assert self.model.training, "[GradientAccumulationSimpleTrainer] model was changed to eval mode!"
-
-        self.optimizer.zero_grad()
-        total_data_time = 0.0
-        total_samples = 0
-        loss_sums = {}
-
-        for micro_step in range(self.accumulation_steps):
-            start = time.perf_counter()
-            data = next(self._data_loader_iter)
-            total_data_time += time.perf_counter() - start
-
-            batch_size = self._get_micro_batch_size(data)
-            total_samples += batch_size
-            is_last_micro_step = micro_step == self.accumulation_steps - 1
-
-            with self._no_sync_context(is_last_micro_step):
-                loss_dict = self.model(data)
-                if isinstance(loss_dict, torch.Tensor):
-                    losses = loss_dict
-                    loss_dict = {"total_loss": loss_dict}
-                else:
-                    losses = sum(loss_dict.values())
-
-                scaled_losses = losses / self.accumulation_steps
-                scaled_losses.backward()
-
-            for key, value in loss_dict.items():
-                detached_value = value.detach()
-                loss_sums[key] = loss_sums.get(key, detached_value.new_zeros(())) + detached_value * batch_size
-
-        self.after_backward()
-        self._write_aggregated_metrics(loss_sums, total_samples, total_data_time)
-        self.optimizer.step()
-
-
-class GradientAccumulationAMPTrainer(_GradientAccumulationMixin, AMPTrainer):
-    def run_step(self):
-        assert self.model.training, "[GradientAccumulationAMPTrainer] model was changed to eval mode!"
-        assert torch.cuda.is_available(), "[GradientAccumulationAMPTrainer] CUDA is required for AMP training!"
-        from torch.cuda.amp import autocast
-
-        self.optimizer.zero_grad()
-        total_data_time = 0.0
-        total_samples = 0
-        loss_sums = {}
-
-        for micro_step in range(self.accumulation_steps):
-            start = time.perf_counter()
-            data = next(self._data_loader_iter)
-            total_data_time += time.perf_counter() - start
-
-            batch_size = self._get_micro_batch_size(data)
-            total_samples += batch_size
-            is_last_micro_step = micro_step == self.accumulation_steps - 1
-
-            with self._no_sync_context(is_last_micro_step):
-                with autocast(dtype=self.precision):
-                    loss_dict = self.model(data)
-                    if isinstance(loss_dict, torch.Tensor):
-                        losses = loss_dict
-                        loss_dict = {"total_loss": loss_dict}
-                    else:
-                        losses = sum(loss_dict.values())
-
-                scaled_losses = losses / self.accumulation_steps
-                self.grad_scaler.scale(scaled_losses).backward()
-
-            for key, value in loss_dict.items():
-                detached_value = value.detach()
-                loss_sums[key] = loss_sums.get(key, detached_value.new_zeros(())) + detached_value * batch_size
-
-        if self.log_grad_scaler:
-            storage = get_event_storage()
-            storage.put_scalar("[metric]grad_scaler", self.grad_scaler.get_scale())
-
-        self.after_backward()
-        self._write_aggregated_metrics(loss_sums, total_samples, total_data_time)
-        self.grad_scaler.step(self.optimizer)
-        self.grad_scaler.update()
-
-
 class Trainer(DefaultTrainer):
     """
     Extension of the Trainer class adapted to FCCLIP.
     """
-
-    def __init__(self, cfg):
-        super(DefaultTrainer, self).__init__()
-        logger = logging.getLogger("detectron2")
-        if not logger.isEnabledFor(logging.INFO):
-            setup_logger()
-
-        cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
-        accumulation_info = infer_gradient_accumulation(cfg, comm.get_world_size())
-
-        model = self.build_model(cfg)
-        optimizer = self.build_optimizer(cfg, model)
-        data_loader = self.build_train_loader(cfg)
-
-        model = create_ddp_model(model, broadcast_buffers=False)
-        trainer_cls = (
-            GradientAccumulationAMPTrainer if cfg.SOLVER.AMP.ENABLED else GradientAccumulationSimpleTrainer
-        )
-        self._trainer = trainer_cls(
-            model,
-            data_loader,
-            optimizer,
-            accumulation_steps=accumulation_info["accumulation_steps"],
-        )
-
-        self.scheduler = self.build_lr_scheduler(cfg, optimizer)
-        self.checkpointer = DetectionCheckpointer(
-            model,
-            cfg.OUTPUT_DIR,
-            trainer=weakref.proxy(self),
-        )
-        self.start_iter = 0
-        self.max_iter = cfg.SOLVER.MAX_ITER
-        self.cfg = cfg
-        self.accumulation_info = accumulation_info
-
-        logging.getLogger("detectron2").info(
-            "Gradient accumulation enabled: per_gpu_micro_batch=%d, world_size=%d, "
-            "accumulation_steps=%d, effective_batch_size=%d (SOLVER.IMS_PER_BATCH=%d)",
-            accumulation_info["micro_batch_size"],
-            accumulation_info["world_size"],
-            accumulation_info["accumulation_steps"],
-            accumulation_info["effective_batch_size"],
-            accumulation_info["total_batch_size"],
-        )
-
-        self.register_hooks(self.build_hooks())
-
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
