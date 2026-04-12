@@ -152,7 +152,7 @@ class RADIOSAM(nn.Module):
 
         self.use_pixel_proj = cfg.MODEL.SAM3.USE_PIXEL_PROJ
         if self.use_pixel_proj:
-            self.pixel_proj = MLP(256, 256, 256, 3)
+            self.pixel_proj = nn.Linear(256, 256)
         else:
             self.pixel_proj = None
 
