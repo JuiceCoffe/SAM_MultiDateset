@@ -267,7 +267,7 @@ class _GradientAccumulationMixin:
             key: value / normalizer for key, value in loss_sums.items()
         }
 
-        if self.async_write_metrics:
+        if getattr(self, "async_write_metrics", False):
             self.concurrent_executor.submit(
                 self._write_metrics, reduced_loss_dict, data_time, iter=self.iter
             )
@@ -308,7 +308,8 @@ class GradientAccumulationSimpleTrainer(_GradientAccumulationMixin, SimpleTraine
                 detached_value = value.detach()
                 loss_sums[key] = loss_sums.get(key, detached_value.new_zeros(())) + detached_value * batch_size
 
-        self.after_backward()
+        if hasattr(self, "after_backward"):
+            self.after_backward()
         self._write_aggregated_metrics(loss_sums, total_samples, total_data_time)
         self.optimizer.step()
 
@@ -334,7 +335,7 @@ class GradientAccumulationAMPTrainer(_GradientAccumulationMixin, AMPTrainer):
             is_last_micro_step = micro_step == self.accumulation_steps - 1
 
             with self._no_sync_context(is_last_micro_step):
-                with autocast(dtype=self.precision):
+                with autocast():
                     loss_dict = self.model(data)
                     if isinstance(loss_dict, torch.Tensor):
                         losses = loss_dict
@@ -349,11 +350,12 @@ class GradientAccumulationAMPTrainer(_GradientAccumulationMixin, AMPTrainer):
                 detached_value = value.detach()
                 loss_sums[key] = loss_sums.get(key, detached_value.new_zeros(())) + detached_value * batch_size
 
-        if self.log_grad_scaler:
+        if getattr(self, "log_grad_scaler", False):
             storage = get_event_storage()
             storage.put_scalar("[metric]grad_scaler", self.grad_scaler.get_scale())
 
-        self.after_backward()
+        if hasattr(self, "after_backward"):
+            self.after_backward()
         self._write_aggregated_metrics(loss_sums, total_samples, total_data_time)
         self.grad_scaler.step(self.optimizer)
         self.grad_scaler.update()
